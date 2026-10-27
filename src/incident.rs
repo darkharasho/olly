@@ -3,7 +3,7 @@
 use crate::engine::{Action, Event, Target};
 use crate::history::History;
 use crate::sample::{AppKey, AppSample, SystemSample};
-use crate::voice::fmt_bytes;
+use crate::voice::{self, fmt_bytes};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -67,6 +67,23 @@ impl IncidentRecorder {
         }
     }
 
+    /// Closes the open incident at `wall_ms` because olly is stopping before it ended.
+    pub fn finish_now(&mut self, wall_ms: u64) -> Option<Incident> {
+        let mut inc = self.take_closed(wall_ms)?;
+        inc.summary = format!("{} {}", lead(&inc), voice::stopped_mid_incident(duration_secs(&inc)));
+        Some(inc)
+    }
+
+    fn take_closed(&mut self, wall_ms: u64) -> Option<Incident> {
+        let mut inc = self.current.take()?;
+        inc.end_ms_wall = wall_ms;
+        inc.peak_full = inc.peak_full.max(0.0);
+        if inc.min_avail == u64::MAX {
+            inc.min_avail = 0;
+        }
+        Some(inc)
+    }
+
     /// Returns the completed incident on `IncidentEnd`.
     pub fn on_event(&mut self, ev: &Event, wall_ms: u64) -> Option<Incident> {
         match ev {
@@ -94,12 +111,7 @@ impl IncidentRecorder {
                 if self.current.as_ref().is_none_or(|i| i.id != *id) {
                     return None;
                 }
-                let mut inc = self.current.take()?;
-                inc.end_ms_wall = wall_ms;
-                inc.peak_full = inc.peak_full.max(0.0);
-                if inc.min_avail == u64::MAX {
-                    inc.min_avail = 0;
-                }
+                let mut inc = self.take_closed(wall_ms)?;
                 inc.summary = summarize(&inc);
                 Some(inc)
             }
@@ -108,9 +120,17 @@ impl IncidentRecorder {
     }
 }
 
+fn duration_secs(inc: &Incident) -> u64 {
+    inc.end_ms_wall.saturating_sub(inc.start_ms_wall) / 1000
+}
+
 /// One olly-voice line: what was done, then how long it took to recover.
 fn summarize(inc: &Incident) -> String {
-    let secs = inc.end_ms_wall.saturating_sub(inc.start_ms_wall) / 1000;
+    format!("{} Recovered in {}s.", lead(inc), duration_secs(inc))
+}
+
+/// What was done during the incident, as one sentence.
+fn lead(inc: &Incident) -> String {
     let pick = |f: fn(&Action) -> Option<&Target>| {
         inc.actions.iter().rev().find_map(|(_, a, dry)| f(a).map(|t| (t, *dry)))
     };
@@ -139,7 +159,7 @@ fn summarize(inc: &Incident) -> String {
         s.push(')');
         s
     };
-    let lead = if let Some((t, dry)) = kill {
+    if let Some((t, dry)) = kill {
         let verb = if dry { "Would have closed" } else { "Closed" };
         format!("{verb} {}.", describe(t))
     } else if let Some((t, dry)) = freeze {
@@ -150,8 +170,7 @@ fn summarize(inc: &Incident) -> String {
         format!("{verb} {}.", describe(t))
     } else {
         "Memory ran tight and eased up on its own.".to_string()
-    };
-    format!("{lead} Recovered in {secs}s.")
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -508,5 +527,23 @@ mod tests {
         s.append(&inc(6, 1)).unwrap();
         let reopened = IncidentStore::new(s.path.clone());
         assert_eq!(reopened.next_id(), 10);
+    }
+
+    #[test]
+    fn finish_now_flushes_open_incident() {
+        let mut rec = IncidentRecorder::new();
+        assert_eq!(rec.finish_now(5000), None);
+        rec.on_event(&Event::IncidentStart { id: 3, t_ms: 0 }, 10_000);
+        rec.on_sample(&sys(1000, 20.0, 3 * GB), &[app(1, 9 * GB)], &History::new(&Config::default().growth), 11_000);
+        let done = rec.finish_now(52_000).expect("open incident is flushed");
+        assert_eq!(done.id, 3);
+        assert_eq!(done.end_ms_wall, 52_000);
+        assert_eq!(done.peak_full, 20.0);
+        assert_eq!(done.min_avail, 3 * GB);
+        assert_eq!(
+            done.summary,
+            "Memory ran tight and eased up on its own. olly was stopped 42s in, before memory recovered."
+        );
+        assert_eq!(rec.finish_now(60_000), None);
     }
 }

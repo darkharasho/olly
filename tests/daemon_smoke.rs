@@ -59,14 +59,37 @@ fn request(s: &UnixStream, line: &str) -> serde_json::Value {
     serde_json::from_str(&resp).unwrap_or_else(|e| panic!("bad response {resp:?}: {e}"))
 }
 
+/// Recursive copy that keeps symlinks (the fixture's `exe` links) as symlinks.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        let ft = e.file_type().unwrap();
+        if ft.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&src).unwrap(), &dst).unwrap();
+        } else if ft.is_dir() {
+            copy_tree(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).unwrap();
+        }
+    }
+}
+
+/// Runs the daemon on a private copy of the fixture, so it can never write a checked-in file.
 fn spawn(tmp: &Path, config: &str) -> (Daemon, PathBuf, PathBuf) {
+    let root = tmp.join("root");
+    copy_tree(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"), &root);
+    spawn_on(tmp, &root, config)
+}
+
+fn spawn_on(tmp: &Path, root: &Path, config: &str) -> (Daemon, PathBuf, PathBuf) {
     let cfg = tmp.join("config.toml");
     std::fs::write(&cfg, config).unwrap();
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam");
     let log = tmp.join("stderr.log");
     let child = Command::new(env!("CARGO_BIN_EXE_olly"))
         .args(["daemon", "--root"])
-        .arg(&root)
+        .arg(root)
         .arg("--config")
         .arg(&cfg)
         .env("OLLY_RUN_DIR", tmp)
@@ -125,6 +148,11 @@ fn config_error_notice_reaches_subscriber() {
         eprintln!("skipped: the default desktop_uid (1000) must be the test user");
         return;
     }
+    // This test runs LIVE (defaults => dry_run = false) with a real SysActuator. It is only
+    // safe because the fixture is calm (about 47% available, PSI 0), so the engine never acts.
+    // If it did, it would write cgroup files in the copied root and could signal host pids
+    // that happen to match the fixture's pids (100-300). The assertion below fails loudly
+    // if any action is taken; keep the fixture calm.
     let tmp = tempfile::tempdir().unwrap();
     let (mut d, sock, log) = spawn(tmp.path(), "dry_run = [[");
     let s = connect(&sock, &mut d, &log);
@@ -143,4 +171,36 @@ fn config_error_notice_reaches_subscriber() {
     drop(s);
     let stderr = stop(d, &log);
     assert!(stderr.contains("ERROR"), "{stderr}");
+    assert!(!stderr.contains("action="), "the live daemon acted on the fixture: {stderr}");
+}
+
+/// SIGTERM during an open incident saves it, marked as cut short.
+#[test]
+fn sigterm_flushes_open_incident() {
+    let tmp = tempfile::tempdir().unwrap();
+    let uid = unsafe { libc::getuid() };
+    let (mut d, sock, log) = {
+        // Pre-create the copy with 8% available (warning level), then spawn on it.
+        let root = tmp.path().join("root");
+        copy_tree(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"), &root);
+        let mi = root.join("proc/meminfo");
+        let text = std::fs::read_to_string(&mi).unwrap();
+        let low: String = text
+            .lines()
+            .map(|l| if l.starts_with("MemAvailable:") { "MemAvailable:    2556307 kB" } else { l })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::remove_file(&mi).unwrap();
+        std::fs::write(&mi, low).unwrap();
+        spawn_on(tmp.path(), &root, &format!("dry_run = true\ndesktop_uid = {uid}\n"))
+    };
+    let s = connect(&sock, &mut d, &log);
+    let v = request(&s, r#"{"cmd":"status"}"#);
+    assert_eq!(v["data"]["level"], "warning", "{v}");
+    drop(s);
+    stop(d, &log);
+    let text = std::fs::read_to_string(tmp.path().join("incidents.jsonl")).unwrap();
+    let inc: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(inc["type"], "incident", "{inc}");
+    assert!(inc["summary"].as_str().unwrap().contains("olly was stopped"), "{inc}");
 }

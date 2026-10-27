@@ -122,6 +122,11 @@ pub fn config_fallback() -> Message {
     }
 }
 
+/// Incident summary tail when olly was stopped before the incident ended.
+pub fn stopped_mid_incident(secs: u64) -> String {
+    format!("olly was stopped {secs}s in, before memory recovered.")
+}
+
 /// `paused_remaining_ms` is the time left on a pause, relative to now.
 pub fn status_line(level: Level, avail_bytes: u64, paused_remaining_ms: Option<u64>) -> String {
     let avail = fmt_bytes(avail_bytes);

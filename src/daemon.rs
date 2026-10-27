@@ -236,6 +236,16 @@ impl Daemon {
         }
     }
 
+    /// On shutdown: an incident still open is saved, marked as cut short.
+    fn flush_open_incident(&mut self) {
+        if let Some(inc) = self.recorder.finish_now(wall_ms()) {
+            eprintln!("olly: saving open incident {} before exit", inc.id);
+            if let Err(e) = self.store.append(&inc) {
+                eprintln!("olly: cannot save incident {}: {e}", inc.id);
+            }
+        }
+    }
+
     fn command(&mut self, cmd: Command) -> Result<(), String> {
         let out = self.engine.command(cmd, self.now())?;
         self.process(out);
@@ -523,6 +533,7 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
             drain(fds[0].0, std::mem::size_of::<libc::signalfd_siginfo>());
             eprintln!("olly: stopping; undoing every freeze and throttle");
             d.act.undo_all();
+            d.flush_open_incident();
             if served {
                 let _ = fs::remove_file(&paths.sock);
             }
