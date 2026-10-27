@@ -32,6 +32,18 @@ systemctl --user daemon-reload
 systemctl --user enable olly-notify
 systemctl --user restart olly-notify
 
+# The tray face installs per-user (no sudo). --upgrade fails when it isn't
+# installed yet, so fall back to --install. plasmashell is never restarted.
+if command -v kpackagetool6 >/dev/null 2>&1; then
+    if kpackagetool6 --type Plasma/Applet --upgrade plasmoid/package 2>/dev/null || kpackagetool6 --type Plasma/Applet --install plasmoid/package; then
+        echo "🤖 tray face installed! If you don't see it, log out and back in, then check System Tray Settings → Entries → olly → Always shown."
+    else
+        echo "🤖 couldn't install the tray face, but olly itself is fine." >&2
+    fi
+else
+    echo "🤖 no kpackagetool6 found, so I skipped the tray face."
+fi
+
 if grep -q '^dry_run = true' /etc/olly/config.toml; then
     echo "🤖 olly is up and watching, in dry-run mode: it will tell you what it would do, but won't act yet."
     echo "   Check in with: olly status"

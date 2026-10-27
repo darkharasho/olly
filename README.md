@@ -35,8 +35,8 @@ sudo sed -i 's/^dry_run = true/dry_run = false/' /etc/olly/config.toml && sudo s
 ## The `olly` command
 
 ```
-olly status                 how memory looks right now
-olly incidents [-n N]       recent incidents, newest first
+olly status [--json]        how memory looks right now
+olly incidents [-n N] [--json]  recent incidents, newest first
 olly incident <id>          one incident in full
 olly pause <minutes>        stop slowing and pausing apps for a while
 olly resume                 end a pause early
@@ -48,6 +48,22 @@ olly watch                  follow what olly does, live
 ```
 
 `olly daemon [--config PATH] [--root PATH]` is what the systemd unit runs. A pause is capped at `max_pause_secs` (one hour by default).
+
+## Tray face
+
+`scripts/install.sh` also installs a small Plasma system-tray widget (`org.olly.tray`) for your user, if `kpackagetool6` is available. It shows olly's mood as a face:
+
+- **All good:** green, happy eyes.
+- **Watching:** blue, pressure rising.
+- **Worried:** amber, warning or worse.
+- **On it!:** red, olly acted in the last minute.
+- **Needs you:** orange, an app is frozen and waiting on you.
+- **Napping:** purple, paused.
+- **Offline:** grey, daemon not reachable.
+
+Click it for a popup with the mood and stats, a Close it / Let it run card while something is frozen, the last 3 incidents (click one to expand it; "All incidents…" shows 20), and Pause 30 min / Wake olly up.
+
+If you don't see it, log out and back in, then check System Tray Settings → Entries → olly → Always shown. The installer never restarts plasmashell.
 
 ## The never-kill list
 
@@ -83,6 +99,7 @@ These need a real machine and root, so they aren't part of `cargo test`. Always 
 1. **Daemon in dry-run (as root, test thresholds).** Copy `dist/config.toml` to `/tmp/olly-test.toml`, keep `dry_run = true`, and raise the thresholds so a capped hog can trigger them: `watch_avail = 45`, `warning_avail = 40`, `critical_avail = 35`, `emergency_avail = 25` (suited to about 16 GB free on a 30 GB machine; adjust for yours). Run `sudo OLLY_RUN_DIR=/tmp/olly target/debug/olly daemon --config /tmp/olly-test.toml`. In a second terminal run `systemd-run --user --scope -p MemoryMax=14G target/release/examples/memhog 512`. Expect level changes and "would have" actions naming memhog on stderr, and a clean exit on Ctrl-C.
 2. **Notification agent.** With that daemon running, also run `cargo run --bin olly-notify`. Try `olly status`, `olly pause 1`, `olly status` (shows the pause), `olly resume`. Then run memhog again: a KDE notification with Kill/Resume should appear, and clicking Kill should leave `olly status` showing nothing frozen.
 3. **End to end.** Run `scripts/install.sh`, switch `/etc/olly/config.toml` to `dry_run = false` with the same raised thresholds, and restart olly. Run `systemd-run --user --scope -p MemoryMax=14G target/release/examples/memhog 1024`. Expect throttle and/or freeze notifications, then a kill before the 14G cap, the incident in `olly incidents`, and a Claude hunch once memory recovers. Afterwards restore the shipped config (`dry_run = true`, default thresholds) and restart olly.
+4. **Tray face.** Run `scripts/install.sh` and look for the olly face in the system tray. With the dry-run daemon and raised thresholds from check 1, run memhog and watch the face move through its moods. Then, on a dry-run freeze, press Close it and Let it run in the popup and confirm `olly status` agrees.
 
 ## Uses
 
