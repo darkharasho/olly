@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub struct Psi {
     pub some_avg10: f32,
     pub full_avg10: f32,
+    /// `full total=`: cumulative microseconds all tasks were stalled on memory.
+    pub full_total: u64,
 }
 
 fn avg10(line: &str) -> Option<f32> {
@@ -17,19 +19,29 @@ fn avg10(line: &str) -> Option<f32> {
         .ok()
 }
 
+fn total(line: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|t| t.strip_prefix("total="))?
+        .parse()
+        .ok()
+}
+
 pub fn parse_psi(s: &str) -> Option<Psi> {
     let mut some = None;
     let mut full = None;
+    let mut full_total = None;
     for line in s.lines() {
         if line.starts_with("some ") {
             some = avg10(line);
         } else if line.starts_with("full ") {
             full = avg10(line);
+            full_total = total(line);
         }
     }
     Some(Psi {
         some_avg10: some?,
         full_avg10: full?,
+        full_total: full_total?,
     })
 }
 
@@ -172,9 +184,10 @@ mod tests {
 
     #[test]
     fn psi_parses_some_and_full() {
-        let p = parse_psi("some avg10=1.50 avg60=0.00 avg300=0.01 total=1\nfull avg10=0.75 avg60=0 avg300=0 total=1\n").unwrap();
+        let p = parse_psi("some avg10=1.50 avg60=0.00 avg300=0.01 total=1\nfull avg10=0.75 avg60=0 avg300=0 total=34906813\n").unwrap();
         assert_eq!(p.some_avg10, 1.5);
         assert_eq!(p.full_avg10, 0.75);
+        assert_eq!(p.full_total, 34906813);
     }
 
     #[test]

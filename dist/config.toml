@@ -71,6 +71,9 @@ freeze_remind_secs = 60
 freeze_giveup_secs = 300
 # Minimum seconds between two actions.
 action_cooldown_secs = 5
+# After closing an app, olly waits until it is really gone and then this many
+# more seconds, so memory can settle, before it closes anything else.
+kill_settle_secs = 10
 
 [growth]
 # Window for spotting fast growth, in seconds.

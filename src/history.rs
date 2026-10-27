@@ -151,7 +151,9 @@ mod tests {
             exe: None,
             kind: TargetKind::Cgroup,
             bytes,
+            ram: bytes,
             names: vec!["x".into()],
+            exe_names: vec![],
         }
     }
 

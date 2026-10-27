@@ -542,6 +542,13 @@ mod tests {
             assert!(handle_line(&line).is_err(), "{name:?}");
         }
         assert!(handle_line(r#"{"cmd":"allowlist_add","name":"fire fox"}"#).is_ok());
+        // Longer than the 15-char comm: matches through the exe basename.
+        assert_eq!(
+            handle_line(r#"{"cmd":"allowlist_add","name":"kwin_wayland_wrapper"}"#),
+            Ok(Request::AllowlistAdd {
+                name: "kwin_wayland_wrapper".into()
+            })
+        );
     }
 
     #[test]

@@ -348,7 +348,9 @@ mod tests {
             psi: Psi {
                 some_avg10: full,
                 full_avg10: full,
+                full_total: 0,
             },
+            full_now: Some(full),
             mem: MemInfo {
                 total: 32 * GB,
                 available: avail,
@@ -367,7 +369,9 @@ mod tests {
             exe: None,
             kind: TargetKind::Cgroup,
             bytes,
+            ram: bytes,
             names: vec![format!("app{i}")],
+            exe_names: vec![],
         }
     }
 

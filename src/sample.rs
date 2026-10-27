@@ -1,10 +1,11 @@
 //! Periodic sampling: system pressure plus per-app memory with lineage grouping.
 
 use crate::procfs::{
-    list_pids, parse_meminfo, parse_psi, parse_zram_used, read_proc, read_u64_file, MemInfo, Proc,
-    Psi,
+    list_pids, parse_meminfo, parse_psi, parse_status, parse_zram_used, read_proc, read_u64_file,
+    MemInfo, Proc, Psi,
 };
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,9 @@ const SMALL_PROC: u64 = 64 * 1024 * 1024;
 pub struct SystemSample {
     pub t_ms: u64,
     pub psi: Psi,
+    /// Instantaneous `full` stall, in percent, since the previous sample: the `full total=`
+    /// delta over the elapsed time. None on the first sample or after a counter reset.
+    pub full_now: Option<f32>,
     pub mem: MemInfo,
     pub zram_used: u64,
 }
@@ -43,13 +47,19 @@ pub struct AppSample {
     pub kind: TargetKind,
     /// RAM + swap.
     pub bytes: u64,
+    /// RAM only: memory.current for a cgroup, summed RSS for a process group.
+    pub ram: u64,
     /// comm of every member, for allowlist matching.
     pub names: Vec<String>,
+    /// exe basename of every member (comm is cut at 15 chars), for allowlist matching.
+    pub exe_names: Vec<String>,
 }
 
 pub struct Sampler {
     root: PathBuf,
     uid: u32,
+    /// (t_ms, full total) from the previous `system` call, for `full_now`.
+    prev_full: Cell<Option<(u64, u64)>>,
 }
 
 fn rel(root: &Path, p: &str) -> PathBuf {
@@ -58,6 +68,22 @@ fn rel(root: &Path, p: &str) -> PathBuf {
 
 fn mem_of(p: &Proc) -> u64 {
     p.status.rss + p.status.swap
+}
+
+/// Basename of `exe`, without the " (deleted)" the kernel adds for a replaced binary.
+fn exe_name(p: &Proc) -> Option<String> {
+    let name = p.exe.as_ref()?.file_name()?.to_str()?;
+    Some(name.strip_suffix(" (deleted)").unwrap_or(name).to_string())
+}
+
+/// Stall percentage between two `full total=` readings (microseconds).
+fn stall_pct(prev: Option<(u64, u64)>, t_ms: u64, total: u64) -> Option<f32> {
+    let (t0, total0) = prev?;
+    if t_ms <= t0 || total < total0 {
+        return None;
+    }
+    let pct = (total - total0) as f64 / ((t_ms - t0) as f64 * 1000.0) * 100.0;
+    Some(pct.min(100.0) as f32)
 }
 
 /// Walk up in-cgroup parents while the child belongs to the parent's group.
@@ -80,7 +106,11 @@ fn group_root(procs: &HashMap<i32, &Proc>, pid: i32) -> i32 {
 
 impl Sampler {
     pub fn new(root: PathBuf, uid: u32) -> Self {
-        Self { root, uid }
+        Self {
+            root,
+            uid,
+            prev_full: Cell::new(None),
+        }
     }
 
     pub fn system(&self, t_ms: u64) -> Option<SystemSample> {
@@ -89,9 +119,12 @@ impl Sampler {
         let zram_used = fs::read_to_string(self.root.join("sys/block/zram0/mm_stat"))
             .map(|s| parse_zram_used(&s))
             .unwrap_or(0);
+        let full_now = stall_pct(self.prev_full.get(), t_ms, psi.full_total);
+        self.prev_full.set(Some((t_ms, psi.full_total)));
         Some(SystemSample {
             t_ms,
             psi,
+            full_now,
             mem,
             zram_used,
         })
@@ -120,14 +153,15 @@ impl Sampler {
             for p in procs {
                 groups.entry(group_root(&index, p.pid)).or_default().push(p);
             }
-            let single = groups.len() == 1;
+            // The whole cgroup is a target only if every process in it is the user's.
+            let single = groups.len() == 1 && !self.has_foreign(cgroup, &index);
             for (root_pid, mut members) in groups {
                 members.sort_by_key(|p| p.pid);
                 let root = index[&root_pid];
-                let (key, kind, bytes) = if single {
+                let (key, kind, bytes, ram) = if single {
                     let dir = rel(&self.root, &format!("sys/fs/cgroup{cgroup}"));
-                    let bytes = read_u64_file(&dir.join("memory.current"))
-                        + read_u64_file(&dir.join("memory.swap.current"));
+                    let ram = read_u64_file(&dir.join("memory.current"));
+                    let bytes = ram + read_u64_file(&dir.join("memory.swap.current"));
                     (
                         AppKey {
                             cgroup: cgroup.clone(),
@@ -135,6 +169,7 @@ impl Sampler {
                         },
                         TargetKind::Cgroup,
                         bytes,
+                        ram,
                     )
                 } else {
                     (
@@ -146,20 +181,48 @@ impl Sampler {
                             pids: members.iter().map(|p| (p.pid, p.start_time)).collect(),
                         },
                         members.iter().map(|p| mem_of(p)).sum(),
+                        members.iter().map(|p| p.status.rss).sum(),
                     )
                 };
+                let mut exe_names: Vec<String> = Vec::new();
+                for n in members.iter().filter_map(|p| exe_name(p)) {
+                    if !exe_names.contains(&n) {
+                        exe_names.push(n);
+                    }
+                }
                 out.push(AppSample {
                     key,
                     name: root.status.name.clone(),
                     exe: root.exe.clone(),
                     kind,
                     bytes,
+                    ram,
                     names: members.iter().map(|p| p.status.name.clone()).collect(),
+                    exe_names,
                 });
             }
         }
         out.sort_by(|a, b| (&a.key.cgroup, a.key.root_pid).cmp(&(&b.key.cgroup, b.key.root_pid)));
         out
+    }
+
+    /// True if `cgroup.procs` lists a live pid owned by someone other than the desktop
+    /// user (root helpers, other users). `ours` holds the user's pids in this cgroup.
+    fn has_foreign(&self, cgroup: &str, ours: &HashMap<i32, &Proc>) -> bool {
+        let dir = rel(&self.root, &format!("sys/fs/cgroup{cgroup}"));
+        let Ok(procs) = fs::read_to_string(dir.join("cgroup.procs")) else {
+            return false;
+        };
+        procs
+            .split_whitespace()
+            .filter_map(|t| t.parse::<i32>().ok())
+            .filter(|pid| !ours.contains_key(pid))
+            .any(|pid| {
+                fs::read_to_string(rel(&self.root, &format!("proc/{pid}/status")))
+                    .ok()
+                    .and_then(|t| parse_status(&t))
+                    .is_some_and(|st| st.uid != self.uid)
+            })
     }
 
     /// memory.current + memory.swap.current for every populated cgroup under
@@ -276,6 +339,116 @@ mod tests {
         assert_eq!(s.zram_used, 976678912);
         let empty = Sampler::new(PathBuf::from("/nonexistent/olly"), 1000);
         assert!(empty.system(0).is_none());
+    }
+
+    /// A private copy of the steam fixture (symlinks kept), safe to modify.
+    fn fixture_copy() -> tempfile::TempDir {
+        fn copy(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for e in fs::read_dir(from).unwrap() {
+                let e = e.unwrap();
+                let (src, dst) = (e.path(), to.join(e.file_name()));
+                let ft = e.file_type().unwrap();
+                if ft.is_symlink() {
+                    std::os::unix::fs::symlink(fs::read_link(&src).unwrap(), &dst).unwrap();
+                } else if ft.is_dir() {
+                    copy(&src, &dst);
+                } else {
+                    fs::copy(&src, &dst).unwrap();
+                }
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        copy(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"),
+            d.path(),
+        );
+        d
+    }
+
+    #[test]
+    fn full_now_from_total_delta() {
+        let d = fixture_copy();
+        let s = Sampler::new(d.path().to_path_buf(), 1000);
+        let psi = |total: u64| {
+            let p = d.path().join("proc/pressure/memory");
+            fs::write(
+                &p,
+                format!("some avg10=60.00 avg60=0 avg300=0 total={total}\nfull avg10=55.00 avg60=0 avg300=0 total={total}\n"),
+            )
+            .unwrap();
+        };
+        psi(10_000_000);
+        assert_eq!(s.system(1_000).unwrap().full_now, None);
+        // 500 ms of full stall in a 2 s interval: 25%, whatever avg10 says.
+        psi(10_500_000);
+        let now = s.system(3_000).unwrap();
+        assert_eq!(now.psi.full_avg10, 55.0);
+        assert_eq!(now.full_now, Some(25.0));
+        psi(10_500_000);
+        assert_eq!(s.system(4_000).unwrap().full_now, Some(0.0));
+        // A counter that went backwards gives no reading rather than a wrong one.
+        psi(1);
+        assert_eq!(s.system(5_000).unwrap().full_now, None);
+    }
+
+    #[test]
+    fn ram_excludes_swap() {
+        let apps = sampler().apps();
+        let ff = apps.iter().find(|a| a.name == "firefox").unwrap();
+        assert_eq!(ff.ram, 2_000_000_000);
+        assert_eq!(ff.bytes, 2_000_000_100);
+        let game = apps.iter().find(|a| a.name == "game.exe").unwrap();
+        assert_eq!(game.ram, 9 * GIB);
+    }
+
+    #[test]
+    fn exe_basenames_for_allowlist() {
+        let apps = sampler().apps();
+        let game = apps.iter().find(|a| a.name == "game.exe").unwrap();
+        assert_eq!(game.exe_names, vec!["wine64-preloader"]);
+        let client = apps.iter().find(|a| a.name == "steam").unwrap();
+        assert_eq!(client.exe_names, vec!["steam", "reaper"]);
+    }
+
+    #[test]
+    fn cgroup_with_root_process_becomes_process_target() {
+        let d = fixture_copy();
+        let ff = "user.slice/user-1000.slice/user@1000.service/app.slice/app-org.mozilla.firefox-1.scope";
+        let p = d.path().join("proc/204");
+        fs::create_dir_all(&p).unwrap();
+        fs::write(
+            p.join("status"),
+            "Name:\thelper\nPPid:\t1\nUid:\t0\t0\t0\t0\nVmRSS:\t1024 kB\nVmSwap:\t0 kB\n",
+        )
+        .unwrap();
+        fs::write(
+            p.join("stat"),
+            "204 (helper) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 1204 1 1 0\n",
+        )
+        .unwrap();
+        fs::write(p.join("cgroup"), format!("0::/{ff}\n")).unwrap();
+        fs::write(
+            d.path().join("sys/fs/cgroup").join(ff).join("cgroup.procs"),
+            "200\n201\n202\n204\n",
+        )
+        .unwrap();
+        let apps = Sampler::new(d.path().to_path_buf(), 1000).apps();
+        let ff: Vec<_> = apps
+            .iter()
+            .filter(|a| a.key.cgroup.contains("firefox"))
+            .collect();
+        assert_eq!(ff.len(), 1);
+        // Never freeze or kill the cgroup: only the desktop user's own processes.
+        assert_eq!(
+            ff[0].kind,
+            TargetKind::Processes {
+                pids: vec![(200, 1200), (201, 1201), (202, 1202)]
+            }
+        );
+        assert_eq!(ff[0].key.root_pid, Some(200));
+        assert_eq!(ff[0].bytes, 2 * GIB);
+        assert_eq!(ff[0].ram, 2 * GIB);
     }
 
     #[test]

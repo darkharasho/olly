@@ -41,6 +41,8 @@ pub struct Timing {
     pub freeze_remind_secs: u64,
     pub freeze_giveup_secs: u64,
     pub action_cooldown_secs: u64,
+    /// After a kill, no further kill until the target is gone and this long has passed.
+    pub kill_settle_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -131,6 +133,7 @@ impl Default for Timing {
             freeze_remind_secs: 60,
             freeze_giveup_secs: 300,
             action_cooldown_secs: 5,
+            kill_settle_secs: 10,
         }
     }
 }

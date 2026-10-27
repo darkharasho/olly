@@ -88,15 +88,26 @@ pub enum Command {
 }
 
 const MIB: u64 = 1024 * 1024;
+/// At most this many last-resort (size-based) kills per incident.
+const LAST_RESORT_CAP: u32 = 2;
+
+fn avail_pct(s: &SystemSample) -> f32 {
+    if s.mem.total == 0 {
+        100.0
+    } else {
+        (s.mem.available as f64 * 100.0 / s.mem.total as f64) as f32
+    }
+}
+
+/// Session services (plasmashell and friends) are never a last-resort pick.
+fn in_session_slice(a: &AppSample) -> bool {
+    a.key.cgroup.contains("/session.slice/")
+}
 
 /// Highest level whose full-PSI or available-memory threshold is met.
 pub fn classify(s: &SystemSample, t: &Thresholds) -> Level {
     let full = s.psi.full_avg10;
-    let avail = if s.mem.total == 0 {
-        100.0
-    } else {
-        (s.mem.available as f64 * 100.0 / s.mem.total as f64) as f32
-    };
+    let avail = avail_pct(s);
     if full >= t.emergency_full || avail <= t.emergency_avail {
         Level::Emergency
     } else if full >= t.critical_full || avail <= t.critical_avail {
@@ -108,6 +119,14 @@ pub fn classify(s: &SystemSample, t: &Thresholds) -> Level {
     } else {
         Level::Calm
     }
+}
+
+/// The last kill, until its target is gone and memory has had time to settle.
+struct KillWait {
+    id: u64,
+    key: AppKey,
+    /// When the target was first seen gone from the samples.
+    gone_at: Option<u64>,
 }
 
 struct FrozenState {
@@ -133,6 +152,16 @@ pub struct Engine {
     resumed: Vec<AppKey>,
     /// Dry run only: already "killed" this incident, so not chosen again.
     dry_killed: Vec<AppKey>,
+    /// Blocks the next kill until the last one's target is gone and settled.
+    kill_wait: Option<KillWait>,
+    /// MemAvailable when the last kill this incident happened; None before the first.
+    avail_at_kill: Option<u64>,
+    /// MemAvailable in the current sample (kills from commands have no sample).
+    last_avail: u64,
+    last_resorts: u32,
+    cap_noticed: bool,
+    /// The actuator couldn't kill these this incident; not picked again.
+    stuck: Vec<AppKey>,
 }
 
 impl Engine {
@@ -150,11 +179,59 @@ impl Engine {
             next_target_id: 1,
             resumed: Vec::new(),
             dry_killed: Vec::new(),
+            kill_wait: None,
+            avail_at_kill: None,
+            last_avail: 0,
+            last_resorts: 0,
+            cap_noticed: false,
+            stuck: Vec::new(),
         }
     }
 
     pub fn set_next_incident_id(&mut self, id: u64) {
         self.next_incident_id = id;
+    }
+
+    /// Seed target ids (e.g. from wall time) so ids from before a restart never match.
+    pub fn set_next_target_id(&mut self, id: u64) {
+        self.next_target_id = id;
+    }
+
+    /// The actuator could not kill target `id`, so it won't go away by itself. Stop
+    /// waiting for it (the settle window still runs from now) and don't pick it again
+    /// this incident.
+    pub fn kill_failed(&mut self, id: u64, now_ms: u64) {
+        if let Some(w) = self.kill_wait.as_mut().filter(|w| w.id == id) {
+            w.gone_at.get_or_insert(now_ms);
+            if !self.stuck.contains(&w.key) {
+                self.stuck.push(w.key.clone());
+            }
+        }
+    }
+
+    /// No kill until the last killed target is gone and `kill_settle_secs` have passed.
+    fn may_kill(&self, now: u64) -> bool {
+        let settle = self.cfg.timing.kill_settle_secs * 1000;
+        self.kill_wait
+            .as_ref()
+            .is_none_or(|w| w.gone_at.is_some_and(|g| now.saturating_sub(g) >= settle))
+    }
+
+    /// After a kill this incident, a further emergency kill needs the emergency to be
+    /// real right now, not in the lagging avg10: available memory at the emergency
+    /// line, or the stall since the last sample at emergency while available memory
+    /// has not come back (by at least 1% of RAM) since the kill.
+    fn still_emergency(&self, sys: &SystemSample) -> bool {
+        let Some(avail_then) = self.avail_at_kill else {
+            return true;
+        };
+        let t = &self.cfg.thresholds;
+        if avail_pct(sys) <= t.emergency_avail {
+            return true;
+        }
+        let stalled = sys.full_now.is_some_and(|f| f >= t.emergency_full);
+        let improved = sys.mem.available >= avail_then.saturating_add(sys.mem.total / 100);
+        stalled && !improved
     }
 
     pub fn step(
@@ -180,7 +257,8 @@ impl Engine {
             self.incident = Some(id);
             out.events.push(Event::IncidentStart { id, t_ms: now });
         }
-        if level == Level::Calm && sys.psi.some_avg10 < self.cfg.thresholds.calm_some {
+        // Below Warning counts as calm for closing: a busy desktop can sit at Watch for hours.
+        if level < Level::Warning && sys.psi.some_avg10 < self.cfg.thresholds.calm_some {
             self.calm_since.get_or_insert(now);
         } else {
             self.calm_since = None;
@@ -191,7 +269,19 @@ impl Engine {
                 .calm_since
                 .is_some_and(|c| now.saturating_sub(c) >= self.cfg.timing.calm_end_secs * 1000);
 
-        // 2. Frozen targets.
+        // The last kill's target is gone once it no longer shows up in the samples.
+        self.last_avail = sys.mem.available;
+        if let Some(w) = self.kill_wait.as_mut() {
+            if w.gone_at.is_none() && find(&w.key).is_none() {
+                w.gone_at = Some(now);
+            }
+        }
+        if self.may_kill(now) {
+            self.kill_wait = None;
+        }
+        let confirmed = self.still_emergency(sys);
+
+        // 2. Frozen targets. At most one kill per step, then the settle window.
         let tm = &self.cfg.timing;
         let (grace, remind, giveup) = (
             tm.freeze_grace_secs * 1000,
@@ -206,7 +296,9 @@ impl Engine {
             f.target.bytes = a.bytes;
             let elapsed = now.saturating_sub(f.at_ms);
             let mut reason = None;
-            if level == Level::Emergency {
+            if !self.may_kill(now) {
+                // Decided once the last kill has settled.
+            } else if level == Level::Emergency && confirmed {
                 reason = Some(KillReason::Emergency);
             } else {
                 if !f.grace_checked && elapsed >= grace {
@@ -240,7 +332,11 @@ impl Engine {
         let mut cands: Vec<(&AppSample, f64, bool, bool)> = apps
             .iter()
             .filter(|a| {
-                !allow.allows_app(a) && !self.is_frozen(&a.key) && !self.dry_killed.contains(&a.key)
+                !allow.allows_app(a)
+                    && !self.is_frozen(&a.key)
+                    && !self.dry_killed.contains(&a.key)
+                    && !self.stuck.contains(&a.key)
+                    && self.kill_wait.as_ref().is_none_or(|w| w.key != a.key)
             })
             .map(|a| {
                 let gentle = !self.resumed.contains(&a.key);
@@ -274,7 +370,8 @@ impl Engine {
                         continue;
                     }
                     let target = self.target_for(a);
-                    let high = (a.bytes * 105 / 100).max(a.bytes + 128 * MIB);
+                    // memory.high caps RAM only; swap (zram) doesn't count against it.
+                    let high = (a.ram * 105 / 100).max(a.ram + 128 * MIB);
                     let message = voice::throttled(&a.name, (rate * 60.0) as u64, dry);
                     self.throttled.push(target.clone());
                     self.act(&mut out, Action::Throttle { target, high }, message);
@@ -295,16 +392,30 @@ impl Engine {
                     self.act(&mut out, Action::Freeze { target }, message);
                 }
             }
-            Level::Emergency if cooled => {
+            Level::Emergency if cooled && confirmed && self.may_kill(now) => {
                 let pick = match top_growing {
                     Some(a) => Some((a, KillReason::Emergency)),
+                    None if self.last_resorts >= LAST_RESORT_CAP => {
+                        if !self.cap_noticed {
+                            self.cap_noticed = true;
+                            out.events.push(Event::Notice {
+                                message: voice::last_resort_cap(),
+                                frozen_id: None,
+                            });
+                        }
+                        None
+                    }
                     None => cands
                         .iter()
                         .map(|c| c.0)
+                        .filter(|a| !in_session_slice(a))
                         .max_by_key(|a| a.bytes)
                         .map(|a| (a, KillReason::LastResort)),
                 };
                 if let Some((a, reason)) = pick {
+                    if reason == KillReason::LastResort {
+                        self.last_resorts += 1;
+                    }
                     let target = self.target_for(a);
                     self.kill(&mut out, target, reason, now);
                 }
@@ -322,6 +433,11 @@ impl Engine {
             }
             self.resumed.clear();
             self.dry_killed.clear();
+            self.stuck.clear();
+            self.kill_wait = None;
+            self.avail_at_kill = None;
+            self.last_resorts = 0;
+            self.cap_noticed = false;
             if let Some(id) = self.incident.take() {
                 out.events.push(Event::IncidentEnd { id, t_ms: now });
                 out.events.push(Event::Notice {
@@ -408,11 +524,19 @@ impl Engine {
         Ok(self.frozen.remove(i).target)
     }
 
-    /// Kill `target`: forget it everywhere and start the cooldown.
+    /// Kill `target`: forget it everywhere, start the cooldown, and hold further kills
+    /// until it is gone and settled.
     fn kill(&mut self, out: &mut StepOutput, target: Target, reason: KillReason, now: u64) {
         self.frozen.retain(|f| f.target.key != target.key);
         self.throttled.retain(|t| t.key != target.key);
         self.last_action_ms = Some(now);
+        self.avail_at_kill = Some(self.last_avail);
+        // A dry-run target never goes away, so it counts as gone at once.
+        self.kill_wait = Some(KillWait {
+            id: target.id,
+            key: target.key.clone(),
+            gone_at: self.cfg.dry_run.then_some(now),
+        });
         if self.cfg.dry_run {
             self.dry_killed.push(target.key.clone());
         }
@@ -447,7 +571,10 @@ mod tests {
             psi: Psi {
                 some_avg10: some,
                 full_avg10: full,
+                full_total: 0,
             },
+            // Instantaneous stall tracks avg10 unless a test says otherwise.
+            full_now: Some(full),
             mem: MemInfo {
                 total: TOTAL,
                 available: (TOTAL as f64 * avail_pct as f64 / 100.0) as u64,
@@ -479,7 +606,9 @@ mod tests {
             exe: None,
             kind,
             bytes,
+            ram: bytes,
             names: vec![name.into()],
+            exe_names: vec![],
         }
     }
 
@@ -816,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_spaces_kills() {
+    fn kills_spaced_by_settle() {
         let mut sim = Sim::new();
         let other = |t: u64| {
             app(
@@ -848,9 +977,10 @@ mod tests {
                 alive[if name == "leaky" { 0 } else { 1 }] = false;
             }
         }
+        // leaky is gone from 12s; the settle window then runs 10s.
         assert_eq!(
             kill_times,
-            vec![(11_000, "leaky".to_string()), (16_000, "other".to_string())]
+            vec![(11_000, "leaky".to_string()), (22_000, "other".to_string())]
         );
     }
 
@@ -1104,6 +1234,285 @@ mod tests {
         );
         assert_eq!(out.actions.len(), 1);
         assert!(notices(&out).is_empty(), "{:?}", out.events);
+    }
+
+    /// `full_avg10` and the instantaneous `full_now` given separately.
+    fn sys_now(t: u64, full: f32, full_now: f32, avail_pct: f32) -> SystemSample {
+        SystemSample {
+            full_now: Some(full_now),
+            ..sys(t, 0.0, full, avail_pct)
+        }
+    }
+
+    fn other(t: u64) -> AppSample {
+        app(
+            "other",
+            "/other",
+            TargetKind::Cgroup,
+            8 * GIB + t * (GIB / 20) / 1000,
+        )
+    }
+
+    #[test]
+    fn no_second_kill_while_avg10_lags() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t), other(t)]);
+        let out = sim.step(emergency(11_000), &[leak(11_000), other(11_000)]);
+        assert_eq!(
+            kills(&out),
+            vec![("leaky".to_string(), KillReason::Emergency)]
+        );
+        // leaky is gone. avg10 lags at 55 for a long while, but the stall since the last
+        // sample is down to 5%: the kill worked, so "other" must not be killed.
+        for s in 12..=60 {
+            let t = s * 1000;
+            let out = sim.step(sys_now(t, 55.0, 5.0, 50.0), &[other(t)]);
+            assert!(kills(&out).is_empty(), "t {t}: {:?}", out.actions);
+        }
+        assert_eq!(sim.eng.level(), Level::Emergency);
+        // If the stall really climbs back to emergency, olly does move on to "other".
+        let out = sim.step(sys_now(61_000, 55.0, 60.0, 50.0), &[other(61_000)]);
+        assert_eq!(
+            kills(&out),
+            vec![("other".to_string(), KillReason::Emergency)]
+        );
+    }
+
+    #[test]
+    fn no_second_kill_once_memory_came_back() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t), other(t)]);
+        let out = sim.step(sys(11_000, 0.0, 30.0, 1.5), &[leak(11_000), other(11_000)]);
+        assert_eq!(kills(&out).len(), 1);
+        // Memory came back (1.5% -> 30%) but swap-in keeps the stall high: no second kill.
+        for s in 12..=40 {
+            let t = s * 1000;
+            let out = sim.step(sys_now(t, 55.0, 70.0, 30.0), &[other(t)]);
+            assert!(kills(&out).is_empty(), "t {t}: {:?}", out.actions);
+        }
+    }
+
+    #[test]
+    fn second_kill_waits_for_target_gone_and_settle() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t), other(t)]);
+        let out = sim.step(emergency(11_000), &[leak(11_000), other(11_000)]);
+        assert_eq!(
+            kills(&out),
+            vec![("leaky".to_string(), KillReason::Emergency)]
+        );
+        // Still at emergency by every measure. leaky takes until 15s to die, so the
+        // settle window runs from 15s, and "other" is only killed at 25s.
+        let mut kill_times = Vec::new();
+        for s in 12..=40 {
+            let t = s * 1000;
+            let apps = if s < 15 {
+                vec![leak(11_000), other(t)]
+            } else {
+                vec![other(t)]
+            };
+            for k in kills(&sim.step(emergency(t), &apps)) {
+                kill_times.push((t, k));
+            }
+            if s >= 25 {
+                break;
+            }
+        }
+        assert_eq!(
+            kill_times,
+            vec![(25_000, ("other".to_string(), KillReason::Emergency))]
+        );
+    }
+
+    #[test]
+    fn failed_kill_does_not_block_forever() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t), other(t)]);
+        let out = sim.step(emergency(11_000), &[leak(11_000), other(11_000)]);
+        let id = match &out.actions[..] {
+            [Action::Kill { target, .. }] => target.id,
+            a => panic!("expected kill, got {a:?}"),
+        };
+        // The actuator could not kill it, so it will never go away by itself.
+        sim.eng.kill_failed(id, 11_000);
+        let mut kill_times = Vec::new();
+        for s in 12..=30 {
+            let t = s * 1000;
+            for k in kills(&sim.step(emergency(t), &[leak(t), other(t)])) {
+                kill_times.push((t, k));
+            }
+        }
+        // Settle still applies; the stuck target is not picked again.
+        assert_eq!(
+            kill_times,
+            vec![(21_000, ("other".to_string(), KillReason::Emergency))]
+        );
+    }
+
+    #[test]
+    fn two_frozen_targets_not_killed_in_one_go() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t), other(t)]);
+        let mut frozen = 0;
+        for s in 11..=16 {
+            let t = s * 1000;
+            let out = sim.step(sys(t, 0.0, 20.0, 4.0), &[leak(t), other(t)]);
+            frozen += out.actions.len();
+        }
+        assert_eq!(frozen, 2);
+        let out = sim.step(emergency(17_000), &[leak(17_000), other(17_000)]);
+        assert_eq!(kills(&out).len(), 1, "{:?}", out.actions);
+    }
+
+    #[test]
+    fn last_resort_capped_per_incident() {
+        let mut sim = Sim::new();
+        let all = [
+            ("a", 12 * GIB),
+            ("b", 10 * GIB),
+            ("c", 8 * GIB),
+            ("d", 6 * GIB),
+        ];
+        let mut alive: Vec<&str> = all.iter().map(|x| x.0).collect();
+        let apps = |alive: &[&str]| -> Vec<AppSample> {
+            all.iter()
+                .filter(|x| alive.contains(&x.0))
+                .map(|&(n, b)| app(n, &format!("/{n}"), TargetKind::Cgroup, b))
+                .collect()
+        };
+        sim.warm(10, |_| apps(&alive));
+        let mut kill_times = Vec::new();
+        let mut capped = Vec::new();
+        for s in 11..=200 {
+            let t = s * 1000;
+            let out = sim.step(emergency(t), &apps(&alive));
+            for (name, reason) in kills(&out) {
+                alive.retain(|n| *n != name);
+                kill_times.push((t, name, reason));
+            }
+            for (m, _) in notices(&out) {
+                capped.push((t, m));
+            }
+        }
+        assert_eq!(
+            kill_times,
+            vec![
+                (11_000, "a".to_string(), KillReason::LastResort),
+                (22_000, "b".to_string(), KillReason::LastResort),
+            ]
+        );
+        assert_eq!(capped, vec![(33_000, voice::last_resort_cap())]);
+        assert_eq!(alive, vec!["c", "d"]);
+
+        // A clear culprit is still closed after the cap, once it counts as growing.
+        let mut after = Vec::new();
+        for s in 201..=215 {
+            let t = s * 1000;
+            let mut v = apps(&alive);
+            v.push(leak(t));
+            after.extend(kills(&sim.step(emergency(t), &v)));
+        }
+        assert_eq!(after, vec![("leaky".to_string(), KillReason::Emergency)]);
+    }
+
+    #[test]
+    fn last_resort_skips_session_slice() {
+        let session =
+            "/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-foo.service";
+        let apps = |with_app: bool| {
+            let mut v = vec![app("plasma-foo", session, TargetKind::Cgroup, 14 * GIB)];
+            if with_app {
+                v.push(app(
+                    "big",
+                    "/user.slice/user-1000.slice/user@1000.service/app.slice/app-big.scope",
+                    TargetKind::Cgroup,
+                    6 * GIB,
+                ));
+            }
+            v
+        };
+        let mut sim = Sim::new();
+        sim.warm(10, |_| apps(true));
+        let out = sim.step(emergency(11_000), &apps(true));
+        assert_eq!(
+            kills(&out),
+            vec![("big".to_string(), KillReason::LastResort)]
+        );
+
+        let mut sim = Sim::new();
+        sim.warm(10, |_| apps(false));
+        for s in 11..=40 {
+            let out = sim.step(emergency(s * 1000), &apps(false));
+            assert!(kills(&out).is_empty(), "step {s}: {:?}", out.actions);
+        }
+    }
+
+    #[test]
+    fn throttle_high_uses_ram_not_swap() {
+        let mut sim = Sim::new();
+        // 4 GiB of the app is in zram swap; memory.high only limits the RAM part.
+        let swapped = |t: u64| {
+            let mut a = leak(t);
+            a.ram = a.bytes - 4 * GIB;
+            a
+        };
+        sim.warm(10, |t| vec![swapped(t)]);
+        let a = swapped(11_000);
+        let out = sim.step(warning(11_000), std::slice::from_ref(&a));
+        match &out.actions[..] {
+            [Action::Throttle { high, .. }] => {
+                assert_eq!(*high, (a.ram * 105 / 100).max(a.ram + 128 * MIB))
+            }
+            x => panic!("expected throttle, got {x:?}"),
+        }
+    }
+
+    #[test]
+    fn incident_closes_while_at_watch() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t)]);
+        let out = sim.step(warning(11_000), &[leak(11_000)]);
+        assert!(matches!(&out.actions[..], [Action::Throttle { .. }]));
+        // A busy game keeps available memory at 12%: Watch, never Calm.
+        let stable = leak(11_000);
+        let mut ended_at = None;
+        for s in 12..=200 {
+            let t = s * 1000;
+            let out = sim.step(sys(t, 0.0, 0.0, 12.0), std::slice::from_ref(&stable));
+            assert_eq!(sim.eng.level(), Level::Watch);
+            if out
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::IncidentEnd { .. }))
+            {
+                assert!(matches!(&out.actions[..], [Action::Unthrottle { .. }]));
+                ended_at = Some(t);
+                break;
+            }
+        }
+        assert_eq!(ended_at, Some(72_000));
+        // "some" above calm_some keeps it open (hysteresis).
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t)]);
+        sim.step(warning(11_000), &[leak(11_000)]);
+        for s in 12..=200 {
+            let out = sim.step(sys(s * 1000, 7.0, 0.0, 50.0), std::slice::from_ref(&stable));
+            assert!(!out
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::IncidentEnd { .. })));
+        }
+    }
+
+    #[test]
+    fn target_ids_start_from_seed() {
+        let mut sim = Sim::new();
+        sim.eng.set_next_target_id(1_761_550_000_000);
+        sim.warm(10, |t| vec![leak(t)]);
+        assert_eq!(
+            freeze_id(&sim.step(critical(11_000), &[leak(11_000)])),
+            1_761_550_000_000
+        );
     }
 
     #[test]

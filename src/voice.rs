@@ -75,6 +75,14 @@ pub fn killed(app: &str, bytes: u64, reason: KillReason, dry: bool) -> Message {
     msg(dry, title, body)
 }
 
+/// Emergency, after the last-resort cap: no more size-based kills this incident.
+pub fn last_resort_cap() -> Message {
+    Message {
+        title: "olly has done what it safely can".to_string(),
+        body: "Memory is still very tight, but nothing is clearly running away and I've already closed two apps, so I won't guess again. Save your work and close something you don't need if you can.".to_string(),
+    }
+}
+
 pub fn resumed(app: &str) -> Message {
     Message {
         title: format!("{app} is running again"),
@@ -182,6 +190,7 @@ mod tests {
             all_clear(),
             hunch("something odd"),
             config_fallback(),
+            last_resort_cap(),
         ];
         for r in [
             KillReason::Emergency,
