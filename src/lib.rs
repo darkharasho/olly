@@ -8,3 +8,5 @@ pub mod actuator;
 pub mod voice;
 pub mod incident;
 pub mod ipc;
+pub mod psi;
+pub mod daemon;

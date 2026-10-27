@@ -1,4 +1,4 @@
-use crate::engine::{KillReason, Level};
+use crate::engine::{Action, KillReason, Level};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -99,6 +99,29 @@ pub fn hunch(summary: &str) -> Message {
     }
 }
 
+/// An action the actuator could not carry out (the target is usually already gone).
+pub fn act_failed(action: &Action) -> Message {
+    let (verb, t) = match action {
+        Action::Throttle { target, .. } => ("slow down", target),
+        Action::Unthrottle { target } => ("ease off", target),
+        Action::Freeze { target } => ("pause", target),
+        Action::Resume { target } => ("resume", target),
+        Action::Kill { target, .. } => ("close", target),
+    };
+    Message {
+        title: format!("olly couldn't {verb} {}", t.name),
+        body: format!("olly tried to {verb} {} but couldn't \u{2014} it may have already closed.", t.name),
+    }
+}
+
+/// Startup notice when config.toml was unreadable or invalid.
+pub fn config_fallback() -> Message {
+    Message {
+        title: "olly couldn't read its config \u{1F916}".to_string(),
+        body: "I'm running on my default settings, and that means live, not a dry run: I'll really act if memory runs out. Check the config file and restart olly to change that.".to_string(),
+    }
+}
+
 /// `paused_remaining_ms` is the time left on a pause, relative to now.
 pub fn status_line(level: Level, avail_bytes: u64, paused_remaining_ms: Option<u64>) -> String {
     let avail = fmt_bytes(avail_bytes);
@@ -130,6 +153,7 @@ mod tests {
             unthrottled("Firefox"),
             all_clear(),
             hunch("something odd"),
+            config_fallback(),
         ];
         for r in [
             KillReason::Emergency,
@@ -259,5 +283,30 @@ mod tests {
             status_line(Level::Calm, 21_000_000_000, Some(61_000)),
             "🤖 olly is watching. All calm — 21 GB free, nothing suspicious. Paused for 2 more min."
         );
+    }
+
+    #[test]
+    fn act_failed_copy() {
+        let t = crate::engine::Target {
+            id: 1,
+            key: crate::sample::AppKey { cgroup: "/c".into(), root_pid: None },
+            name: "Firefox".into(),
+            kind: crate::sample::TargetKind::Cgroup,
+            bytes: 1,
+        };
+        let m = act_failed(&Action::Freeze { target: t.clone() });
+        assert_eq!(m.body, "olly tried to pause Firefox but couldn't \u{2014} it may have already closed.");
+        assert_eq!(m.title, "olly couldn't pause Firefox");
+        let k = act_failed(&Action::Kill { target: t.clone(), reason: KillReason::Emergency });
+        assert!(k.body.starts_with("olly tried to close Firefox"));
+        assert!(act_failed(&Action::Throttle { target: t, high: 1 }).body.contains("slow down"));
+    }
+
+    #[test]
+    fn config_fallback_says_live_defaults() {
+        let m = config_fallback();
+        assert!(m.title.contains("config"));
+        assert!(m.body.contains("default"));
+        assert!(m.body.contains("not a dry run"));
     }
 }

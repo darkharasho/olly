@@ -97,6 +97,26 @@ impl SysActuator {
         Self { cgroup_root, proc_root, active_path, active: ActiveState::default() }
     }
 
+    /// Takes over whatever `recover` left in the active-state file (entries it could not
+    /// undo whose targets still exist), so the next persist keeps them and
+    /// `restore_throttles` / `undo_all` retry them. Returns how many were adopted.
+    pub fn adopt_leftovers(&mut self) -> usize {
+        let Ok(txt) = fs::read_to_string(&self.active_path) else { return 0 };
+        let Ok(left) = serde_json::from_str::<ActiveState>(&txt) else { return 0 };
+        let n = left.frozen.len() + left.throttled.len();
+        for t in left.frozen {
+            if !self.active.frozen.iter().any(|f| f.key == t.key) {
+                self.active.frozen.push(t);
+            }
+        }
+        for (t, prev) in left.throttled {
+            if !self.active.throttled.iter().any(|(f, _)| f.key == t.key) {
+                self.active.throttled.push((t, prev));
+            }
+        }
+        n
+    }
+
     fn persist(&self) {
         if let Err(e) = self.try_persist() {
             eprintln!("olly: cannot persist {}: {e}", self.active_path.display());
@@ -588,5 +608,34 @@ mod tests {
         let left: ActiveState = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(left, ActiveState { frozen: vec![tb], throttled: vec![] });
         assert_eq!(fs::read_to_string(ok.join("memory.high")).unwrap(), "max");
+    }
+
+    #[test]
+    fn adopts_recover_leftovers() {
+        let (d, _, dir) = setup("/a");
+        fs::create_dir_all(d.path().join("cg/b")).unwrap();
+        // memory.high is a directory, so recover's restore fails and the entry stays.
+        fs::create_dir(dir.join("memory.high")).unwrap();
+        let path = d.path().join("state/active.json");
+        let left = ActiveState { frozen: vec![], throttled: vec![(cg_target("/a"), "max".into())] };
+        write_state(&path, &left).unwrap();
+        recover(&d.path().join("cg"), Path::new("/"), &path);
+
+        let mut act = SysActuator::new(d.path().join("cg"), "/".into(), path.clone());
+        assert_eq!(act.adopt_leftovers(), 1);
+        assert_eq!(act.active, left);
+        // The next persist keeps the leftover alongside the new entry.
+        act.apply(&Action::Freeze { target: cg_target("/b") }).unwrap();
+        let st: ActiveState = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(st.throttled, left.throttled);
+        assert_eq!(st.frozen.len(), 1);
+        // Once the cgroup is writable again, restore_throttles retries it.
+        fs::remove_dir(dir.join("memory.high")).unwrap();
+        act.restore_throttles();
+        assert_eq!(fs::read_to_string(dir.join("memory.high")).unwrap(), "max");
+        assert!(act.active.throttled.is_empty());
+        // Nothing to adopt from a missing file.
+        let mut fresh = SysActuator::new(d.path().join("cg"), "/".into(), d.path().join("none.json"));
+        assert_eq!(fresh.adopt_leftovers(), 0);
     }
 }
