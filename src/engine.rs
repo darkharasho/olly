@@ -311,6 +311,37 @@ impl Engine {
         }
         let confirmed = self.still_emergency(sys);
 
+        // 1b. An app that became allowlisted mid-incident (e.g. "Never touch this") is
+        // let go at once: thaw its freeze and lift its throttle.
+        let mut released: Vec<(Target, bool)> = Vec::new();
+        self.frozen.retain(|f| match find(&f.target.key) {
+            Some(a) if allow.allows_app(a) => {
+                let mut t = f.target.clone();
+                t.bytes = a.bytes;
+                released.push((t, true));
+                false
+            }
+            _ => true,
+        });
+        self.throttled.retain(|t| match find(&t.key) {
+            Some(a) if allow.allows_app(a) => {
+                let mut t = t.clone();
+                t.bytes = a.bytes;
+                released.push((t, false));
+                false
+            }
+            _ => true,
+        });
+        for (target, was_frozen) in released {
+            if was_frozen {
+                let message = voice::resumed(&target.name);
+                self.act(&mut out, Action::Resume { target }, message);
+            } else {
+                let message = voice::unthrottled(&target.name);
+                self.act(&mut out, Action::Unthrottle { target }, message);
+            }
+        }
+
         // 2. Frozen targets. At most one kill per step, then the settle window.
         let tm = &self.cfg.timing;
         let (grace, remind, giveup) = (
@@ -929,6 +960,54 @@ mod tests {
             [Action::Freeze { target }] => assert_eq!(target.name, "leaky"),
             a => panic!("expected freeze of leaky, got {a:?}"),
         }
+    }
+
+    fn allow_leaky(sim: &mut Sim) {
+        sim.allow = Allowlist::load(
+            vec!["leaky".into()],
+            PathBuf::from("/nonexistent/olly/a.toml"),
+        );
+    }
+
+    #[test]
+    fn newly_allowlisted_frozen_app_is_thawed() {
+        let mut sim = Sim::new();
+        sim.warm(10, leak_only);
+        let out = sim.step(critical(11_000), &leak_only(11_000));
+        assert!(matches!(&out.actions[..], [Action::Freeze { .. }]), "{:?}", out.actions);
+        assert_eq!(sim.eng.frozen().len(), 1);
+
+        allow_leaky(&mut sim);
+        let out = sim.step(critical(12_000), &leak_only(12_000));
+        match &out.actions[..] {
+            [Action::Resume { target }] => assert_eq!(target.name, "leaky"),
+            a => panic!("expected resume, got {a:?}"),
+        }
+        assert!(sim.eng.frozen().is_empty());
+        // Not frozen, throttled or killed again.
+        let out = sim.step(critical(13_000), &leak_only(13_000));
+        assert!(out.actions.is_empty(), "{:?}", out.actions);
+    }
+
+    #[test]
+    fn newly_allowlisted_throttled_app_is_unthrottled() {
+        let mut sim = Sim::new();
+        sim.warm(10, leak_only);
+        let out = sim.step(warning(11_000), &leak_only(11_000));
+        assert!(matches!(&out.actions[..], [Action::Throttle { .. }]), "{:?}", out.actions);
+        assert_eq!(sim.eng.throttled().len(), 1);
+
+        allow_leaky(&mut sim);
+        let out = sim.step(warning(12_000), &leak_only(12_000));
+        match &out.actions[..] {
+            [Action::Unthrottle { target }] => assert_eq!(target.name, "leaky"),
+            a => panic!("expected unthrottle, got {a:?}"),
+        }
+        assert!(sim.eng.throttled().is_empty());
+    }
+
+    fn leak_only(t: u64) -> Vec<AppSample> {
+        vec![leak(t)]
     }
 
     #[test]

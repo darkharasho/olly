@@ -28,6 +28,19 @@ struct Note {
     urgency: Urg,
     /// Offer Kill and Resume for this frozen target.
     frozen_id: Option<u64>,
+    /// Offer "Never touch this" for this app, by the name the allowlist matches.
+    /// `None` for dry runs and for events that are not about one app.
+    app: Option<String>,
+}
+
+/// The name `olly allow` takes for a target: its process name.
+fn allow_name(action: &Action) -> Option<&str> {
+    match action {
+        Action::Throttle { target, .. }
+        | Action::Freeze { target }
+        | Action::Kill { target, .. } => Some(&target.name),
+        Action::Unthrottle { .. } | Action::Resume { .. } => None,
+    }
 }
 
 /// Maps an event to a notification. `None` for events that are not shown.
@@ -54,6 +67,7 @@ fn map_event(ev: &Event) -> Option<Note> {
                 body: message.body.clone(),
                 urgency: if urgent { Urg::Critical } else { Urg::Normal },
                 frozen_id,
+                app: allow_name(action).filter(|_| !*dry_run).map(str::to_string),
             })
         }
         Event::Notice { message, frozen_id } => Some(Note {
@@ -65,6 +79,7 @@ fn map_event(ev: &Event) -> Option<Note> {
                 Urg::Normal
             },
             frozen_id: *frozen_id,
+            app: None,
         }),
         // An update is announced by the widget and the CLI; the desktop stays quiet.
         Event::Updated { .. } => None,
@@ -249,9 +264,88 @@ fn socket_path() -> PathBuf {
         .map_or_else(|| PathBuf::from("/run/olly/olly.sock"), PathBuf::from)
 }
 
-/// Sends a command over a fresh connection and logs the answer.
-fn send_command(cmd: &str, id: u64) {
-    let line = format!("{{\"cmd\":\"{cmd}\",\"id\":{id}}}\n");
+/// A command for the daemon socket.
+#[derive(Debug, PartialEq)]
+enum Cmd {
+    Kill(u64),
+    Resume(u64),
+    Allow(String),
+}
+
+impl Cmd {
+    fn label(&self) -> String {
+        match self {
+            Cmd::Kill(id) => format!("frozen_kill {id}"),
+            Cmd::Resume(id) => format!("frozen_resume {id}"),
+            Cmd::Allow(name) => format!("allowlist_add {name}"),
+        }
+    }
+
+    /// The request line, as `Request` in ipc.rs reads it.
+    fn wire(&self) -> String {
+        let v = match self {
+            Cmd::Kill(id) => serde_json::json!({"cmd": "frozen_kill", "id": id}),
+            Cmd::Resume(id) => serde_json::json!({"cmd": "frozen_resume", "id": id}),
+            Cmd::Allow(name) => serde_json::json!({"cmd": "allowlist_add", "name": name}),
+        };
+        format!("{v}\n")
+    }
+}
+
+/// The buttons a note offers, as (action key, label).
+fn buttons(frozen_id: Option<u64>, app: Option<&str>) -> Vec<(&'static str, &'static str)> {
+    let mut b = Vec::new();
+    if frozen_id.is_some() {
+        b.push(("kill", "Kill"));
+        b.push(("resume", "Resume"));
+    }
+    if app.is_some() {
+        b.push(("allow", "Never touch this"));
+    }
+    b
+}
+
+/// What a click does. "Never touch this" allowlists the app, then thaws it if frozen.
+fn plan_click(action: &str, frozen_id: Option<u64>, app: Option<&str>) -> Vec<Cmd> {
+    match (action, frozen_id, app) {
+        ("kill", Some(id), _) => vec![Cmd::Kill(id)],
+        ("resume", Some(id), _) => vec![Cmd::Resume(id)],
+        ("allow", fid, Some(app)) => {
+            let mut v = vec![Cmd::Allow(app.to_string())];
+            v.extend(fid.map(Cmd::Resume));
+            v
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn allowed_message(app: &str) -> String {
+    format!("Got it, I'll leave {app} alone from now on.")
+}
+
+/// Runs a click's commands. Once the allowlist add succeeds, says so.
+fn handle_click(action: &str, frozen_id: Option<u64>, app: Option<&str>) {
+    for cmd in plan_click(action, frozen_id, app) {
+        let ok = send_command(&cmd);
+        if ok && matches!(cmd, Cmd::Allow(_)) {
+            if let Some(app) = app {
+                let shown = Notification::new()
+                    .appname("olly")
+                    .icon("dialog-information")
+                    .summary(&allowed_message(app))
+                    .show();
+                if let Err(e) = shown {
+                    eprintln!("olly-notify: cannot show a notification: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Sends a command over a fresh connection and logs the answer. True when the daemon said ok.
+fn send_command(cmd: &Cmd) -> bool {
+    let label = cmd.label();
+    let line = cmd.wire();
     let result = UnixStream::connect(socket_path()).and_then(|mut s| {
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         s.write_all(line.as_bytes())?;
@@ -260,9 +354,18 @@ fn send_command(cmd: &str, id: u64) {
         Ok(resp)
     });
     match result {
-        Ok(r) if r.contains("\"ok\":true") => eprintln!("olly-notify: {cmd} {id}: done"),
-        Ok(r) => eprintln!("olly-notify: {cmd} {id}: {}", r.trim()),
-        Err(e) => eprintln!("olly-notify: {cmd} {id}: {e}"),
+        Ok(r) if r.contains("\"ok\":true") => {
+            eprintln!("olly-notify: {label}: done");
+            true
+        }
+        Ok(r) => {
+            eprintln!("olly-notify: {label}: {}", r.trim());
+            false
+        }
+        Err(e) => {
+            eprintln!("olly-notify: {label}: {e}");
+            false
+        }
     }
 }
 
@@ -271,6 +374,8 @@ fn send_command(cmd: &str, id: u64) {
 struct Shown {
     ids: HashMap<u64, u32>,
     gens: HashMap<u64, Arc<AtomicU64>>,
+    /// The app name behind each frozen target, kept for its later reminders.
+    names: HashMap<u64, String>,
 }
 
 fn show(note: &Note, shown: &Mutex<Shown>) {
@@ -284,14 +389,25 @@ fn show(note: &Note, shown: &Mutex<Shown>) {
         Urg::Critical => Urgency::Critical,
     });
     let mut generation = None;
+    let mut app = note.app.clone();
     if let Some(fid) = note.frozen_id {
-        n.action("kill", "Kill").action("resume", "Resume");
         let mut s = shown.lock().unwrap();
+        match &app {
+            Some(a) => {
+                s.names.insert(fid, a.clone());
+            }
+            // A reminder carries no name; use the one from the freeze notification.
+            None => app = s.names.get(&fid).cloned(),
+        }
         if let Some(&id) = s.ids.get(&fid) {
             n.id(id);
         }
         let g = s.gens.entry(fid).or_default().clone();
         generation = Some((g.fetch_add(1, Ordering::SeqCst) + 1, g));
+    }
+    let offered = buttons(note.frozen_id, app.as_deref());
+    for (key, label) in &offered {
+        n.action(key, label);
     }
     let handle = match n.show() {
         Ok(h) => h,
@@ -300,24 +416,26 @@ fn show(note: &Note, shown: &Mutex<Shown>) {
             return;
         }
     };
-    let (Some(fid), Some((mine, g))) = (note.frozen_id, generation) else {
+    if let (Some(fid), Some(_)) = (note.frozen_id, &generation) {
+        shown.lock().unwrap().ids.insert(fid, handle.id());
+    }
+    if offered.is_empty() {
         return;
-    };
-    shown.lock().unwrap().ids.insert(fid, handle.id());
+    }
+    let frozen_id = note.frozen_id;
     // Waiting for a click blocks, so it gets its own thread. A newer notification for the
     // same target replaces this one; its clicks win and this thread's are ignored.
     let spawned = std::thread::Builder::new()
         .name("olly-notify-action".into())
         .spawn(move || {
             handle.wait_for_action(|action| {
-                if g.load(Ordering::SeqCst) != mine {
+                if generation
+                    .as_ref()
+                    .is_some_and(|(mine, g)| g.load(Ordering::SeqCst) != *mine)
+                {
                     return;
                 }
-                match action {
-                    "kill" => send_command("frozen_kill", fid),
-                    "resume" => send_command("frozen_resume", fid),
-                    _ => {}
-                }
+                handle_click(action, frozen_id, app.as_deref());
             });
         });
     if let Err(e) = spawned {
@@ -414,6 +532,108 @@ mod tests {
             title: "t".into(),
             body: "b".into(),
         }
+    }
+
+    #[test]
+    fn never_touch_offered_for_throttle_freeze_and_kill() {
+        let acted = |action| Event::Acted {
+            action,
+            message: msg(),
+            dry_run: false,
+        };
+        let t = Action::Throttle {
+            target: target(1),
+            high: 5,
+        };
+        let f = Action::Freeze { target: target(2) };
+        let k = Action::Kill {
+            target: target(3),
+            reason: KillReason::Emergency,
+        };
+        for a in [t, f, k] {
+            let n = map_event(&acted(a)).unwrap();
+            assert_eq!(n.app.as_deref(), Some("game.exe"));
+        }
+        for a in [
+            Action::Unthrottle { target: target(1) },
+            Action::Resume { target: target(2) },
+        ] {
+            assert_eq!(map_event(&acted(a)).unwrap().app, None);
+        }
+    }
+
+    #[test]
+    fn dry_runs_and_notices_get_no_never_touch() {
+        let ev = Event::Acted {
+            action: Action::Throttle {
+                target: target(1),
+                high: 5,
+            },
+            message: msg(),
+            dry_run: true,
+        };
+        assert_eq!(map_event(&ev).unwrap().app, None);
+        let n = map_event(&Event::Notice {
+            message: msg(),
+            frozen_id: Some(5),
+        })
+        .unwrap();
+        assert_eq!(n.app, None);
+    }
+
+    #[test]
+    fn button_sets() {
+        assert_eq!(
+            buttons(Some(2), Some("x")),
+            vec![
+                ("kill", "Kill"),
+                ("resume", "Resume"),
+                ("allow", "Never touch this")
+            ]
+        );
+        assert_eq!(
+            buttons(None, Some("x")),
+            vec![("allow", "Never touch this")]
+        );
+        assert_eq!(
+            buttons(Some(2), None),
+            vec![("kill", "Kill"), ("resume", "Resume")]
+        );
+        assert!(buttons(None, None).is_empty());
+    }
+
+    #[test]
+    fn click_plans() {
+        assert_eq!(plan_click("kill", Some(2), Some("x")), vec![Cmd::Kill(2)]);
+        assert_eq!(
+            plan_click("resume", Some(2), Some("x")),
+            vec![Cmd::Resume(2)]
+        );
+        assert_eq!(
+            plan_click("allow", Some(2), Some("x")),
+            vec![Cmd::Allow("x".into()), Cmd::Resume(2)]
+        );
+        assert_eq!(
+            plan_click("allow", None, Some("x")),
+            vec![Cmd::Allow("x".into())]
+        );
+        assert!(plan_click("allow", Some(2), None).is_empty());
+        assert!(plan_click("bogus", Some(2), Some("x")).is_empty());
+    }
+
+    #[test]
+    fn wire_format_matches_ipc() {
+        assert_eq!(Cmd::Kill(7).wire(), "{\"cmd\":\"frozen_kill\",\"id\":7}\n");
+        assert_eq!(
+            Cmd::Resume(7).wire(),
+            "{\"cmd\":\"frozen_resume\",\"id\":7}\n"
+        );
+        let line = Cmd::Allow("we\"ird".into()).wire();
+        assert_eq!(line, "{\"cmd\":\"allowlist_add\",\"name\":\"we\\\"ird\"}\n");
+        assert_eq!(
+            allowed_message("obs"),
+            "Got it, I'll leave obs alone from now on."
+        );
     }
 
     #[test]
