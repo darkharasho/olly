@@ -73,6 +73,16 @@ olly never freezes, throttles, or kills an app that contains one of these proces
 
 Add your own with `olly allow <name>`; those are saved in `/var/lib/olly/allowlist.toml`. Nothing can remove an entry over IPC. To change the base list, edit `allowlist` in the config.
 
+## Releases and updates
+
+To cut a release: bump `version` in `Cargo.toml`; if anything under `plasmoid/` changed, also bump `KPlugin.Version` in `plasmoid/package/metadata.json` (`scripts/release-check.sh` fails the release if you forget); commit; then `git tag vX.Y.Z && git push --tags`. The `v*` tag runs `.github/workflows/release.yml`: it checks the tag matches `Cargo.toml`, runs the tests, builds static musl binaries, bundles them, signs `manifest.json` with minisign (secret `OLLY_MINISIGN_KEY`), and publishes a GitHub release.
+
+olly checks for a new release 5 minutes after it starts and then every 6 hours, only when things are calm. When there's one, the tray antenna glows blue and the popup shows an update card with an Update button. You can also run `olly update --check`, `olly update`, or `olly update --no-wait` (start it and return). An update only installs while olly is calm with nothing frozen or throttled; olly verifies the signature and checksum, swaps the binaries, and checks that the new daemon answers. If it doesn't, olly rolls back by itself. `olly-notify` then upgrades the widget and its user unit; after a changed widget you may need to log out and back in.
+
+To turn off the automatic checks, set `update_check = false` in `/etc/olly/config.toml`. Manual `olly update` still works.
+
+Updates are verified against the public key in `src/update_key.pub` (key ID `FEE7FE12633D6160`). The secret key lives at `~/.config/olly-release/olly-update.key`; back it up somewhere safe and never commit it. To rotate keys, publish one release signed with the old key that carries the new public key; after that, sign with the new one. If the key is lost, installed copies can't verify new releases, so reinstall once with `scripts/install.sh` from a build with the new key. If it leaks, rotate at once.
+
 ## How it relates to systemd-oomd
 
 olly leaves systemd-oomd alone; the two can run side by side. oomd reacts per cgroup after pressure has already stayed high for a while. olly looks at per-app growth as well as pressure, tries gentler options first (throttle, freeze, ask you), and explains itself afterwards. If olly ever fails to act in time, oomd and the kernel OOM killer are still there behind it.

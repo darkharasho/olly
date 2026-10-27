@@ -34,6 +34,8 @@ fi
 rm -f "$HOME/.config/systemd/user/olly-notify.service"
 systemctl --user daemon-reload || true
 sudo rm -f /etc/systemd/system/olly.service /usr/local/bin/olly /usr/local/bin/olly-notify
+sudo rm -rf /usr/local/share/olly /var/lib/olly/update
+sudo rm -f /var/lib/olly/update-result.json
 sudo systemctl daemon-reload
 
 if [ "$purge" -eq 1 ]; then

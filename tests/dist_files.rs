@@ -100,3 +100,43 @@ fn uninstall_removes_the_tray_face_without_failing() {
     assert!(line.contains("2>/dev/null || true"), "{line}");
     assert!(!line.contains("sudo"), "{line}");
 }
+
+#[test]
+fn install_ships_update_copies() {
+    let install = read("scripts/install.sh");
+    for line in [
+        "sudo install -d /usr/local/share/olly",
+        "sudo rm -rf /usr/local/share/olly/plasmoid && sudo cp -r plasmoid/package /usr/local/share/olly/plasmoid",
+        "sudo install -Dm644 dist/olly-notify.service /usr/local/share/olly/olly-notify.service",
+    ] {
+        assert!(has_line(&install, line), "missing {line}");
+    }
+}
+
+#[test]
+fn uninstall_removes_update_files() {
+    let un = read("scripts/uninstall.sh");
+    assert!(un.contains("/usr/local/share/olly"), "{un}");
+    assert!(un.contains("/var/lib/olly/update"), "{un}");
+    assert!(un.contains("/var/lib/olly/update-result.json"), "{un}");
+}
+
+#[test]
+fn widget_version_is_semver() {
+    let meta: serde_json::Value =
+        serde_json::from_str(&read("plasmoid/package/metadata.json")).unwrap();
+    let v = meta["KPlugin"]["Version"].as_str().expect("KPlugin.Version");
+    let parts: Vec<&str> = v.split('.').collect();
+    assert_eq!(parts.len(), 3, "{v}");
+    assert!(
+        parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+        "{v}"
+    );
+}
+
+#[test]
+fn release_key_matches_known_id() {
+    let key = read("src/update_key.pub");
+    let first = key.lines().next().unwrap();
+    assert!(first.ends_with("FEE7FE12633D6160"), "{first}");
+}

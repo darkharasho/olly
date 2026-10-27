@@ -23,6 +23,10 @@ else
     sudo install -Dm644 dist/config.toml /etc/olly/config.toml
 fi
 install -Dm644 dist/olly-notify.service "$HOME/.config/systemd/user/olly-notify.service"
+# Copies the self-updater restores or upgrades from (the widget and notify unit).
+sudo install -d /usr/local/share/olly
+sudo rm -rf /usr/local/share/olly/plasmoid && sudo cp -r plasmoid/package /usr/local/share/olly/plasmoid
+sudo install -Dm644 dist/olly-notify.service /usr/local/share/olly/olly-notify.service
 
 # enable, then restart: a re-run after a rebuild picks up the new binaries.
 sudo systemctl daemon-reload
