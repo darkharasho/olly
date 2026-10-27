@@ -3,3 +3,5 @@ pub mod procfs;
 pub mod sample;
 pub mod history;
 pub mod allowlist;
+pub mod engine;
+pub mod voice;
