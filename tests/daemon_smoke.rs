@@ -102,6 +102,8 @@ fn spawn_on(tmp: &Path, root: &Path, config: &str) -> (Daemon, PathBuf, PathBuf)
         .arg("--config")
         .arg(&cfg)
         .env("OLLY_RUN_DIR", tmp)
+        // Never start a real claude from a test, even in the live config-error test.
+        .env("OLLY_TEST_NO_CLAUDE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&log).unwrap())
@@ -160,6 +162,7 @@ fn daemon_smoke() {
     let stderr = stop(d, &log);
     assert!(!sock.exists(), "socket left behind");
     assert!(stderr.contains("PSI trigger unavailable"), "{stderr}");
+    assert!(stderr.contains("OLLY_TEST_NO_CLAUDE"), "{stderr}");
 }
 
 /// An unreadable config runs live on defaults (desktop_uid 1000) and tells subscribers.
@@ -194,6 +197,10 @@ fn config_error_notice_reaches_subscriber() {
     drop(s);
     let stderr = stop(d, &log);
     assert!(stderr.contains("ERROR"), "{stderr}");
+    assert!(
+        stderr.contains("claude diagnosis is off: OLLY_TEST_NO_CLAUDE"),
+        "{stderr}"
+    );
     assert!(
         !stderr.contains("action="),
         "the live daemon acted on the fixture: {stderr}"

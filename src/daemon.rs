@@ -119,6 +119,20 @@ impl Act {
         }
     }
 
+    /// Undoes freezes and throttles the engine has dropped. Dry run: nothing to undo.
+    fn reconcile(&mut self, engine: &Engine, rlog: &mut RateLog, now: u64) {
+        let Act::Sys(s) = self else { return };
+        let frozen: Vec<u64> = engine.frozen().iter().map(|t| t.id).collect();
+        let throttled: Vec<u64> = engine.throttled().iter().map(|t| t.id).collect();
+        for line in s.reconcile(&frozen, &throttled) {
+            if line.starts_with("could not") {
+                rlog.log("reconcile", now, &format!("reconcile: {line}"));
+            } else {
+                eprintln!("olly: reconcile: {line}");
+            }
+        }
+    }
+
     /// Safety net at IncidentEnd: the actuator's state is the truth about what is applied.
     fn restore_throttles(&mut self) {
         if let Act::Sys(s) = self {
@@ -192,6 +206,18 @@ fn prune_cooldown(seen: &mut HashMap<String, u64>, now: u64) {
 fn in_cooldown(seen: &HashMap<String, u64>, cgroup: &str, now: u64) -> bool {
     seen.get(cgroup)
         .is_some_and(|&t| now.saturating_sub(t) < LEAK_COOLDOWN_MS)
+}
+
+/// Delay until the next sample.
+/// Without a PSI trigger nothing wakes olly early, so even idle it samples about every 2s.
+fn tick_ms(active: bool, psi_ok: bool, active_ms: u64, slow_ms: u64) -> u64 {
+    if active {
+        active_ms
+    } else if psi_ok {
+        slow_ms
+    } else {
+        (2 * active_ms).min(slow_ms)
+    }
 }
 
 /// The notification line: the first paragraph, on one line.
@@ -324,6 +350,14 @@ impl Daemon {
     fn process(&mut self, out: StepOutput) {
         let results: Vec<Result<(), String>> =
             out.actions.iter().map(|a| self.act.apply(a)).collect();
+        let now = self.now();
+        for (a, r) in out.actions.iter().zip(&results) {
+            if let (Action::Kill { target, .. }, Err(_)) = (a, r) {
+                self.engine.kill_failed(target.id, now);
+            }
+        }
+        // Anything the engine let go of (a failed kill, a regrouped key) is undone.
+        self.act.reconcile(&self.engine, &mut self.rlog, now);
         // The engine pushes one Acted event per action, in the same order.
         let mut results = results.into_iter();
         let wall = wall_ms();
@@ -593,8 +627,9 @@ fn bind_socket(p: &Paths, uid: u32) -> Option<UnixListener> {
     Some(listener)
 }
 
-pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
+pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
     let paths = Paths::from_env();
+    let no_claude = std::env::var_os("OLLY_TEST_NO_CLAUDE").is_some_and(|v| v == "1");
     if let Some(e) = &cfg_err {
         let one_line: Vec<&str> = e.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         eprintln!("olly: ERROR: {}", one_line.join(" "));
@@ -643,6 +678,12 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
     let store = IncidentStore::new(paths.incidents.clone());
     let mut engine = Engine::new(cfg.clone());
     engine.set_next_incident_id(store.next_id());
+    // Ids from before a restart (old notification buttons) must not hit a new target.
+    engine.set_next_target_id(wall_ms());
+    if no_claude && cfg.claude.enabled {
+        eprintln!("olly: claude diagnosis is off: OLLY_TEST_NO_CLAUDE is set");
+        cfg.claude.enabled = false;
+    }
     let claude = if cfg.claude.enabled {
         let as_root = unsafe { libc::geteuid() } == 0;
         match ClaudeRunner::new(cfg.claude.clone(), cfg.desktop_uid, as_root) {
@@ -722,7 +763,7 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         let now = d.now();
         if now >= next_tick {
             d.tick(now);
-            next_tick = now + if d.active() { active_ms } else { slow_ms };
+            next_tick = now + tick_ms(d.active(), psi.is_some(), active_ms, slow_ms);
         }
         if now >= next_slow {
             d.slow(now);
@@ -777,9 +818,8 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
             if psi_storm.1 > PSI_STORM {
                 eprintln!("olly: PSI trigger keeps firing; falling back to timeout-only polling");
                 psi = None;
-            } else {
-                next_tick = 0;
             }
+            next_tick = 0;
         }
     }
 }
@@ -832,6 +872,16 @@ mod tests {
         assert!(!in_cooldown(&seen, "/c", 5));
         prune_cooldown(&mut seen, 1_000 + LEAK_COOLDOWN_MS);
         assert!(!seen.contains_key("/a") && seen.contains_key("/b"));
+    }
+
+    #[test]
+    fn idle_cadence_without_psi_trigger() {
+        assert_eq!(tick_ms(true, true, 1000, 60_000), 1000);
+        assert_eq!(tick_ms(true, false, 1000, 60_000), 1000);
+        assert_eq!(tick_ms(false, true, 1000, 60_000), 60_000);
+        // Nothing wakes olly early without the trigger, so idle polling stays quick.
+        assert_eq!(tick_ms(false, false, 1000, 60_000), 2000);
+        assert_eq!(tick_ms(false, false, 1000, 1000), 1000);
     }
 
     #[test]

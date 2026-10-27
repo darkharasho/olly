@@ -252,6 +252,36 @@ impl SysActuator {
         r
     }
 
+    /// Undoes every freeze and throttle the engine no longer lists (by target id), e.g.
+    /// after a failed kill or a target whose key changed. Returns log lines.
+    pub fn reconcile(&mut self, frozen: &[u64], throttled: &[u64]) -> Vec<String> {
+        let mut log = Vec::new();
+        let orphans: Vec<Target> = (self.active.frozen.iter())
+            .filter(|t| !frozen.contains(&t.id))
+            .cloned()
+            .collect();
+        for t in orphans {
+            match self.resume(&t) {
+                Ok(()) => log.push(format!("resumed {}, which olly no longer tracks", t.name)),
+                Err(e) => log.push(format!("could not resume {}: {e}", t.name)),
+            }
+        }
+        let orphans: Vec<Target> = (self.active.throttled.iter())
+            .filter(|(t, _)| !throttled.contains(&t.id))
+            .map(|(t, _)| t.clone())
+            .collect();
+        for t in orphans {
+            match self.unthrottle(&t) {
+                Ok(()) => log.push(format!(
+                    "restored memory.high on {}, which olly no longer tracks",
+                    t.key.cgroup
+                )),
+                Err(e) => log.push(format!("could not restore {}: {e}", t.key.cgroup)),
+            }
+        }
+        log
+    }
+
     /// Writes every stored previous `memory.high` back and clears the throttles.
     pub fn restore_throttles(&mut self) -> Vec<String> {
         let mut log = Vec::new();
@@ -416,6 +446,70 @@ mod tests {
             },
             bytes: 1,
         }
+    }
+
+    fn cg_target_id(cg: &str, id: u64) -> Target {
+        Target {
+            id,
+            ..cg_target(cg)
+        }
+    }
+
+    #[test]
+    fn reconcile_resumes_orphaned_freeze() {
+        let (d, mut act, a) = setup("/a");
+        let b = d.path().join("cg/b");
+        fs::create_dir_all(&b).unwrap();
+        let (ta, tb) = (cg_target_id("/a", 1), cg_target_id("/b", 2));
+        act.apply(&Action::Freeze { target: ta }).unwrap();
+        act.apply(&Action::Freeze { target: tb.clone() }).unwrap();
+        // The engine only still knows about target 2.
+        let log = act.reconcile(&[2], &[]);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(fs::read_to_string(a.join("cgroup.freeze")).unwrap(), "0");
+        assert_eq!(fs::read_to_string(b.join("cgroup.freeze")).unwrap(), "1");
+        assert_eq!(act.active.frozen, vec![tb]);
+        assert!(act.reconcile(&[2], &[]).is_empty());
+
+        // A process target is resumed with a start-time-checked SIGCONT.
+        let c = spawn_sleep();
+        let t = Target {
+            id: 3,
+            ..proc_target(&c, start_time(&c))
+        };
+        act.apply(&Action::Freeze { target: t }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        act.reconcile(&[2], &[]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let s = fs::read_to_string(format!("/proc/{}/stat", c.id())).unwrap();
+        assert_ne!(s[s.rfind(')').unwrap() + 2..].chars().next().unwrap(), 'T');
+        assert_eq!(act.active.frozen.len(), 1);
+    }
+
+    #[test]
+    fn reconcile_restores_orphaned_throttle() {
+        let (d, mut act, a) = setup("/a");
+        let b = d.path().join("cg/b");
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("memory.high"), "max").unwrap();
+        fs::write(b.join("memory.high"), "max").unwrap();
+        let (ta, tb) = (cg_target_id("/a", 1), cg_target_id("/b", 2));
+        for t in [&ta, &tb] {
+            act.apply(&Action::Throttle {
+                target: t.clone(),
+                high: 1000,
+            })
+            .unwrap();
+        }
+        let log = act.reconcile(&[], &[2]);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(fs::read_to_string(a.join("memory.high")).unwrap(), "max");
+        assert_eq!(fs::read_to_string(b.join("memory.high")).unwrap(), "1000");
+        assert_eq!(act.active.throttled, vec![(tb, "max".to_string())]);
+        let st: ActiveState =
+            serde_json::from_str(&fs::read_to_string(d.path().join("state/active.json")).unwrap())
+                .unwrap();
+        assert_eq!(st.throttled.len(), 1);
     }
 
     #[test]
