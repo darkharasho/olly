@@ -10,7 +10,7 @@ The emergency path is plain local rules: no network, no LLM, no spawning process
 - **Acts in steps** as things get worse: throttle a growing app, freeze it and ask you what to do, and in an emergency close it. `olly pause` suspends throttling and freezing for a while, but emergency kills still happen.
 - **Notifies you** with a desktop notification whenever it acts.
 - **Keeps an incident log** in `/var/lib/olly/incidents.jsonl`, with what happened, which app was the biggest, and what olly did.
-- **Asks Claude for a hunch** about slow leaks and after incidents (at most 3 a day by default). This runs sandboxed as your desktop user: read-only tools, no MCP, and your user settings are not loaded. Claude never acts, never edits the never-kill list, and never changes config.
+- **Asks Claude for a hunch** about slow leaks and after incidents (at most 3 a day by default). This runs sandboxed as your desktop user: only the read-only Read, Grep and Glob tools (no shell), no MCP, and your user settings are not loaded. For an incident, olly reads the kernel log itself (up to 200 lines from the incident window) and passes it along as untrusted data. Claude never acts, never edits the never-kill list, and never changes config.
 
 ## Install
 
