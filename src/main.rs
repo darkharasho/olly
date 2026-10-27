@@ -581,6 +581,9 @@ fn main() {
         }
         Ok(Cli::Local(LocalCmd::Supervise { root, from, to })) => {
             use olly::supervise::{supervise, Layout, SystemHost};
+            if unsafe { libc::geteuid() } != 0 {
+                fail("`olly update-supervise` only runs as root; olly starts it for you.");
+            }
             let result = supervise(&Layout::system(), &root, &from, &to, &mut SystemHost);
             std::process::exit(if result.ok { 0 } else { 1 })
         }

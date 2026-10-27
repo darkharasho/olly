@@ -118,3 +118,22 @@ fn json_error_reply() {
     assert!(out.stderr.is_empty());
     assert_eq!(out.status.code(), Some(1));
 }
+
+#[test]
+fn update_supervise_refuses_without_root() {
+    // As root this would really swap files, so it only runs unprivileged.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_olly"))
+        .arg("update-supervise")
+        .arg(dir.path())
+        .args(["0.1.0", "0.2.0"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.contains("only runs as root"), "{err}");
+}
