@@ -78,6 +78,13 @@ pub fn resumed(app: &str) -> Message {
     }
 }
 
+pub fn unthrottled(app: &str) -> Message {
+    Message {
+        title: format!("olly eased off {app}"),
+        body: format!("Memory's calm again, so {app} is back to full speed."),
+    }
+}
+
 pub fn all_clear() -> Message {
     Message {
         title: "All clear! \u{2728}".to_string(),
@@ -120,6 +127,7 @@ mod tests {
             frozen("Firefox", 60, true),
             still_frozen("Firefox"),
             resumed("Firefox"),
+            unthrottled("Firefox"),
             all_clear(),
             hunch("something odd"),
         ];
@@ -218,6 +226,8 @@ mod tests {
         assert_eq!(resumed("X").title, "X is running again");
         assert_eq!(resumed("X").body, "I'll keep a close eye on it.");
         assert_eq!(all_clear().title, "All clear! ✨");
+        assert_eq!(unthrottled("X").title, "olly eased off X");
+        assert_eq!(unthrottled("X").body, "Memory's calm again, so X is back to full speed.");
         let u = killed("X", 3_000_000_000, KillReason::User, false);
         assert_eq!(u.title, "Closed X");
         assert_eq!(u.body, "Done — freed up 3.0 GB.");
