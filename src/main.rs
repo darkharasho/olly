@@ -22,7 +22,7 @@ const USAGE: &str = "\u{1F916} here's what I can do:
   olly allowlist                   show the never-close list
   olly kill <id>                   close a paused app (id from `olly status`)
   olly unfreeze <id>               let a paused app carry on
-  olly update [--check]             install a new version, or just look for one
+  olly update [--check]            install a new version, or just look for one
   olly watch                       follow what olly does, live
   olly daemon [--config PATH] [--root PATH]";
 
@@ -478,19 +478,31 @@ fn socket_path() -> String {
     std::env::var("OLLY_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_string())
 }
 
-/// One request, one reply, on a fresh connection. `None` if olly can't be
-/// reached or the reply isn't readable.
-fn ask(socket: &str, req: &Request, timeout: Duration) -> Option<serde_json::Value> {
-    let mut stream = UnixStream::connect(socket).ok()?;
-    let line = serde_json::to_string(req).ok()?;
-    stream.write_all(format!("{line}\n").as_bytes()).ok()?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    let first = BufReader::new(stream).lines().next()?.ok()?;
-    serde_json::from_str(&first).ok()
+enum AskErr {
+    Unreachable,
+    NoAnswer,
+}
+
+/// One request, one reply, on a fresh connection.
+fn ask(socket: &str, req: &Request, timeout: Duration) -> Result<serde_json::Value, AskErr> {
+    let mut stream = UnixStream::connect(socket).map_err(|_| AskErr::Unreachable)?;
+    let line = serde_json::to_string(req).map_err(|_| AskErr::NoAnswer)?;
+    stream
+        .write_all(format!("{line}\n").as_bytes())
+        .map_err(|_| AskErr::Unreachable)?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|_| AskErr::NoAnswer)?;
+    let first = BufReader::new(stream)
+        .lines()
+        .next()
+        .and_then(Result::ok)
+        .ok_or(AskErr::NoAnswer)?;
+    serde_json::from_str(&first).map_err(|_| AskErr::NoAnswer)
 }
 
 fn status_of(socket: &str) -> Option<StatusData> {
-    let v = ask(socket, &Request::Status, Duration::from_secs(10))?;
+    let v = ask(socket, &Request::Status, Duration::from_secs(10)).ok()?;
     if v["ok"] != true {
         return None;
     }
@@ -501,19 +513,26 @@ fn update_cmd(mode: UpdateMode) -> ! {
     let socket = socket_path();
     if mode == UpdateMode::Check {
         // The daemon waits up to 75 s for the fetch.
-        let Some(v) = ask(&socket, &Request::UpdateCheck, Duration::from_secs(80)) else {
-            fail("olly didn't answer.")
+        let v = match ask(&socket, &Request::UpdateCheck, Duration::from_secs(80)) {
+            Ok(v) => v,
+            Err(AskErr::Unreachable) => unreachable(&socket),
+            Err(AskErr::NoAnswer) => fail("olly didn't answer."),
         };
         if v["ok"] != true {
             fail(v["error"].as_str().unwrap_or("olly said no."));
         }
-        match render(&Request::UpdateCheck, v["data"].clone()) {
-            Ok(t) => {
-                println!("{t}");
+        let current = status_of(&socket)
+            .map(|st| st.version)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let data = serde_json::from_value::<Option<UpdateInfo>>(v["data"].clone());
+        match data {
+            Ok(info) => {
+                println!("{}", render_check(info.as_ref(), &current));
                 std::process::exit(0)
             }
             Err(e) => {
-                eprintln!("{e}");
+                eprintln!("\u{1F916} olly's answer wasn't what I expected: {e}");
                 std::process::exit(1)
             }
         }
@@ -522,8 +541,10 @@ fn update_cmd(mode: UpdateMode) -> ! {
         unreachable(&socket)
     };
     let baseline = before.last_update.as_ref().map_or(0, |l| l.at_wall_ms);
-    let Some(v) = ask(&socket, &Request::Update, Duration::from_secs(10)) else {
-        fail("olly didn't answer.")
+    let v = match ask(&socket, &Request::Update, Duration::from_secs(10)) {
+        Ok(v) => v,
+        Err(AskErr::Unreachable) => unreachable(&socket),
+        Err(AskErr::NoAnswer) => fail("olly didn't answer."),
     };
     if v["ok"] != true {
         fail(v["error"].as_str().unwrap_or("olly said no."));
@@ -705,7 +726,7 @@ mod tests {
         assert!(e.starts_with('\u{1F916}'), "{e}");
         assert!(p("update --check --no-wait").is_err());
         assert!(USAGE.contains(
-            "olly update [--check]             install a new version, or just look for one"
+            "olly update [--check]            install a new version, or just look for one"
         ));
     }
 
