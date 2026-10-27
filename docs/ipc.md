@@ -44,11 +44,36 @@ Every request gets exactly one response line (except `subscribe`, which then str
   "throttled": [],
   "frozen": [],
   "self_rss": 3200000,
-  "message": "..."
+  "message": "...",
+  "swap_total": 8589934592,
+  "swap_used": 104857600,
+  "some_avg10": 1.5,
+  "top": {"name":"firefox","key":{"cgroup":"/user.slice/.../app-firefox.scope","root_pid":null},"bytes":4000000000,"rate":0.0},
+  "incident_active": false,
+  "incident_acted": false,
+  "last_action_wall_ms": null,
+  "last_incident_id": 7,
+  "frozen_info": []
 }
 ```
 
 `level` is one of `calm`, `watch`, `warning`, `critical`, `emergency`. Memory values are bytes; wall times are milliseconds since the Unix epoch. `message` is a ready-to-show one-line status in olly's voice.
+
+The fields from `swap_total` on are newer; a reply from an older daemon may lack them, and they default to zero, `null`, `false` or empty.
+
+- `swap_total`: bytes of swap in total (0 when there is none).
+- `swap_used`: bytes of swap in use.
+- `some_avg10`: memory "some" pressure over the last 10 s, in percent.
+- `top`: the biggest app by memory in the latest sample, an `Incident` `top_at_peak` entry (`name`, `key`, `bytes`, and `rate` in bytes/s), or `null` before the first sample.
+- `incident_active`: whether an incident is open.
+- `incident_acted`: whether olly has acted since the open incident began (false when none is open).
+- `last_action_wall_ms`: wall time (ms) of olly's latest action, or `null` if it has not acted since it started.
+- `last_incident_id`: the newest incident id on record, or `null` if there are none.
+- `frozen_info`: one entry per frozen app, in the same order as `frozen`. `bytes` is its memory, `rate` its growth in bytes/s when it was frozen, and `kill_at_wall_ms` is the wall time (ms) olly closes it if you do not answer:
+
+```json
+{"id":2,"name":"game.exe","bytes":21000000000,"rate":53687091.2,"kill_at_wall_ms":1761550300000}
+```
 
 `throttled` and `frozen` hold `Target` objects:
 

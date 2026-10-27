@@ -354,6 +354,8 @@ mod tests {
             mem: MemInfo {
                 total: 32 * GB,
                 available: avail,
+                swap_total: 0,
+                swap_free: 0,
             },
             zram_used: 0,
         }

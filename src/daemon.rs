@@ -4,10 +4,10 @@ use crate::actuator::{self, Actuator, DryRunActuator, SysActuator};
 use crate::allowlist::Allowlist;
 use crate::claude::{ClaudeRunner, Job};
 use crate::config::Config;
-use crate::engine::{Action, Command, Engine, Event, Level, StepOutput};
+use crate::engine::{Action, Command, Engine, Event, FrozenView, Level, StepOutput};
 use crate::history::{History, LeakWatch};
-use crate::incident::{IncidentRecorder, IncidentStore};
-use crate::ipc::{self, err_line, ok_line, Request, StatusData, Subscribers, ToDaemon};
+use crate::incident::{IncidentRecorder, IncidentStore, TopApp};
+use crate::ipc::{self, err_line, ok_line, FrozenInfo, Request, StatusData, Subscribers, ToDaemon};
 use crate::procfs::parse_status;
 use crate::psi::{self, PsiTrigger};
 use crate::sample::{Sampler, SystemSample};
@@ -175,6 +175,14 @@ struct Daemon {
     pending: Vec<String>,
     last_sys: Option<SystemSample>,
     incident_open: bool,
+    /// The biggest app in the latest sample.
+    last_top: Option<TopApp>,
+    /// Wall time of the latest action olly took.
+    last_action_wall_ms: Option<u64>,
+    /// Whether olly has acted during the open incident.
+    incident_acted: bool,
+    /// The newest incident id on record, if any.
+    last_incident_id: Option<u64>,
     rlog: RateLog,
     /// None when Claude is disabled or the desktop user can't be found.
     claude: Option<ClaudeRunner>,
@@ -220,6 +228,35 @@ fn tick_ms(active: bool, psi_ok: bool, active_ms: u64, slow_ms: u64) -> u64 {
     }
 }
 
+/// What the tray shows for each frozen app; the kill deadline is in wall time.
+fn frozen_info(
+    views: &[FrozenView],
+    now_mono: u64,
+    now_wall: u64,
+    giveup_secs: u64,
+) -> Vec<FrozenInfo> {
+    views
+        .iter()
+        .map(|v| FrozenInfo {
+            id: v.target.id,
+            name: v.target.name.clone(),
+            bytes: v.target.bytes,
+            rate: v.rate,
+            kill_at_wall_ms: now_wall.saturating_sub(now_mono.saturating_sub(v.at_ms))
+                + giveup_secs * 1000,
+        })
+        .collect()
+}
+
+/// Whether the open incident has had an action, after `ev`.
+fn acted_after(acted: bool, ev: &Event) -> bool {
+    match ev {
+        Event::Acted { .. } => true,
+        Event::IncidentStart { .. } | Event::IncidentEnd { .. } => false,
+        _ => acted,
+    }
+}
+
 /// The notification line: the first paragraph, on one line.
 fn first_paragraph(text: &str) -> String {
     let first = text.trim().split("\n\n").next().unwrap_or("");
@@ -250,6 +287,12 @@ impl Daemon {
         };
         let apps = self.sampler.apps();
         self.hist.record(now, &apps);
+        self.last_top = apps.iter().max_by_key(|a| a.bytes).map(|a| TopApp {
+            name: a.name.clone(),
+            key: a.key.clone(),
+            bytes: a.bytes,
+            rate: self.hist.rate(&a.key, now),
+        });
         let out = self.engine.step(&sys, &apps, &self.hist, &self.allow);
         self.process(out);
         self.recorder.on_sample(&sys, &apps, &self.hist, wall_ms());
@@ -394,6 +437,10 @@ impl Daemon {
                 }
                 other => other,
             };
+            self.incident_acted = acted_after(self.incident_acted, &ev);
+            if matches!(ev, Event::Acted { .. }) {
+                self.last_action_wall_ms = Some(wall);
+            }
             match &ev {
                 Event::Level { level } => {
                     eprintln!("olly: level={} event=level_change", level_name(*level))
@@ -413,6 +460,7 @@ impl Daemon {
                 _ => {}
             }
             if let Some(inc) = self.recorder.on_event(&ev, wall) {
+                self.last_incident_id = Some(inc.id);
                 if let Err(e) = self
                     .store
                     .append(&inc)
@@ -511,6 +559,9 @@ impl Daemon {
         let (avail, total) = self
             .last_sys
             .map_or((0, 0), |s| (s.mem.available, s.mem.total));
+        let (swap_total, swap_free) = self
+            .last_sys
+            .map_or((0, 0), |s| (s.mem.swap_total, s.mem.swap_free));
         let level = self.engine.level();
         StatusData {
             level,
@@ -522,6 +573,20 @@ impl Daemon {
             frozen: self.engine.frozen(),
             self_rss: self_rss(),
             message: voice::status_line(level, avail, remaining),
+            swap_total,
+            swap_used: swap_total.saturating_sub(swap_free),
+            some_avg10: self.last_sys.map_or(0.0, |s| s.psi.some_avg10),
+            top: self.last_top.clone(),
+            incident_active: self.engine.incident().is_some(),
+            incident_acted: self.incident_acted,
+            last_action_wall_ms: self.last_action_wall_ms,
+            last_incident_id: self.last_incident_id,
+            frozen_info: frozen_info(
+                &self.engine.frozen_view(),
+                now,
+                wall_ms(),
+                self.cfg.timing.freeze_giveup_secs,
+            ),
         }
     }
 }
@@ -676,8 +741,10 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         eprintln!("olly: cannot create {}: {e}", paths.state_dir.display());
     }
     let store = IncidentStore::new(paths.incidents.clone());
+    let next_id = store.next_id();
+    let store_last_id = (next_id > 1).then(|| next_id - 1);
     let mut engine = Engine::new(cfg.clone());
-    engine.set_next_incident_id(store.next_id());
+    engine.set_next_incident_id(next_id);
     // Ids from before a restart (old notification buttons) must not hit a new target.
     engine.set_next_target_id(wall_ms());
     if no_claude && cfg.claude.enabled {
@@ -725,6 +792,10 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         pending: Vec::new(),
         last_sys: None,
         incident_open: false,
+        last_top: None,
+        last_action_wall_ms: None,
+        incident_acted: false,
+        last_incident_id: store_last_id,
         rlog: RateLog::default(),
         claude,
         claude_queue: VecDeque::new(),
@@ -827,6 +898,8 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Target;
+    use crate::sample::{AppKey, TargetKind};
 
     fn leak(n: u64) -> Job {
         Job::Leak {
@@ -882,6 +955,57 @@ mod tests {
         // Nothing wakes olly early without the trigger, so idle polling stays quick.
         assert_eq!(tick_ms(false, false, 1000, 60_000), 2000);
         assert_eq!(tick_ms(false, false, 1000, 1000), 1000);
+    }
+
+    fn view(id: u64, at_ms: u64) -> FrozenView {
+        FrozenView {
+            target: Target {
+                id,
+                key: AppKey {
+                    cgroup: format!("/a{id}"),
+                    root_pid: None,
+                },
+                name: format!("app{id}"),
+                kind: TargetKind::Cgroup,
+                bytes: 7,
+            },
+            at_ms,
+            rate: 1.5,
+        }
+    }
+
+    #[test]
+    fn frozen_info_computes_wall_deadline() {
+        // Frozen 10s ago on the monotonic clock; the wall clock reads 1_000_000.
+        let info = frozen_info(&[view(2, 5_000)], 15_000, 1_000_000, 300);
+        assert_eq!(
+            info,
+            vec![FrozenInfo {
+                id: 2,
+                name: "app2".into(),
+                bytes: 7,
+                rate: 1.5,
+                kill_at_wall_ms: 1_000_000 - 10_000 + 300_000,
+            }]
+        );
+        // A freeze stamped after "now" (clock skew) doesn't underflow.
+        let info = frozen_info(&[view(3, 20_000)], 15_000, 1_000_000, 300);
+        assert_eq!(info[0].kill_at_wall_ms, 1_000_000 + 300_000);
+    }
+
+    #[test]
+    fn incident_acted_resets_on_new_incident() {
+        let acted = Event::Acted {
+            action: Action::Freeze {
+                target: view(1, 0).target,
+            },
+            message: voice::frozen("x", 30, false),
+            dry_run: false,
+        };
+        assert!(acted_after(false, &acted));
+        assert!(acted_after(true, &Event::Level { level: Level::Calm }));
+        assert!(!acted_after(true, &Event::IncidentStart { id: 2, t_ms: 0 }));
+        assert!(!acted_after(true, &Event::IncidentEnd { id: 2, t_ms: 0 }));
     }
 
     #[test]

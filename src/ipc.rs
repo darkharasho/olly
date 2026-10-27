@@ -1,6 +1,7 @@
 //! Local IPC: newline-delimited JSON over a unix socket. See docs/ipc.md.
 
 use crate::engine::{Event, Level, Target};
+use crate::incident::TopApp;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -71,6 +72,34 @@ pub struct StatusData {
     pub frozen: Vec<Target>,
     pub self_rss: u64,
     pub message: String,
+    #[serde(default)]
+    pub swap_total: u64,
+    #[serde(default)]
+    pub swap_used: u64,
+    #[serde(default)]
+    pub some_avg10: f32,
+    #[serde(default)]
+    pub top: Option<TopApp>,
+    #[serde(default)]
+    pub incident_active: bool,
+    #[serde(default)]
+    pub incident_acted: bool,
+    #[serde(default)]
+    pub last_action_wall_ms: Option<u64>,
+    #[serde(default)]
+    pub last_incident_id: Option<u64>,
+    #[serde(default)]
+    pub frozen_info: Vec<FrozenInfo>,
+}
+
+/// What the tray shows for one frozen app.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct FrozenInfo {
+    pub id: u64,
+    pub name: String,
+    pub bytes: u64,
+    pub rate: f64,
+    pub kill_at_wall_ms: u64,
 }
 
 pub enum ToDaemon {
@@ -416,6 +445,22 @@ mod tests {
     use super::*;
     use crate::voice::Message;
     use std::io::BufReader;
+
+    #[test]
+    fn old_status_without_new_fields_parses() {
+        let st: StatusData = serde_json::from_str(
+            r#"{"level":"calm","dry_run":true,"paused_until_wall_ms":null,
+            "mem_available":15227060000,"mem_total":31953848000,"throttled":[],"frozen":[],
+            "self_rss":3200000,"message":"..."}"#,
+        )
+        .unwrap();
+        assert!(st.frozen_info.is_empty());
+        assert!(st.top.is_none());
+        assert!(!st.incident_active && !st.incident_acted);
+        assert_eq!((st.swap_total, st.swap_used), (0, 0));
+        assert_eq!(st.last_action_wall_ms, None);
+        assert_eq!(st.last_incident_id, None);
+    }
 
     struct Harness {
         _dir: tempfile::TempDir,

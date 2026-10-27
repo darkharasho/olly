@@ -138,8 +138,19 @@ struct FrozenState {
     target: Target,
     at_ms: u64,
     full_at_freeze: f32,
+    /// Growth rate (bytes/s) when frozen.
+    rate: f64,
     grace_checked: bool,
     reminded: bool,
+}
+
+/// A frozen target as the status reply shows it.
+#[derive(Clone, Debug)]
+pub struct FrozenView {
+    pub target: Target,
+    pub at_ms: u64,
+    /// Growth rate (bytes/s) when it was frozen.
+    pub rate: f64,
 }
 
 pub struct Engine {
@@ -389,12 +400,13 @@ impl Engine {
                 }
             }
             Level::Critical if !paused && cooled => {
-                if let Some(&(a, ..)) = cands.iter().find(|c| c.2 && c.3) {
+                if let Some(&(a, rate, ..)) = cands.iter().find(|c| c.2 && c.3) {
                     let target = self.target_for(a);
                     self.frozen.push(FrozenState {
                         target: target.clone(),
                         at_ms: now,
                         full_at_freeze: sys.psi.full_avg10,
+                        rate,
                         grace_checked: false,
                         reminded: false,
                     });
@@ -496,6 +508,22 @@ impl Engine {
         self.frozen.iter().map(|f| f.target.clone()).collect()
     }
 
+    pub fn frozen_view(&self) -> Vec<FrozenView> {
+        self.frozen
+            .iter()
+            .map(|f| FrozenView {
+                target: f.target.clone(),
+                at_ms: f.at_ms,
+                rate: f.rate,
+            })
+            .collect()
+    }
+
+    /// The id of the open incident, if any.
+    pub fn incident(&self) -> Option<u64> {
+        self.incident
+    }
+
     pub fn paused_until(&self) -> Option<u64> {
         self.paused_until
     }
@@ -590,6 +618,8 @@ mod tests {
             mem: MemInfo {
                 total: TOTAL,
                 available: (TOTAL as f64 * avail_pct as f64 / 100.0) as u64,
+                swap_total: 0,
+                swap_free: 0,
             },
             zram_used: 0,
         }
@@ -1132,6 +1162,24 @@ mod tests {
             .eng
             .command(Command::ResumeFrozen(ids[0].0), 17_000)
             .is_err());
+    }
+
+    #[test]
+    fn frozen_view_keeps_rate_and_time() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t)]);
+        sim.step(critical(11_000), &[leak(11_000)]);
+        let views = sim.eng.frozen_view();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].at_ms, 11_000);
+        let key = AppKey {
+            cgroup: "/leaky".into(),
+            root_pid: None,
+        };
+        let rate = sim.hist.rate(&key, 11_000);
+        assert!(rate > 0.0);
+        assert_eq!(views[0].rate, rate);
+        assert!(sim.eng.incident().is_some());
     }
 
     #[test]

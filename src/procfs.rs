@@ -49,6 +49,8 @@ pub fn parse_psi(s: &str) -> Option<Psi> {
 pub struct MemInfo {
     pub total: u64,
     pub available: u64,
+    pub swap_total: u64,
+    pub swap_free: u64,
 }
 
 fn kb_field(s: &str, key: &str) -> Option<u64> {
@@ -64,6 +66,9 @@ pub fn parse_meminfo(s: &str) -> Option<MemInfo> {
     Some(MemInfo {
         total: kb_field(s, "MemTotal")?,
         available: kb_field(s, "MemAvailable")?,
+        // No swap configured: the lines are absent.
+        swap_total: kb_field(s, "SwapTotal").unwrap_or(0),
+        swap_free: kb_field(s, "SwapFree").unwrap_or(0),
     })
 }
 
@@ -198,6 +203,18 @@ mod tests {
         .unwrap();
         assert_eq!(m.total, 31876543 * 1024);
         assert_eq!(m.available, 20000000 * 1024);
+    }
+
+    #[test]
+    fn meminfo_reads_swap() {
+        let m = parse_meminfo(
+            "MemTotal: 100 kB\nMemAvailable: 50 kB\nSwapTotal:      8388604 kB\nSwapFree:       8000000 kB\n",
+        )
+        .unwrap();
+        assert_eq!(m.swap_total, 8388604 * 1024);
+        assert_eq!(m.swap_free, 8000000 * 1024);
+        let m = parse_meminfo("MemTotal: 100 kB\nMemAvailable: 50 kB\n").unwrap();
+        assert_eq!((m.swap_total, m.swap_free), (0, 0));
     }
 
     #[test]
