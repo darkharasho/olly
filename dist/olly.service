@@ -1,0 +1,16 @@
+[Unit]
+Description=olly memory watchdog
+
+[Service]
+ExecStart=/usr/local/bin/olly daemon --config /etc/olly/config.toml
+OOMScoreAdjust=-1000
+MemoryMin=32M
+Nice=-5
+Restart=always
+RestartSec=1
+RuntimeDirectory=olly
+StateDirectory=olly
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

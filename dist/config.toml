@@ -1,0 +1,98 @@
+# olly config. Every value below is olly's default, written out so you can see it.
+# Edit, then: sudo systemctl restart olly
+
+# While true, olly watches and tells you what it WOULD do, but never acts.
+# Set to false when you are happy with what dry-run shows you.
+dry_run = true
+
+# The desktop user's uid. olly lets this user (and root) talk to its socket.
+desktop_uid = 1000
+
+# Longest pause `olly pause` may ask for, in seconds.
+max_pause_secs = 3600
+
+# Process names olly never freezes, throttles, or kills. A trailing * matches
+# any ending. Names you add with `olly allow` are kept separately, in
+# /var/lib/olly/allowlist.toml.
+allowlist = [
+    "olly",
+    "olly-notify",
+    "systemd",
+    "systemd-*",
+    "dbus-broker",
+    "dbus-broker-launch",
+    "dbus-daemon",
+    "kwin_wayland",
+    "kwin_wayland_wrapper",
+    "plasmashell",
+    "ksmserver",
+    "kded6",
+    "Xwayland",
+    "xdg-desktop-portal*",
+    "pipewire",
+    "pipewire-pulse",
+    "wireplumber",
+    "sddm",
+    "NetworkManager",
+    "sshd",
+    "polkitd",
+    "gamescope",
+]
+
+# Memory-pressure thresholds. "some" and "full" are kernel PSI percentages
+# (share of time tasks were stalled on memory); "avail" is MemAvailable as a
+# percent of total memory.
+[thresholds]
+# Start sampling quickly once PSI "some" reaches this, and calm down below calm_some.
+watch_some = 10.0
+calm_some = 5.0
+# PSI "full" levels for warning, critical, and emergency.
+warning_full = 10.0
+critical_full = 25.0
+emergency_full = 50.0
+# Available-memory percentages for each level (lower is worse).
+watch_avail = 15.0
+warning_avail = 10.0
+critical_avail = 5.0
+emergency_avail = 2.0
+
+[timing]
+# How often olly samples while pressure is up, in milliseconds.
+active_sample_ms = 1000
+# How often olly samples while everything is calm, in seconds.
+slow_sample_secs = 60
+# Seconds of calm before an incident is closed.
+calm_end_secs = 60
+# Seconds a frozen app waits for your answer before olly steps in.
+freeze_grace_secs = 10
+# Seconds between reminders that an app is still frozen.
+freeze_remind_secs = 60
+# Seconds after which olly gives up waiting on a frozen app.
+freeze_giveup_secs = 300
+# Minimum seconds between two actions.
+action_cooldown_secs = 5
+
+[growth]
+# Window for spotting fast growth, in seconds.
+short_window_secs = 10
+# Window for "grew a lot recently", in seconds, and how much counts as a lot:
+# at least recent_min_bytes (500 MiB) and at least recent_min_ratio (20%).
+recent_window_secs = 300
+recent_min_bytes = 524288000
+recent_min_ratio = 0.2
+# Window for slow leaks, in seconds (2 hours), and how much growth counts (2 GiB).
+leak_window_secs = 7200
+leak_min_bytes = 2147483648
+
+[claude]
+# Ask Claude for a hunch about slow leaks and after incidents. It only
+# suggests; it never acts. Runs sandboxed as the desktop user.
+enabled = true
+# At most this many diagnoses per day.
+max_per_day = 3
+# Wait until available memory is back above this percent before asking.
+recovered_avail = 25.0
+# Give up on a diagnosis after this many seconds.
+timeout_secs = 180
+# Path to the claude binary. Leave unset to look it up automatically.
+# claude_path = "/home/you/.local/bin/claude"

@@ -1,3 +1,89 @@
 # olly
 
-olly is a tiny Rust background daemon for a Bazzite desktop that watches kernel memory-pressure signals (PSI) and per-process memory growth, and uses deterministic local rules to freeze, throttle, or kill runaway processes within seconds, before the system freezes. The Claude Code SDK is invoked on demand only, for ambiguous or slow-building issues and post-incident diagnosis, never in the emergency path. olly is a sibling to otto (a hotkey AI assistant): separate codebases, but olly exposes a small local IPC interface so otto can query its status and send simple commands.
+olly is a tiny background daemon for a Bazzite desktop (KDE Plasma). It watches the kernel's memory-pressure signals (PSI) and how fast each app's memory is growing, and when something runs away it steps in within seconds, before the system freezes. It slows the app down, pauses it, or as a last resort closes it, and it tells you every time.
+
+The emergency path is plain local rules: no network, no LLM, no spawning processes. Claude is only asked on demand, for slow leaks and for a second opinion after an incident, and it only ever suggests. When nothing is wrong, olly sleeps and uses about 3 MB of memory.
+
+## What it does
+
+- **Watches** PSI memory pressure and available memory, sampling once a minute when things are calm and once a second when they aren't.
+- **Acts in steps** as things get worse: throttle a growing app, freeze it and ask you what to do, and in an emergency close it. `olly pause` suspends throttling and freezing for a while, but emergency kills still happen.
+- **Notifies you** with a desktop notification whenever it acts.
+- **Keeps an incident log** in `/var/lib/olly/incidents.jsonl`, with what happened, which app was the biggest, and what olly did.
+- **Asks Claude for a hunch** about slow leaks and after incidents (at most 3 a day by default). This runs sandboxed as your desktop user: read-only tools, no MCP, and your user settings are not loaded. Claude never acts, never edits the never-kill list, and never changes config.
+
+## Install
+
+```sh
+scripts/install.sh
+```
+
+Run it as your normal user, not root. It builds with `cargo build --release`, then uses sudo to install `olly` and `olly-notify` into `/usr/local/bin`, the system unit into `/etc/systemd/system`, and the config into `/etc/olly/config.toml` (an existing config is left alone). The notification agent installs as a user unit under `~/.config/systemd/user`. On Bazzite, `/usr/local` is writable, so this works on the immutable base.
+
+To remove it: `scripts/uninstall.sh`. That stops and disables both units and deletes the binaries and units, but keeps `/etc/olly/config.toml` and `/var/lib/olly` (your incident history). Add `--purge` to remove those too.
+
+## Dry-run first
+
+The shipped config has `dry_run = true`. In dry-run olly watches and notifies as usual, and records what it *would* have done, but it never freezes, throttles, or kills anything. Live with it for a while, check `olly incidents`, and when you're happy:
+
+```sh
+sudo sed -i 's/^dry_run = true/dry_run = false/' /etc/olly/config.toml && sudo systemctl restart olly
+```
+
+`/etc/olly/config.toml` lists every setting with its default and a comment.
+
+## The `olly` command
+
+```
+olly status                 how memory looks right now
+olly incidents [-n N]       recent incidents, newest first
+olly incident <id>          one incident in full
+olly pause <minutes>        stop slowing and pausing apps for a while
+olly resume                 end a pause early
+olly allow <name>           never close this process name
+olly allowlist              show the never-close list
+olly kill <id>              close a paused app (id from `olly status`)
+olly unfreeze <id>          let a paused app carry on
+olly watch                  follow what olly does, live
+```
+
+`olly daemon [--config PATH] [--root PATH]` is what the systemd unit runs. A pause is capped at `max_pause_secs` (one hour by default).
+
+## The never-kill list
+
+olly never freezes, throttles, or kills an app that contains one of these process names (a trailing `*` matches any ending):
+
+`olly`, `olly-notify`, `systemd`, `systemd-*`, `dbus-broker`, `dbus-broker-launch`, `dbus-daemon`, `kwin_wayland`, `kwin_wayland_wrapper`, `plasmashell`, `ksmserver`, `kded6`, `Xwayland`, `xdg-desktop-portal*`, `pipewire`, `pipewire-pulse`, `wireplumber`, `sddm`, `NetworkManager`, `sshd`, `polkitd`, `gamescope`
+
+Add your own with `olly allow <name>`; those are saved in `/var/lib/olly/allowlist.toml`. Nothing can remove an entry over IPC. To change the base list, edit `allowlist` in the config.
+
+## How it relates to systemd-oomd
+
+olly leaves systemd-oomd alone; the two can run side by side. oomd reacts per cgroup after pressure has already stayed high for a while. olly looks at per-app growth as well as pressure, tries gentler options first (throttle, freeze, ask you), and explains itself afterwards. If olly ever fails to act in time, oomd and the kernel OOM killer are still there behind it.
+
+## IPC
+
+olly listens on `/run/olly/olly.sock` (newline-delimited JSON, root and the desktop user only) so other tools, such as otto, can ask for status, read incidents, send simple commands, and follow an event stream. See [docs/ipc.md](docs/ipc.md).
+
+## Try it with memhog
+
+`memhog` is a small example program that grows its memory at a steady rate, so you can watch olly react. Always run it under a hard cap:
+
+```sh
+cargo build --release --examples
+systemd-run --user --scope -p MemoryMax=14G target/release/examples/memhog 1024 --max 12288
+```
+
+`memhog <mb_per_sec> [--max MB]` stops growing at `--max` (default 2048 MB), holds, and exits cleanly on Ctrl-C. In dry-run, olly will say what it would have done.
+
+## Manual checks to run as root
+
+These need a real machine and root, so they aren't part of `cargo test`. Always keep memhog under a `MemoryMax` cap.
+
+1. **Daemon in dry-run (as root, test thresholds).** Copy `dist/config.toml` to `/tmp/olly-test.toml`, keep `dry_run = true`, and raise the thresholds so a capped hog can trigger them: `watch_avail = 45`, `warning_avail = 40`, `critical_avail = 35`, `emergency_avail = 25` (suited to about 16 GB free on a 30 GB machine; adjust for yours). Run `sudo OLLY_RUN_DIR=/tmp/olly target/debug/olly daemon --config /tmp/olly-test.toml`. In a second terminal run `systemd-run --user --scope -p MemoryMax=14G target/release/examples/memhog 512`. Expect level changes and "would have" actions naming memhog on stderr, and a clean exit on Ctrl-C.
+2. **Notification agent.** With that daemon running, also run `cargo run --bin olly-notify`. Try `olly status`, `olly pause 1`, `olly status` (shows the pause), `olly resume`. Then run memhog again: a KDE notification with Kill/Resume should appear, and clicking Kill should leave `olly status` showing nothing frozen.
+3. **End to end.** Run `scripts/install.sh`, switch `/etc/olly/config.toml` to `dry_run = false` with the same raised thresholds, and restart olly. Run `systemd-run --user --scope -p MemoryMax=14G target/release/examples/memhog 1024`. Expect throttle and/or freeze notifications, then a kill before the 14G cap, the incident in `olly incidents`, and a Claude hunch once memory recovers. Afterwards restore the shipped config (`dry_run = true`, default thresholds) and restart olly.
+
+## Uses
+
+Rust, Linux PSI and cgroups v2, systemd, and the Claude CLI for on-demand diagnosis. The daemon depends only on serde, serde_json, toml and libc; `olly-notify` adds notify-rust.

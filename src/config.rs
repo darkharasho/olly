@@ -227,4 +227,17 @@ mod tests {
         assert_eq!(c, Config::default());
         assert!(err.unwrap().contains(p.to_str().unwrap()));
     }
+
+    #[test]
+    fn shipped_config_matches_defaults() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("dist/config.toml");
+        let (c, err) = load(&path);
+        assert!(err.is_none(), "{err:?}");
+        assert!(c.dry_run);
+        let expected = Config {
+            dry_run: true,
+            ..Config::default()
+        };
+        assert_eq!(c, expected);
+    }
 }

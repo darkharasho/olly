@@ -1,0 +1,12 @@
+[Unit]
+Description=olly desktop notifications
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/olly-notify
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
