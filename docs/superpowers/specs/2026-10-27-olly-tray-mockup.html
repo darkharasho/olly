@@ -1,0 +1,111 @@
+<!doctype html>
+<!-- Approved mockups for docs/superpowers/specs/2026-10-27-olly-tray-design.md:
+     style B tray faces (seven moods) and the two popup states. Open in a browser. -->
+<html><head><meta charset="utf-8"><title>olly tray — approved mockups</title><style>
+body{margin:0;font-family:"Noto Sans",system-ui,sans-serif;background:#1e2125;color:#e8ecef;padding:20px 24px}
+h2{font-size:15px;margin:18px 0 8px;font-weight:600}
+.row{display:flex;gap:14px}
+.cell{width:108px;text-align:center;font-size:12px;color:#c4cbd1}
+.cell svg{width:64px;height:64px;display:block;margin:0 auto 6px}
+.cell small{display:block;color:#7f8a93;font-size:10.5px;margin-top:2px}
+.trays{display:flex;gap:18px;margin-top:22px}
+.panel{border-radius:6px;padding:6px 10px;display:flex;gap:10px;align-items:center}
+.panel.dark{background:#2a2e32}.panel.light{background:#eff0f1}
+.panel svg{width:22px;height:22px}
+.label{font-size:11px;color:#9aa3ab;margin-bottom:4px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}.pulse{animation:pulse 1.2s infinite}
+.pops{display:flex;gap:28px;margin-top:28px;align-items:flex-start}
+.pop{width:340px;background:#2a2e32;border:1px solid #3b4045;border-radius:10px;box-shadow:0 8px 28px #0008;overflow:hidden}
+.head{display:flex;gap:12px;align-items:center;padding:14px 16px 10px}
+.head svg{width:52px;height:52px}
+.name{font-weight:700;font-size:15px}.mood{font-size:13px;color:#3ddc84;font-weight:600}
+.say{font-size:12px;color:#aab3ba;margin-top:2px}
+.badge{margin-left:auto;align-self:flex-start;font-size:10px;background:#3a3320;color:#ffb74d;border:1px solid #6b5a2a;border-radius:9px;padding:1px 7px}
+.stats{padding:4px 16px 10px;display:grid;grid-template-columns:78px 1fr 64px;gap:7px 8px;font-size:12px;align-items:center}
+.stats span{color:#9aa3ab}.bar{height:6px;border-radius:3px;background:#3b4045;overflow:hidden}.bar i{display:block;height:100%;border-radius:3px}
+.v{text-align:right;color:#c4cbd1;font-variant-numeric:tabular-nums}
+.sec{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#7f8a93;padding:10px 16px 4px;border-top:1px solid #34393e}
+.inc{padding:7px 16px;display:flex;gap:10px;font-size:12.5px}.inc:hover{background:#31363b}
+.dot{width:8px;height:8px;border-radius:50%;margin-top:5px;flex:none}
+.inc small{display:block;color:#8d969d;font-size:11px;margin-top:1px}
+.t{margin-left:auto;color:#7f8a93;font-size:11px;white-space:nowrap}
+.foot{display:flex;gap:8px;padding:10px 16px 12px;border-top:1px solid #34393e}
+button{background:#31363b;border:1px solid #454b51;color:#e8ecef;border-radius:5px;padding:5px 10px;font-size:12px;font-family:inherit}
+button.link{background:none;border:none;color:#3daee9;margin-left:auto;padding:5px 0}
+.pop2 .mood{color:#ffa726}
+.ask{margin:0 16px 10px;background:#33291c;border:1px solid #6b4f24;border-radius:7px;padding:9px 11px;font-size:12.5px}
+.ask .row{display:flex;gap:8px;margin-top:8px}
+.ask button.k{background:#5a2626;border-color:#8a3a3a}
+.note{font-size:12px;color:#9aa3ab;margin-top:10px}
+</style></head><body>
+<h2>Tray faces (style B)</h2>
+<div class="row" id="b"></div>
+<div class="trays">
+ <div><div class="label">Tray size, Breeze dark</div><div class="panel dark" id="td"></div></div>
+ <div><div class="label">Breeze light</div><div class="panel light" id="tl"></div></div>
+</div>
+<h2 style="margin-top:28px">Popup</h2>
+<div class="pops">
+<div><div class="pop">
+ <div class="head"><span id="h1"></span>
+  <div><div class="name">olly</div><div class="mood">All good!</div><div class="say">Nothing growing. I'll keep an eye out ✨</div></div>
+  <div class="badge">dry run</div></div>
+ <div class="stats">
+  <span>RAM free</span><div class="bar"><i style="width:41%;background:#3ddc84"></i></div><div class="v">13.1 GB</div>
+  <span>Swap used</span><div class="bar"><i style="width:12%;background:#3ddc84"></i></div><div class="v">1.9 GB</div>
+  <span>Pressure</span><div class="bar"><i style="width:3%;background:#3ddc84"></i></div><div class="v">0.4%</div>
+  <span>Biggest</span><div style="color:#c4cbd1">firefox</div><div class="v">5.8 GB</div>
+ </div>
+ <div class="sec">Recent incidents</div>
+ <div class="inc"><div class="dot" style="background:#ff5252"></div><div>Closed <b>memhog</b> (9.1 GB)<small>Emergency · nothing else touched</small></div><div class="t">2h ago</div></div>
+ <div class="inc"><div class="dot" style="background:#ffa726"></div><div>Froze <b>Baldur's Gate 3</b> → you resumed it<small>Critical · grew 1.4 GB/min</small></div><div class="t">yesterday</div></div>
+ <div class="inc"><div class="dot" style="background:#ffb74d"></div><div>Slowed <b>node</b> down for 3 min<small>Warning · Claude: “likely a dev-server leak”</small></div><div class="t">Mon</div></div>
+ <div class="foot"><button>💤 Pause 30 min</button><button class="link">All incidents…</button></div>
+</div><div class="note">Calm. Clicking an incident expands its details.</div></div>
+<div><div class="pop pop2">
+ <div class="head"><span id="h2"></span>
+  <div><div class="name">olly</div><div class="mood">Needs you!</div><div class="say">I paused something that was gobbling memory.</div></div></div>
+ <div class="ask"><b>chrome</b> is frozen at 7.4 GB (it was growing 2.1 GB/min).<br><span style="color:#aab3ba">I'll close it in 4:12 if you don't pick, sooner if memory gets really tight.</span>
+  <div class="row"><button class="k">Close it</button><button>Let it run</button></div></div>
+ <div class="stats">
+  <span>RAM free</span><div class="bar"><i style="width:6%;background:#ff5252"></i></div><div class="v">1.9 GB</div>
+  <span>Swap used</span><div class="bar"><i style="width:71%;background:#ffb74d"></i></div><div class="v">11.4 GB</div>
+  <span>Pressure</span><div class="bar"><i style="width:22%;background:#ffb74d"></i></div><div class="v">22%</div>
+ </div>
+ <div class="sec">Recent incidents</div>
+ <div class="inc"><div class="dot" style="background:#ffa726"></div><div>Now: froze <b>chrome</b><small>Critical · waiting on you</small></div><div class="t">just now</div></div>
+</div><div class="note">While something is frozen, the Kill/Resume choice sits at the top.</div></div>
+</div>
+<script>
+const M=[
+ {k:'calm',n:'All good',d:'calm',c:'#3ddc84'},
+ {k:'watch',n:'Watching',d:'pressure rising',c:'#4fc3f7'},
+ {k:'worried',n:'Worried',d:'warning',c:'#ffb74d'},
+ {k:'onit',n:'On it!',d:'olly acted',c:'#ff5252'},
+ {k:'needs',n:'Needs you',d:'app frozen, waiting',c:'#ffa726'},
+ {k:'nap',n:'Napping',d:'paused',c:'#9575cd'},
+ {k:'off',n:'Offline',d:'daemon unreachable',c:'#6b7378'},
+];
+const S='stroke-linecap="round" stroke-linejoin="round" fill="none"';
+function face(m,edge,size){
+ const c=m.c, scr='#14171a';
+ const e={
+  calm:`<path d="M7.4 13.6Q9 11 10.6 13.6M13.4 13.6Q15 11 16.6 13.6" stroke="${c}" stroke-width="1.9" ${S}/>`,
+  watch:`<rect x="8.3" y="10.2" width="2.6" height="4.6" rx="1.2" fill="${c}"/><rect x="14.3" y="10.2" width="2.6" height="4.6" rx="1.2" fill="${c}"/>`,
+  worried:`<rect x="7.6" y="10.4" width="2.8" height="4.4" rx="1.2" fill="${c}"/><rect x="13.6" y="10.4" width="2.8" height="4.4" rx="1.2" fill="${c}"/><path d="M7 9.4L11 9.4L11 11.6Z M17 9.4L13 9.4L13 11.6Z" fill="${scr}"/>`,
+  onit:`<rect x="7.6" y="10.2" width="2.8" height="4.6" rx="1.1" fill="${c}"/><rect x="13.6" y="10.2" width="2.8" height="4.6" rx="1.1" fill="${c}"/><path d="M7 9.2L11 9.2L11 12Z M17 9.2L13 9.2L13 12Z" fill="${scr}" transform="scale(-1,1) translate(-24,0)"/>`,
+  needs:`<rect x="7.8" y="11.8" width="2.6" height="3" rx="1.1" fill="${c}"/><rect x="13.6" y="9.6" width="2.8" height="5.2" rx="1.2" fill="${c}"/><text x="17.6" y="9.4" font-size="5" font-weight="800" fill="${c}" class="pulse">?</text>`,
+  nap:`<path d="M7.8 13.2H10.4M13.6 13.2H16.2" stroke="${c}" stroke-width="1.6" ${S}/><text x="17.4" y="9.6" font-size="4.4" font-weight="800" fill="${c}">z</text>`,
+  off:`<circle cx="9.5" cy="12.8" r=".7" fill="${c}"/><circle cx="12" cy="12.8" r=".7" fill="${c}"/><circle cx="14.5" cy="12.8" r=".7" fill="${c}"/>`,
+ }[m.k];
+ const op=m.k==='off'?' opacity=".7"':'';
+ const sz=size?` style="width:${size}px;height:${size}px"`:'';
+ return `<svg viewBox="0 0 24 24"${op}${sz}><rect x="2.8" y="5.4" width="18.4" height="15" rx="5" fill="${scr}" stroke="${edge}" stroke-width="1.3"/>
+ <path d="M12 5.4V3.4" stroke="${edge}" stroke-width="1.3" stroke-linecap="round"/><circle cx="12" cy="2.6" r="1.2" fill="${edge}"/>${e}</svg>`;
+}
+b.innerHTML=M.map(m=>`<div class="cell">${face(m,'#9aa3ab')}${m.n}<small>${m.d}</small></div>`).join('');
+td.innerHTML=M.map(m=>face(m,'#9aa3ab')).join('');
+tl.innerHTML=M.map(m=>face(m,'#5c656d')).join('');
+h1.innerHTML=face(M[0],'#9aa3ab',52);
+h2.innerHTML=face(M[4],'#9aa3ab',52);
+</script></body></html>
