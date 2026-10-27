@@ -1,0 +1,1 @@
+Test-only minisign keys (password-less). They sign fixtures for the update tests and protect nothing; the real release key is src/update_key.pub.
