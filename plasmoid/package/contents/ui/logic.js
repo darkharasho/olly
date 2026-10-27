@@ -174,6 +174,8 @@ function command(verb, id) {
         return OLLY + " update --no-wait";
     if (verb === "check")
         return OLLY + " update --check";
+    if (verb === "restart_plasma")
+        return "systemctl --user restart plasma-plasmashell";
     if ((verb === "kill" || verb === "unfreeze" || verb === "diagnose")
             && Number.isInteger(id) && id >= 0 && id <= Number.MAX_SAFE_INTEGER)
         return OLLY + " " + verb + " " + id;
@@ -376,11 +378,13 @@ function updateCard(status, dismissedAt, now, ownVersion) {
     var last = status.last_update;
     if (last && last.at_wall_ms > dismissedAt && now - last.at_wall_ms <= 3600000) {
         if (last.ok) {
+            // Plasma keeps running this widget until it restarts, so offer that.
             var changed = status.widget_version != null && status.widget_version !== ownVersion;
             return {
                 kind: "done",
                 title: "updated to " + last.to + "! ✨",
-                hint: changed ? "log out and back in to see my new look" : ""
+                hint: changed ? "restart Plasma to see my new look. Your windows stay open." : "",
+                button: changed ? "Restart Plasma" : ""
             };
         }
         return { kind: "rolledback", title: "that update didn't work, so I went back to " + last.from + "." };

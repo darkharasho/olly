@@ -196,6 +196,7 @@ test("command is shell-safe", () => {
     assert.equal(L.command("kill", bad), "", String(bad));
   assert.equal(L.command("diagnose", 7), "/usr/local/bin/olly diagnose 7");
   assert.equal(L.command("diagnose", "7; id"), "");
+  assert.equal(L.command("restart_plasma"), "systemctl --user restart plasma-plasmashell");
   assert.equal(L.command("rm", 2), "");
   assert.equal(L.command("kill $(id)", 2), "");
 });
@@ -337,7 +338,9 @@ test("updateCard done and hint", () => {
   let c = L.updateCard(s(), 0, NOW, "0.2.0");
   assert.deepEqual({ kind: c.kind, title: c.title, hint: c.hint }, { kind: "done", title: "updated to 0.2.0! ✨", hint: "" });
   c = L.updateCard(s(), 0, NOW, "0.1.0");
-  assert.equal(c.hint, "log out and back in to see my new look");
+  assert.equal(c.hint, "restart Plasma to see my new look. Your windows stay open.");
+  assert.equal(c.button, "Restart Plasma");
+  assert.equal(L.updateCard(s(), 0, NOW, "0.2.0").button, "");
   assert.equal(L.updateCard(s({ widget_version: null }), 0, NOW, "0.1.0").hint, "");
   assert.equal(L.updateCard(s({ widget_version: undefined }), 0, NOW, "0.1.0").hint, "");
   // done outranks ready

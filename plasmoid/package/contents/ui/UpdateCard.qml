@@ -70,9 +70,9 @@ Rectangle {
         }
 
         PlasmaComponents3.Button {
-            visible: !!card.c && card.c.kind === "ready"
+            visible: !!card.c && !!card.c.button && (card.c.kind === "ready" || card.c.kind === "done")
             text: card.c && card.c.button ? card.c.button : ""
-            onClicked: card.app.run("update")
+            onClicked: card.app.run(card.c.kind === "ready" ? "update" : "restart_plasma")
         }
 
         PlasmaComponents3.Label {

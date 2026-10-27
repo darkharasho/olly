@@ -67,7 +67,8 @@ PlasmoidItem {
             refetchIncidents = true;
     }
 
-    // verb: "kill" | "unfreeze" (with a frozen id from status) | "pause" | "resume" | "update".
+    // verb: "kill" | "unfreeze" (with a frozen id from status) | "pause" | "resume" | "update"
+    // | "restart_plasma".
     function run(verb, id) {
         var cmd = Logic.command(verb, id);
         if (cmd === "")
