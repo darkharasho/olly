@@ -6,3 +6,5 @@ pub mod allowlist;
 pub mod engine;
 pub mod actuator;
 pub mod voice;
+pub mod incident;
+pub mod ipc;
