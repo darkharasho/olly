@@ -12,4 +12,5 @@ pub mod psi;
 pub mod sample;
 pub mod supervise;
 pub mod update;
+pub mod updater;
 pub mod voice;

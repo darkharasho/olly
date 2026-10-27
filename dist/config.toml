@@ -11,6 +11,10 @@ desktop_uid = 1000
 # Longest pause `olly pause` may ask for, in seconds.
 max_pause_secs = 3600
 
+# Look for a new olly release 5 minutes after start, then every 6 hours, only
+# while things are calm. olly never installs one until you ask (`olly update`).
+update_check = true
+
 # Process names olly never freezes, throttles, or kills. A name matches the
 # process name or its executable's file name. A trailing * matches any ending. Names you add with `olly allow` are kept separately, in
 # /var/lib/olly/allowlist.toml.

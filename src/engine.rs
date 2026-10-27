@@ -68,6 +68,14 @@ pub enum Event {
         message: Message,
         frozen_id: Option<u64>,
     },
+    /// An update finished (or was rolled back); from `update-result.json`.
+    Updated {
+        from: String,
+        to: String,
+        ok: bool,
+        message: String,
+        widget_changed: bool,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

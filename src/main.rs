@@ -300,6 +300,10 @@ fn render(req: &Request, data: serde_json::Value) -> Result<String, String> {
         Request::FrozenKill { id } => format!("\u{1F916} okay, closing [{id}]."),
         Request::FrozenResume { id } => format!("\u{1F916} okay, letting [{id}] carry on."),
         Request::Subscribe => String::new(),
+        // The CLI doesn't send these yet.
+        Request::UpdateCheck | Request::Update | Request::UpdateFinished => {
+            serde_json::to_string_pretty(&data).map_err(bad)?
+        }
     })
 }
 

@@ -15,6 +15,8 @@ pub struct Config {
     pub allowlist: Vec<String>,
     pub claude: ClaudeConfig,
     pub max_pause_secs: u64,
+    /// Look for a new olly release now and then (only while things are calm).
+    pub update_check: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -103,6 +105,7 @@ impl Default for Config {
             .collect(),
             claude: ClaudeConfig::default(),
             max_pause_secs: 3600,
+            update_check: true,
         }
     }
 }
@@ -197,6 +200,7 @@ mod tests {
         assert_eq!(c.timing.freeze_grace_secs, 10);
         assert_eq!(c.timing.freeze_giveup_secs, 300);
         assert_eq!(c.max_pause_secs, 3600);
+        assert!(c.update_check);
         assert!(c.allowlist.iter().any(|s| s == "kwin_wayland"));
         assert!(!c.allowlist.iter().any(|s| s == "steam"));
     }

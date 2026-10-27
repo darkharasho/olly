@@ -2,6 +2,8 @@
 
 use crate::engine::{Event, Level, Target};
 use crate::incident::TopApp;
+use crate::supervise::LastUpdate;
+use crate::update::{UpdateInfo, UpdateState};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -25,6 +27,8 @@ const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(300);
 #[cfg(test)]
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// `update_check` waits for the fetch.
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 const CONN_STACK: usize = 256 * 1024;
 
 fn d10() -> usize {
@@ -59,6 +63,12 @@ pub enum Request {
     FrozenResume {
         id: u64,
     },
+    /// Look for a new release now; answered when the check finishes.
+    UpdateCheck,
+    /// Download and install the known new release.
+    Update,
+    /// From the supervisor: re-read `update-result.json`.
+    UpdateFinished,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -90,6 +100,19 @@ pub struct StatusData {
     pub last_incident_id: Option<u64>,
     #[serde(default)]
     pub frozen_info: Vec<FrozenInfo>,
+    /// The running daemon's version.
+    #[serde(default)]
+    pub version: String,
+    /// A newer release, when olly knows of one.
+    #[serde(default)]
+    pub update: Option<UpdateInfo>,
+    #[serde(default)]
+    pub update_state: UpdateState,
+    #[serde(default)]
+    pub last_update: Option<LastUpdate>,
+    /// `KPlugin.Version` of the widget copy olly ships.
+    #[serde(default)]
+    pub widget_version: Option<String>,
 }
 
 /// What the tray shows for one frozen app.
@@ -385,12 +408,17 @@ fn connection(stream: UnixStream, shared: &Shared) {
             stream_events(&stream, shared);
             return;
         }
+        let wait = if req == Request::UpdateCheck {
+            UPDATE_CHECK_TIMEOUT
+        } else {
+            REPLY_TIMEOUT
+        };
         let (rtx, rrx) = mpsc::channel();
         if !shared.send(ToDaemon::Req(req, rtx)) {
             let _ = write_line(&stream, &err_line("daemon unavailable"));
             return;
         }
-        let resp = match rrx.recv_timeout(REPLY_TIMEOUT) {
+        let resp = match rrx.recv_timeout(wait) {
             Ok(r) => r,
             Err(_) => err_line("daemon did not answer"),
         };
@@ -460,6 +488,11 @@ mod tests {
         assert_eq!((st.swap_total, st.swap_used), (0, 0));
         assert_eq!(st.last_action_wall_ms, None);
         assert_eq!(st.last_incident_id, None);
+        assert_eq!(st.version, "");
+        assert_eq!(st.update, None);
+        assert_eq!(st.update_state, crate::update::UpdateState::Idle);
+        assert_eq!(st.last_update, None);
+        assert_eq!(st.widget_version, None);
     }
 
     struct Harness {
@@ -563,6 +596,9 @@ mod tests {
                 r#"{"cmd":"frozen_resume","id":2}"#,
                 Request::FrozenResume { id: 2 },
             ),
+            (r#"{"cmd":"update_check"}"#, Request::UpdateCheck),
+            (r#"{"cmd":"update"}"#, Request::Update),
+            (r#"{"cmd":"update_finished"}"#, Request::UpdateFinished),
         ];
         for (line, want) in cases {
             assert_eq!(handle_line(line), Ok(want), "{line}");

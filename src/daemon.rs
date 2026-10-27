@@ -11,6 +11,9 @@ use crate::ipc::{self, err_line, ok_line, FrozenInfo, Request, StatusData, Subsc
 use crate::procfs::parse_status;
 use crate::psi::{self, PsiTrigger};
 use crate::sample::{AppSample, Sampler, SystemSample};
+use crate::supervise::Layout;
+use crate::update::{self, Curl, Fetch, Staged, UpdateState};
+use crate::updater::{self as upd, Done, Updater};
 use crate::voice;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -39,6 +42,8 @@ struct Paths {
     active: PathBuf,
     incidents: PathBuf,
     allowlist: PathBuf,
+    /// Where the installed files live, for updates.
+    layout: Layout,
     /// OLLY_RUN_DIR is set (tests, manual runs).
     overridden: bool,
 }
@@ -53,7 +58,18 @@ impl Paths {
                 false,
             ),
         };
+        let layout = if overridden {
+            Layout {
+                bin: state_dir.join("bin"),
+                unit_dir: state_dir.join("units"),
+                share: state_dir.join("share"),
+                state: state_dir.clone(),
+            }
+        } else {
+            Layout::system()
+        };
         Paths {
+            layout,
             sock: run_dir.join("olly.sock"),
             active: run_dir.join("active.json"),
             incidents: state_dir.join("incidents.jsonl"),
@@ -192,6 +208,7 @@ struct Daemon {
     claude_rx: mpsc::Receiver<(Job, Result<String, String>)>,
     /// cgroup -> monotonic ms when it was last handed to Claude.
     leak_seen: HashMap<String, u64>,
+    upd: Updater,
 }
 
 /// Adds a job, dropping the oldest when the queue is full.
@@ -401,6 +418,159 @@ impl Daemon {
         self.subs.broadcast(&ipc::event_line(&ev, wall_ms()));
     }
 
+    fn may_update(&self) -> Result<(), String> {
+        update::may_update(
+            self.engine.level(),
+            self.incident_open || self.engine.incident().is_some(),
+            self.engine.frozen().len(),
+            self.engine.throttled().len(),
+        )
+    }
+
+    /// The periodic check: due at `upd.next_check`, then every 6 h whether it ran or not.
+    fn update_due(&mut self, now: u64) {
+        if now < self.upd.next_check {
+            return;
+        }
+        self.upd.next_check = now + upd::CHECK_EVERY_MS;
+        let paused = self.engine.paused_until().is_some_and(|u| u > now);
+        let calm = update::may_check(
+            self.engine.level(),
+            self.incident_open || self.engine.incident().is_some(),
+            paused,
+        );
+        if !self.upd.enabled || !calm || self.upd.checking || self.upd.state != UpdateState::Idle {
+            return;
+        }
+        if let Err(e) = self.upd.spawn_check() {
+            self.rlog
+                .log("update_check", now, &format!("update check: {e}"));
+        }
+    }
+
+    /// Never blocks: collects finished update workers.
+    fn pump_update(&mut self) {
+        while let Some(done) = self.upd.try_recv() {
+            match done {
+                Done::Checked(r) => self.on_checked(r),
+                Done::Staged(r) => self.on_staged(r),
+                Done::Launched(r) => {
+                    self.upd.launching = false;
+                    if let Err(e) = r {
+                        if self.upd.state == UpdateState::Installing {
+                            self.upd.state = UpdateState::Idle;
+                        }
+                        self.rlog
+                            .log("update_launch", self.now(), &format!("update: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_checked(&mut self, r: Result<Option<update::Manifest>, String>) {
+        self.upd.checking = false;
+        if self.upd.state == UpdateState::Checking {
+            self.upd.state = UpdateState::Idle;
+        }
+        let reply = match r {
+            Ok(m) => {
+                self.upd.update = m.as_ref().map(update::info);
+                if let Some(u) = &self.upd.update {
+                    eprintln!("olly: event=update_available version={}", u.version);
+                }
+                ok_line(&self.upd.update)
+            }
+            Err(e) => {
+                let bad_sig =
+                    e.starts_with("signature check failed") || e.starts_with("bad signature");
+                let warn = if bad_sig { "warning: " } else { "" };
+                self.rlog.log(
+                    "update_check",
+                    self.now(),
+                    &format!("{warn}update check failed: {e}"),
+                );
+                err_line(&format!("I couldn't look for updates: {e}"))
+            }
+        };
+        for w in self.upd.waiters.drain(..) {
+            let _ = w.send(reply.clone());
+        }
+    }
+
+    fn on_staged(&mut self, r: Result<Staged, String>) {
+        let now = self.now();
+        if self.upd.state != UpdateState::Downloading {
+            return;
+        }
+        let staged = match r {
+            Ok(s) => s,
+            Err(e) => {
+                self.upd.state = UpdateState::Idle;
+                self.rlog
+                    .log("update_stage", now, &format!("update download failed: {e}"));
+                return;
+            }
+        };
+        // Things may have changed during the download.
+        if let Err(e) = self.may_update() {
+            self.upd.state = UpdateState::Idle;
+            eprintln!(
+                "olly: not installing {} after all: {e}",
+                staged.manifest.version
+            );
+            return;
+        }
+        eprintln!(
+            "olly: event=update_install from={} to={}",
+            upd::CURRENT,
+            staged.manifest.version
+        );
+        if let Err(e) = self.upd.spawn_launch(&staged, wall_ms()) {
+            self.upd.state = UpdateState::Idle;
+            self.rlog.log("update_launch", now, &format!("update: {e}"));
+        }
+    }
+
+    /// `update_check` from a client: joins the running check or starts one, ignoring the
+    /// calm rule and the config flag. Answered when the check finishes.
+    fn update_check(&mut self, reply: mpsc::Sender<String>) {
+        if !self.upd.checking {
+            if let Err(e) = self.upd.spawn_check() {
+                let _ = reply.send(err_line(&e));
+                return;
+            }
+        }
+        self.upd.waiters.push(reply);
+    }
+
+    fn start_update(&mut self) -> Result<(), String> {
+        let Some(u) = &self.upd.update else {
+            return Err("there's no update to install right now".into());
+        };
+        if self.upd.state != UpdateState::Idle {
+            return Err("I'm already updating".into());
+        }
+        self.may_update()?;
+        eprintln!("olly: event=update_download version={}", u.version);
+        self.upd.spawn_stage()
+    }
+
+    /// Reads the supervisor's result (on start and on `update_finished`); a fresh one is
+    /// announced once.
+    fn load_update_result(&mut self) {
+        self.upd.read_widget_version();
+        let Some(ev) = self.upd.load_result(wall_ms()) else {
+            return;
+        };
+        if let Event::Updated { from, to, ok, .. } = &ev {
+            eprintln!("olly: event=updated from={from} to={to} ok={ok}");
+        }
+        let line = ipc::event_line(&ev, wall_ms());
+        self.subs.broadcast(&line);
+        self.pending.push(line);
+    }
+
     /// Applies the actions, then logs, records and broadcasts the events. A failed
     /// action's `Acted` event becomes a `Notice` saying olly couldn't act.
     fn process(&mut self, out: StepOutput) {
@@ -508,6 +678,7 @@ impl Daemon {
 
     fn handle(&mut self, msg: ToDaemon) {
         match msg {
+            ToDaemon::Req(Request::UpdateCheck, reply) => self.update_check(reply),
             ToDaemon::Req(req, reply) => {
                 let line = self.respond(req);
                 let _ = reply.send(line);
@@ -560,6 +731,16 @@ impl Daemon {
             Request::AllowlistList => ok_line(&self.allow.list()),
             Request::FrozenKill { id } => done(self.command(Command::KillFrozen(id))),
             Request::FrozenResume { id } => done(self.command(Command::ResumeFrozen(id))),
+            // `handle` parks these until the check finishes; they never reach here.
+            Request::UpdateCheck => err_line("update_check is answered when the check finishes"),
+            Request::Update => match self.start_update() {
+                Ok(()) => ok_line(&"started"),
+                Err(e) => err_line(&e),
+            },
+            Request::UpdateFinished => {
+                self.load_update_result();
+                ok_line(&())
+            }
         }
     }
 
@@ -601,6 +782,11 @@ impl Daemon {
                 wall_ms(),
                 self.cfg.timing.freeze_giveup_secs,
             ),
+            version: upd::CURRENT.to_string(),
+            update: self.upd.update.clone(),
+            update_state: self.upd.state,
+            last_update: self.upd.last_update.clone(),
+            widget_version: self.upd.widget_version.clone(),
         }
     }
 }
@@ -793,6 +979,14 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         None
     };
     let (claude_tx, claude_rx) = mpsc::channel();
+    let updater = Updater::new(
+        paths.layout,
+        Box::new(|| Box::new(Curl) as Box<dyn Fetch + Send>),
+        update::RELEASE_KEY.to_string(),
+        !paths.overridden,
+        cfg.update_check,
+        wake.as_ref().map(|w| w.as_raw_fd()),
+    );
     let mut d = Daemon {
         sampler: Sampler::new(root.clone(), cfg.desktop_uid),
         hist: History::new(&cfg.growth),
@@ -817,9 +1011,11 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         claude_tx,
         claude_rx,
         leak_seen: HashMap::new(),
+        upd: updater,
         start: Instant::now(),
         cfg,
     };
+    d.load_update_result();
     if cfg_err.is_some() {
         let ev = Event::Notice {
             message: voice::config_fallback(),
@@ -854,6 +1050,7 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
             d.slow(now);
             next_slow = now + slow_ms;
         }
+        d.update_due(now);
 
         let mut fds = Vec::with_capacity(3);
         let fd_of = |o: &Option<OwnedFd>| o.as_ref().map(|f| f.as_raw_fd());
@@ -866,6 +1063,7 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         }
         let timeout = next_tick
             .min(next_slow)
+            .min(d.upd.next_check)
             .saturating_sub(d.now())
             .min(i32::MAX as u64) as i32;
         let ready = match psi::wait(&fds, timeout) {
@@ -884,6 +1082,7 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
             d.handle(msg);
         }
         d.pump_claude();
+        d.pump_update();
         if ready[0] {
             drain(fds[0].0, std::mem::size_of::<libc::signalfd_siginfo>());
             eprintln!("olly: stopping; undoing every freeze and throttle");
@@ -914,6 +1113,10 @@ mod tests {
     use super::*;
     use crate::engine::Target;
     use crate::sample::{AppKey, TargetKind};
+    use crate::supervise::{LastUpdate, Layout};
+    use crate::update::{self, Fetch, Manifest, Staged, UpdateInfo, UpdateState};
+    use crate::updater::Updater;
+    use std::path::Path;
 
     fn leak(n: u64) -> Job {
         Job::Leak {
@@ -1087,9 +1290,105 @@ mod tests {
             claude_tx,
             claude_rx,
             leak_seen: HashMap::new(),
+            upd: test_updater(&root, cfg.update_check),
             start: Instant::now(),
             cfg,
         }
+    }
+
+    const FIX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/update");
+
+    /// Serves the signed 9.9.9 fixture manifest; downloads always fail. Never the network.
+    struct FixtureFetch;
+    impl Fetch for FixtureFetch {
+        fn get(&self, url: &str, _: u64, _: u64) -> Result<Vec<u8>, String> {
+            let name = if url == update::MANIFEST_URL {
+                "good-manifest.json"
+            } else if url == update::manifest_sig_url() {
+                "good-manifest.json.minisig"
+            } else {
+                return Err(format!("no {url} in tests"));
+            };
+            fs::read(format!("{FIX}/{name}")).map_err(|e| e.to_string())
+        }
+        fn get_to_file(&self, url: &str, _: &Path, _: u64, _: u64) -> Result<(), String> {
+            Err(format!("no download of {url} in tests"))
+        }
+    }
+
+    fn test_updater(root: &Path, enabled: bool) -> Updater {
+        let layout = Layout {
+            bin: root.join("bin"),
+            unit_dir: root.join("units"),
+            share: root.join("share"),
+            state: root.to_path_buf(),
+        };
+        let pubkey = fs::read_to_string(format!("{FIX}/test.pub")).unwrap();
+        Updater::new(
+            layout,
+            Box::new(|| Box::new(FixtureFetch) as Box<dyn Fetch + Send>),
+            pubkey,
+            false,
+            enabled,
+            None,
+        )
+    }
+
+    fn offered() -> UpdateInfo {
+        UpdateInfo {
+            version: "9.9.9".into(),
+            notes: vec!["a fixture note".into()],
+            url: update::release_page_url("9.9.9"),
+        }
+    }
+
+    fn staged(root: &Path) -> Staged {
+        let dir = root.join("update/9.9.9/root");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("olly"), "bin").unwrap();
+        Staged {
+            dir,
+            manifest: Manifest {
+                version: "9.9.9".into(),
+                tarball: "olly-9.9.9-x86_64.tar.gz".into(),
+                sha256: "a".repeat(64),
+                notes: vec![],
+                published: "2026-01-01T00:00:00Z".into(),
+            },
+        }
+    }
+
+    /// Pumps worker results until `done` holds, for up to 10 s.
+    fn pump_until(d: &mut Daemon, done: impl Fn(&Daemon) -> bool) {
+        let t = Instant::now();
+        while !done(d) {
+            assert!(t.elapsed() < Duration::from_secs(10), "timed out");
+            std::thread::sleep(Duration::from_millis(20));
+            d.pump_update();
+        }
+    }
+
+    fn write_result(root: &Path, at_wall_ms: u64) {
+        let r = LastUpdate {
+            from: "0.1.0".into(),
+            to: "9.9.9".into(),
+            ok: true,
+            at_wall_ms,
+            message: "updated to 9.9.9! \u{2728}".into(),
+            widget_changed: false,
+        };
+        fs::write(
+            root.join("update-result.json"),
+            serde_json::to_string(&r).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn updated_lines(d: &Daemon) -> usize {
+        d.pending
+            .iter()
+            .filter(|l| l.contains("\"Updated\""))
+            .count()
     }
 
     #[test]
@@ -1110,13 +1409,10 @@ mod tests {
         assert_eq!(d.status().last_incident_id, Some(7));
     }
 
-    /// A real `Daemon` on fake proc files, driven to a freeze through the engine.
-    #[test]
-    fn status_fills_tray_fields() {
-        const GIB: u64 = 1 << 30;
-        let dir = tempfile::tempdir().unwrap();
-        let mut d = test_daemon(dir.path());
-        let leak = |t: u64| AppSample {
+    const GIB: u64 = 1 << 30;
+
+    fn leaky(t: u64) -> AppSample {
+        AppSample {
             key: AppKey {
                 cgroup: "/leaky".into(),
                 root_pid: None,
@@ -1128,17 +1424,25 @@ mod tests {
             ram: 10 * GIB + t * (GIB / 10) / 1000,
             names: vec!["leaky".into()],
             exe_names: vec![],
-        };
-        let step = |d: &mut Daemon, t: u64, full: f32| {
-            let mut sys = d.sampler.system(t).unwrap();
-            sys.psi.full_avg10 = full;
-            sys.full_now = Some(full);
-            d.hist.record(t, &[leak(t)]);
-            let out = d.engine.step(&sys, &[leak(t)], &d.hist, &d.allow);
-            d.process(out);
-            d.last_top = top_app(&[leak(t)], &d.hist, t);
-            d.last_sys = Some(sys);
-        };
+        }
+    }
+
+    fn step(d: &mut Daemon, t: u64, full: f32) {
+        let mut sys = d.sampler.system(t).unwrap();
+        sys.psi.full_avg10 = full;
+        sys.full_now = Some(full);
+        d.hist.record(t, &[leaky(t)]);
+        let out = d.engine.step(&sys, &[leaky(t)], &d.hist, &d.allow);
+        d.process(out);
+        d.last_top = top_app(&[leaky(t)], &d.hist, t);
+        d.last_sys = Some(sys);
+    }
+
+    /// A real `Daemon` on fake proc files, driven to a freeze through the engine.
+    #[test]
+    fn status_fills_tray_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
         for s in 0..=10 {
             step(&mut d, s * 1000, 0.0);
         }
@@ -1179,5 +1483,192 @@ mod tests {
             "It was the browser. Tabs piled up."
         );
         assert_eq!(first_paragraph(""), "");
+    }
+
+    #[test]
+    fn update_refused_when_nothing_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        assert_eq!(
+            d.respond(Request::Update),
+            err_line("there's no update to install right now")
+        );
+        assert_eq!(d.upd.state, UpdateState::Idle);
+    }
+
+    #[test]
+    fn update_refused_when_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        for s in 0..=10 {
+            step(&mut d, s * 1000, 0.0);
+        }
+        step(&mut d, 11_000, 30.0);
+        assert_eq!(d.engine.frozen().len(), 1);
+        // Memory is fine again, the freeze is still in place.
+        step(&mut d, 12_000, 0.0);
+        d.upd.update = Some(offered());
+        assert_eq!(
+            d.respond(Request::Update),
+            err_line("I'll update once things are calm")
+        );
+        assert_eq!(d.upd.state, UpdateState::Idle);
+    }
+
+    #[test]
+    fn second_update_refused_while_downloading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.upd.update = Some(offered());
+        assert_eq!(d.respond(Request::Update), ok_line(&"started"));
+        assert_eq!(d.upd.state, UpdateState::Downloading);
+        assert_eq!(d.status().update_state, UpdateState::Downloading);
+        assert_eq!(d.respond(Request::Update), err_line("I'm already updating"));
+        // The fixture can't download: back to idle, still offered.
+        pump_until(&mut d, |d| d.upd.state == UpdateState::Idle);
+        assert_eq!(d.upd.update, Some(offered()));
+    }
+
+    #[test]
+    fn stage_result_rechecks_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.upd.update = Some(offered());
+        assert_eq!(d.respond(Request::Update), ok_line(&"started"));
+        // An incident opens while the tarball downloads.
+        d.incident_open = true;
+        let s = staged(dir.path());
+        let root = s.dir.clone();
+        d.on_staged(Ok(s));
+        assert_eq!(d.upd.state, UpdateState::Idle);
+        assert_eq!(d.upd.update, Some(offered()));
+        assert!(!dir.path().join("update/olly-supervisor").exists());
+        // Nothing staged is deleted.
+        assert!(root.join("olly").exists());
+    }
+
+    #[test]
+    fn stage_result_hands_off_when_calm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.upd.update = Some(offered());
+        assert_eq!(d.respond(Request::Update), ok_line(&"started"));
+        d.on_staged(Ok(staged(dir.path())));
+        assert_eq!(d.upd.state, UpdateState::Installing);
+        let sup = dir.path().join("update/olly-supervisor");
+        pump_until(&mut d, |_| {
+            fs::metadata(&sup).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o700)
+        });
+        pump_until(&mut d, |d| !d.upd.launching);
+        // The no-op launcher reports success; olly waits for the supervisor.
+        assert_eq!(d.upd.state, UpdateState::Installing);
+        assert_eq!(d.respond(Request::Update), err_line("I'm already updating"));
+        // A stray update_finished without a new result doesn't end the install.
+        d.respond(Request::UpdateFinished);
+        assert_eq!(d.upd.state, UpdateState::Installing);
+        write_result(dir.path(), wall_ms());
+        d.respond(Request::UpdateFinished);
+        assert_eq!(d.upd.state, UpdateState::Idle);
+    }
+
+    #[test]
+    fn check_timer_skips_when_not_calm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        assert_eq!(d.upd.next_check, 300_000);
+        d.update_due(299_999);
+        assert!(!d.upd.checking);
+        d.incident_open = true;
+        d.update_due(300_000);
+        assert!(!d.upd.checking);
+        assert_eq!(d.upd.next_check, 300_000 + 21_600_000);
+        d.incident_open = false;
+        d.command(Command::Pause {
+            until_ms: u64::MAX / 2,
+        })
+        .unwrap();
+        d.update_due(21_900_000);
+        assert!(!d.upd.checking);
+        assert_eq!(d.upd.next_check, 21_900_000 + 21_600_000);
+        d.command(Command::Unpause).unwrap();
+        d.update_due(43_500_000);
+        assert!(d.upd.checking);
+        assert_eq!(d.upd.state, UpdateState::Checking);
+        assert_eq!(d.upd.next_check, 43_500_000 + 21_600_000);
+        pump_until(&mut d, |d| !d.upd.checking);
+        assert_eq!(d.upd.state, UpdateState::Idle);
+        assert_eq!(d.upd.update, Some(offered()));
+    }
+
+    #[test]
+    fn check_timer_respects_config_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.upd.enabled = false;
+        d.update_due(300_000);
+        assert!(!d.upd.checking);
+        assert_eq!(d.upd.next_check, 300_000 + 21_600_000);
+    }
+
+    #[test]
+    fn fresh_result_emits_updated_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.upd.update = Some(offered());
+        write_result(dir.path(), wall_ms() - 1000);
+        assert_eq!(d.respond(Request::UpdateFinished), ok_line(&()));
+        assert_eq!(updated_lines(&d), 1);
+        assert!(
+            d.pending[0].contains("\"to\":\"9.9.9\""),
+            "{}",
+            d.pending[0]
+        );
+        assert!(d.status().last_update.is_some_and(|u| u.ok));
+        // Installed: nothing left to offer.
+        assert_eq!(d.status().update, None);
+        d.respond(Request::UpdateFinished);
+        assert_eq!(updated_lines(&d), 1);
+    }
+
+    #[test]
+    fn old_result_loaded_but_not_emitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        write_result(dir.path(), wall_ms() - 11 * 60_000);
+        d.load_update_result();
+        assert_eq!(updated_lines(&d), 0);
+        assert_eq!(d.status().last_update.map(|u| u.to), Some("9.9.9".into()));
+    }
+
+    #[test]
+    fn status_reports_version_and_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        let st = d.status();
+        assert_eq!(st.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!((st.update, st.update_state), (None, UpdateState::Idle));
+        assert_eq!(st.widget_version, None);
+
+        fs::create_dir_all(dir.path().join("share/plasmoid")).unwrap();
+        fs::write(
+            dir.path().join("share/plasmoid/metadata.json"),
+            r#"{"KPlugin":{"Id":"org.olly.tray","Version":"1.2"}}"#,
+        )
+        .unwrap();
+        d.respond(Request::UpdateFinished);
+        assert_eq!(d.status().widget_version.as_deref(), Some("1.2"));
+
+        let (tx, rx) = mpsc::channel();
+        d.handle(ToDaemon::Req(Request::UpdateCheck, tx.clone()));
+        // A second asker waits for the same check.
+        d.handle(ToDaemon::Req(Request::UpdateCheck, tx));
+        assert_eq!(d.status().update_state, UpdateState::Checking);
+        pump_until(&mut d, |d| !d.upd.checking);
+        let want = ok_line(&Some(offered()));
+        assert_eq!(rx.try_recv().unwrap(), want);
+        assert_eq!(rx.try_recv().unwrap(), want);
+        let st = d.status();
+        assert_eq!(st.update, Some(offered()));
+        assert_eq!(st.update_state, UpdateState::Idle);
     }
 }
