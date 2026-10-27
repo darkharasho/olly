@@ -11,16 +11,16 @@ use std::time::Duration;
 const DEFAULT_SOCKET: &str = "/run/olly/olly.sock";
 
 const USAGE: &str = "\u{1F916} here's what I can do:
-  olly status [--json]        how memory looks right now
-  olly incidents [-n N] [--json]  recent incidents, newest first
-  olly incident <id>          one incident in full
-  olly pause <minutes>        stop slowing and pausing apps for a while
-  olly resume                 end a pause early
-  olly allow <name>           never close this process name
-  olly allowlist              show the never-close list
-  olly kill <id>              close a paused app (id from `olly status`)
-  olly unfreeze <id>          let a paused app carry on
-  olly watch                  follow what olly does, live
+  olly status [--json]             how memory looks right now
+  olly incidents [-n N] [--json]   recent incidents, newest first
+  olly incident <id>               one incident in full
+  olly pause <minutes>             stop slowing and pausing apps for a while
+  olly resume                      end a pause early
+  olly allow <name>                never close this process name
+  olly allowlist                   show the never-close list
+  olly kill <id>                   close a paused app (id from `olly status`)
+  olly unfreeze <id>               let a paused app carry on
+  olly watch                       follow what olly does, live
   olly daemon [--config PATH] [--root PATH]";
 
 #[derive(Debug, PartialEq)]
@@ -293,14 +293,33 @@ fn fail(msg: &str) -> ! {
     std::process::exit(1)
 }
 
+static STDOUT_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Only one thread may print the final `--json` line; the loser waits for the winner to exit.
+fn claim_stdout() {
+    if STDOUT_CLAIMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
 /// What `--json` prints for every failure the tray should treat as "offline".
 fn offline() -> ! {
+    claim_stdout();
     println!("{{\"offline\":true}}");
     std::process::exit(1)
 }
 
 fn client(req: Request, out: Output) -> ! {
     let json = out == Output::Json;
+    if json {
+        // Overall deadline: connect has no timeout and read timeouts restart on every read.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(1000));
+            offline()
+        });
+    }
     let socket = std::env::var("OLLY_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_string());
     let Ok(mut stream) = UnixStream::connect(&socket) else {
         if json {
@@ -329,12 +348,24 @@ fn client(req: Request, out: Output) -> ! {
         else {
             offline()
         };
-        if v["ok"] != true {
-            let msg = v["error"].as_str().unwrap_or("olly said no.");
+        let Some(obj) = v.as_object() else { offline() };
+        if obj.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let msg = obj
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("olly said no.");
+            claim_stdout();
             println!("{}", serde_json::json!({ "error": msg }));
             std::process::exit(1);
         }
-        println!("{}", v["data"]);
+        let (true, Some(data)) = (
+            obj.get("ok") == Some(&serde_json::Value::Bool(true)),
+            obj.get("data"),
+        ) else {
+            offline()
+        };
+        claim_stdout();
+        println!("{data}");
         std::process::exit(0);
     }
     let first = next().unwrap_or_else(|| fail("olly didn't answer."));
