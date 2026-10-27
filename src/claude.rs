@@ -699,9 +699,10 @@ mod tests {
 
     #[test]
     fn child_does_not_inherit_oom_protection() {
-        // Only root can lower oom_score_adj, so the real check needs root: the parent
-        // is set to -500 and the child must read 0. Unprivileged, the write is refused
-        // and the child just keeps the parent's value.
+        // Only root can set a negative oom_score_adj, so the real check needs root: the
+        // parent is set to -500 and the child must read 0. Unprivileged, the reset may be
+        // refused (the child keeps the parent's value) or allowed (CI runners start at
+        // 500 and may lower it back to 0), so either is fine.
         let root = unsafe { libc::geteuid() } == 0;
         if root {
             std::fs::write("/proc/self/oom_score_adj", "-500").unwrap();
@@ -716,7 +717,14 @@ mod tests {
             r#"printf '{"result":"%s"}' "$(cat /proc/self/oom_score_adj)""#,
         );
         let child = r.run_blocking("x").unwrap();
-        assert_eq!(child, if root { "0" } else { parent.as_str() });
+        if root {
+            assert_eq!(child, "0");
+        } else {
+            assert!(
+                child == "0" || child == parent,
+                "child {child}, parent {parent}"
+            );
+        }
     }
 
     #[test]
