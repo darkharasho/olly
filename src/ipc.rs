@@ -28,7 +28,7 @@ const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(300);
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// `update_check` waits for the fetch.
-const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(75);
 const CONN_STACK: usize = 256 * 1024;
 
 fn d10() -> usize {

@@ -429,6 +429,9 @@ impl Daemon {
 
     /// The periodic check: due at `upd.next_check`, then every 6 h whether it ran or not.
     fn update_due(&mut self, now: u64) {
+        if self.upd.expire_install(now) {
+            eprintln!("olly: the update supervisor never reported back; giving up on that install");
+        }
         if now < self.upd.next_check {
             return;
         }
@@ -526,7 +529,7 @@ impl Daemon {
             upd::CURRENT,
             staged.manifest.version
         );
-        if let Err(e) = self.upd.spawn_launch(&staged, wall_ms()) {
+        if let Err(e) = self.upd.spawn_launch(&staged, wall_ms(), now) {
             self.upd.state = UpdateState::Idle;
             self.rlog.log("update_launch", now, &format!("update: {e}"));
         }
@@ -1317,6 +1320,25 @@ mod tests {
     }
 
     fn test_updater(root: &Path, enabled: bool) -> Updater {
+        test_updater_with(
+            root,
+            enabled,
+            Box::new(|| Box::new(FixtureFetch) as Box<dyn Fetch + Send>),
+        )
+    }
+
+    /// A fetcher whose worker dies mid-job.
+    struct PanicFetch;
+    impl Fetch for PanicFetch {
+        fn get(&self, _: &str, _: u64, _: u64) -> Result<Vec<u8>, String> {
+            panic!("fetcher blew up (expected in this test)")
+        }
+        fn get_to_file(&self, _: &str, _: &Path, _: u64, _: u64) -> Result<(), String> {
+            panic!("fetcher blew up (expected in this test)")
+        }
+    }
+
+    fn test_updater_with(root: &Path, enabled: bool, fetch: upd::FetchFactory) -> Updater {
         let layout = Layout {
             bin: root.join("bin"),
             unit_dir: root.join("units"),
@@ -1324,14 +1346,7 @@ mod tests {
             state: root.to_path_buf(),
         };
         let pubkey = fs::read_to_string(format!("{FIX}/test.pub")).unwrap();
-        Updater::new(
-            layout,
-            Box::new(|| Box::new(FixtureFetch) as Box<dyn Fetch + Send>),
-            pubkey,
-            false,
-            enabled,
-            None,
-        )
+        Updater::new(layout, fetch, pubkey, false, enabled, None)
     }
 
     fn offered() -> UpdateInfo {
@@ -1670,5 +1685,47 @@ mod tests {
         let st = d.status();
         assert_eq!(st.update, Some(offered()));
         assert_eq!(st.update_state, UpdateState::Idle);
+    }
+
+    #[test]
+    fn panicking_worker_unsticks_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.upd = test_updater_with(
+            dir.path(),
+            true,
+            Box::new(|| Box::new(PanicFetch) as Box<dyn Fetch + Send>),
+        );
+        let (tx, rx) = mpsc::channel();
+        d.handle(ToDaemon::Req(Request::UpdateCheck, tx));
+        pump_until(&mut d, |d| !d.upd.checking);
+        assert_eq!(d.upd.state, UpdateState::Idle);
+        let reply = rx.try_recv().unwrap();
+        assert!(
+            reply.contains("update worker stopped unexpectedly"),
+            "{reply}"
+        );
+
+        d.upd.update = Some(offered());
+        assert_eq!(d.respond(Request::Update), ok_line(&"started"));
+        pump_until(&mut d, |d| d.upd.state == UpdateState::Idle);
+        assert_eq!(d.upd.update, Some(offered()));
+    }
+
+    #[test]
+    fn install_without_result_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.upd.update = Some(offered());
+        assert_eq!(d.respond(Request::Update), ok_line(&"started"));
+        d.on_staged(Ok(staged(dir.path())));
+        assert_eq!(d.upd.state, UpdateState::Installing);
+        pump_until(&mut d, |d| !d.upd.launching);
+        d.update_due(upd::INSTALL_TIMEOUT_MS);
+        assert_eq!(d.upd.state, UpdateState::Installing);
+        d.update_due(60_000 + upd::INSTALL_TIMEOUT_MS + 1);
+        assert_eq!(d.upd.state, UpdateState::Idle);
+        // The update is still offered and can be tried again.
+        assert_eq!(d.respond(Request::Update), ok_line(&"started"));
     }
 }

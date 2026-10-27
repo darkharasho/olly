@@ -21,6 +21,9 @@ pub const CHECK_EVERY_MS: u64 = 21_600_000;
 /// A result younger than this is announced with `Event::Updated`.
 const FRESH_RESULT_MS: u64 = 10 * 60 * 1000;
 const WORKER_STACK: usize = 256 * 1024;
+/// An install with no result after this long (monotonic ms) is given up on.
+pub const INSTALL_TIMEOUT_MS: u64 = 600_000;
+const WORKER_LOST: &str = "update worker stopped unexpectedly";
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
@@ -58,8 +61,27 @@ pub struct Updater {
     emitted_at: Option<u64>,
     /// Wall ms when the hand-off to the supervisor started.
     installing_since: Option<u64>,
+    /// The same moment, monotonic ms, for the install timeout.
+    installing_mono: Option<u64>,
     tx: mpsc::Sender<Done>,
     rx: mpsc::Receiver<Done>,
+}
+
+/// Sends the worker's result; a worker that panics sends `lost` instead, so the daemon's
+/// state never stays stuck and parked askers get an answer.
+struct Reply {
+    tx: mpsc::Sender<Done>,
+    fd: Option<RawFd>,
+    lost: Option<Done>,
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        if let Some(d) = self.lost.take() {
+            let _ = self.tx.send(d);
+        }
+        wake(self.fd);
+    }
 }
 
 fn wake(fd: Option<RawFd>) {
@@ -96,6 +118,7 @@ impl Updater {
             next_check: FIRST_CHECK_MS,
             emitted_at: None,
             installing_since: None,
+            installing_mono: None,
             tx,
             rx,
         }
@@ -109,15 +132,24 @@ impl Updater {
         self.rx.try_recv().ok()
     }
 
-    fn spawn(&self, name: &str, job: impl FnOnce() -> Done + Send + 'static) -> Result<(), String> {
-        let tx = self.tx.clone();
-        let fd = self.wake;
+    fn spawn(
+        &self,
+        name: &str,
+        lost: Done,
+        job: impl FnOnce() -> Done + Send + 'static,
+    ) -> Result<(), String> {
+        let mut reply = Reply {
+            tx: self.tx.clone(),
+            fd: self.wake,
+            lost: Some(lost),
+        };
         thread::Builder::new()
             .name(name.into())
             .stack_size(WORKER_STACK)
             .spawn(move || {
-                let _ = tx.send(job());
-                wake(fd);
+                let done = job();
+                reply.lost = None;
+                let _ = reply.tx.send(done);
             })
             .map(|_| ())
             .map_err(|e| format!("cannot start the {name} thread: {e}"))
@@ -127,7 +159,8 @@ impl Updater {
     pub fn spawn_check(&mut self) -> Result<(), String> {
         let fetch = (self.fetch)();
         let key = self.pubkey.clone();
-        self.spawn("olly-update-check", move || {
+        let lost = Done::Checked(Err(WORKER_LOST.into()));
+        self.spawn("olly-update-check", lost, move || {
             Done::Checked(update::check(fetch.as_ref(), &key, CURRENT))
         })?;
         self.checking = true;
@@ -142,7 +175,8 @@ impl Updater {
         let fetch = (self.fetch)();
         let key = self.pubkey.clone();
         let work = self.work_dir();
-        self.spawn("olly-update-stage", move || {
+        let lost = Done::Staged(Err(WORKER_LOST.into()));
+        self.spawn("olly-update-stage", lost, move || {
             Done::Staged(update::stage(fetch.as_ref(), &key, CURRENT, &work))
         })?;
         self.state = UpdateState::Downloading;
@@ -150,18 +184,35 @@ impl Updater {
     }
 
     /// Copies this binary next to the staged tree and starts the supervisor in its own unit.
-    pub fn spawn_launch(&mut self, staged: &Staged, wall_ms: u64) -> Result<(), String> {
+    pub fn spawn_launch(&mut self, staged: &Staged, wall_ms: u64, now: u64) -> Result<(), String> {
         let work = self.work_dir();
         let root = staged.dir.clone();
         let to = staged.manifest.version.clone();
         let live = self.live;
-        self.spawn("olly-update-launch", move || {
+        let lost = Done::Launched(Err(WORKER_LOST.into()));
+        self.spawn("olly-update-launch", lost, move || {
             Done::Launched(launch(&work, &root, &to, live))
         })?;
         self.launching = true;
         self.state = UpdateState::Installing;
         self.installing_since = Some(wall_ms);
+        self.installing_mono = Some(now);
         Ok(())
+    }
+
+    /// The supervisor never reported back (killed, or the machine was busy): give up on the
+    /// install after `INSTALL_TIMEOUT_MS`. True when it just gave up.
+    pub fn expire_install(&mut self, now: u64) -> bool {
+        let stale = self.state == UpdateState::Installing
+            && self
+                .installing_mono
+                .is_some_and(|t| now.saturating_sub(t) > INSTALL_TIMEOUT_MS);
+        if stale {
+            self.state = UpdateState::Idle;
+            self.installing_since = None;
+            self.installing_mono = None;
+        }
+        stale
     }
 
     pub fn read_widget_version(&mut self) {
@@ -194,6 +245,7 @@ impl Updater {
         {
             self.state = UpdateState::Idle;
             self.installing_since = None;
+            self.installing_mono = None;
         }
         let fresh = wall_ms.saturating_sub(r.at_wall_ms) < FRESH_RESULT_MS;
         let ev = (fresh && self.emitted_at != Some(r.at_wall_ms)).then(|| Event::Updated {
