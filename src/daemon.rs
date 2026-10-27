@@ -36,6 +36,7 @@ const CLAUDE_QUEUE: usize = 4;
 const LEAK_COOLDOWN_MS: u64 = 24 * 60 * 60 * 1000;
 /// What `status` says when the supervisor couldn't be started.
 const LAUNCH_FAILED: &str = "I couldn't start the update";
+const INSTALL_LOST: &str = "the update never reported back, so I gave up on it";
 
 struct Paths {
     run_dir: PathBuf,
@@ -433,6 +434,7 @@ impl Daemon {
     fn update_due(&mut self, now: u64) {
         if self.upd.expire_install(now) {
             eprintln!("olly: the update supervisor never reported back; giving up on that install");
+            self.update_failed(INSTALL_LOST);
             if let Err(e) = self.upd.spawn_recover(wall_ms()) {
                 self.rlog
                     .log("update_recover", now, &format!("update: {e}"));
@@ -1371,6 +1373,7 @@ mod tests {
     }
 
     fn test_updater_with(root: &Path, enabled: bool, fetch: upd::FetchFactory) -> Updater {
+        fs::create_dir_all(root.join("bin")).unwrap();
         let layout = Layout {
             bin: root.join("bin"),
             unit_dir: root.join("units"),
@@ -1589,7 +1592,7 @@ mod tests {
         d.on_staged(Ok(s));
         assert_eq!(d.upd.state, UpdateState::Idle);
         assert_eq!(d.upd.update, Some(offered()));
-        assert!(!dir.path().join("update/olly-supervisor").exists());
+        assert!(!dir.path().join("bin/.olly-supervisor").exists());
         // Nothing staged is deleted.
         assert!(root.join("olly").exists());
     }
@@ -1625,7 +1628,7 @@ mod tests {
         d.incident_open = false;
 
         // The launch fails: the supervisor copy can't be written.
-        fs::create_dir_all(dir.path().join("update/olly-supervisor/blocker")).unwrap();
+        fs::create_dir_all(dir.path().join("bin/.olly-supervisor/blocker")).unwrap();
         pump_until(&mut d, |d| d.upd.state == UpdateState::Idle);
         assert_eq!(d.respond(Request::Update), ok_line(&"started"));
         d.on_staged(Ok(staged(dir.path())));
@@ -1646,7 +1649,7 @@ mod tests {
         assert_eq!(d.respond(Request::Update), ok_line(&"started"));
         d.on_staged(Ok(staged(dir.path())));
         assert_eq!(d.upd.state, UpdateState::Installing);
-        let sup = dir.path().join("update/olly-supervisor");
+        let sup = dir.path().join("bin/.olly-supervisor");
         pump_until(&mut d, |_| {
             fs::metadata(&sup).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o700)
         });
@@ -1842,6 +1845,7 @@ mod tests {
         assert_eq!(d.upd.state, UpdateState::Installing);
         d.update_due(60_000 + upd::INSTALL_TIMEOUT_MS + 1);
         assert_eq!(d.upd.state, UpdateState::Idle);
+        assert_eq!(update_error(&d).as_deref(), Some(INSTALL_LOST));
         // The update is still offered and can be tried again.
         assert_eq!(d.respond(Request::Update), ok_line(&"started"));
     }

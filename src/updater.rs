@@ -133,6 +133,12 @@ impl Updater {
         self.layout.state.join("update")
     }
 
+    /// Next to olly's own binary, not in the state dir: SELinux won't let systemd run
+    /// anything from `/var/lib` (`var_lib_t`), and a file made in `/usr/local/bin` gets `bin_t`.
+    pub fn supervisor_path(&self) -> PathBuf {
+        self.layout.bin.join(".olly-supervisor")
+    }
+
     pub fn try_recv(&self) -> Option<Done> {
         self.rx.try_recv().ok()
     }
@@ -188,15 +194,15 @@ impl Updater {
         Ok(())
     }
 
-    /// Copies this binary next to the staged tree and starts the supervisor in its own unit.
+    /// Copies this binary to `supervisor_path` and starts it in its own unit.
     pub fn spawn_launch(&mut self, staged: &Staged, wall_ms: u64, now: u64) -> Result<(), String> {
-        let work = self.work_dir();
+        let sup = self.supervisor_path();
         let root = staged.dir.clone();
         let to = staged.manifest.version.clone();
         let live = self.live;
         let lost = Done::Launched(Err(WORKER_LOST.into()));
         self.spawn("olly-update-launch", lost, move || {
-            Done::Launched(launch(&work, &root, &to, live))
+            Done::Launched(launch(&sup, &root, &to, live))
         })?;
         self.launching = true;
         self.state = UpdateState::Installing;
@@ -301,10 +307,12 @@ fn reloader(live: bool) -> impl FnMut() {
 }
 
 /// The supervisor runs in its own unit, as protected from the OOM killer as olly is.
+/// `--service-type=exec` makes systemd-run fail when the supervisor can't be started at all,
+/// instead of reporting success and leaving olly to wait out `INSTALL_TIMEOUT_MS`.
 fn supervisor_command(sup: &Path, root: &Path, to: &str) -> Command {
     let unit = format!("--unit=olly-update-{to}");
     let mut cmd = Command::new("systemd-run");
-    cmd.args([unit.as_str(), "--collect", "--quiet"])
+    cmd.args([unit.as_str(), "--service-type=exec", "--collect", "--quiet"])
         .args(["-p", "OOMScoreAdjust=-1000"])
         .arg(sup)
         .arg("update-supervise")
@@ -320,14 +328,13 @@ fn widget_version(path: &Path) -> Option<String> {
 }
 
 /// Runs on the launch worker. `live` false: copy only, log the systemd-run line.
-fn launch(work: &Path, root: &Path, to: &str, live: bool) -> Result<(), String> {
-    let sup = work.join("olly-supervisor");
-    let _ = fs::remove_file(&sup);
-    fs::copy("/proc/self/exe", &sup)
+fn launch(sup: &Path, root: &Path, to: &str, live: bool) -> Result<(), String> {
+    let _ = fs::remove_file(sup);
+    fs::copy("/proc/self/exe", sup)
         .map_err(|e| format!("cannot copy olly to {}: {e}", sup.display()))?;
-    fs::set_permissions(&sup, fs::Permissions::from_mode(0o700))
+    fs::set_permissions(sup, fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("cannot chmod {}: {e}", sup.display()))?;
-    let mut cmd = supervisor_command(&sup, root, to);
+    let mut cmd = supervisor_command(sup, root, to);
     if !live {
         eprintln!("olly: OLLY_RUN_DIR is set; not running {cmd:?}");
         return Ok(());
@@ -359,6 +366,7 @@ mod tests {
             args,
             [
                 "--unit=olly-update-0.2.0",
+                "--service-type=exec",
                 "--collect",
                 "--quiet",
                 "-p",
