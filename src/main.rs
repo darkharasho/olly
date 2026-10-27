@@ -1,6 +1,8 @@
 use olly::engine::{Event, Target};
 use olly::incident::Incident;
 use olly::ipc::{Request, StatusData};
+use olly::supervise::LastUpdate;
+use olly::update::UpdateInfo;
 use olly::voice::fmt_bytes;
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
@@ -20,6 +22,7 @@ const USAGE: &str = "\u{1F916} here's what I can do:
   olly allowlist                   show the never-close list
   olly kill <id>                   close a paused app (id from `olly status`)
   olly unfreeze <id>               let a paused app carry on
+  olly update [--check]             install a new version, or just look for one
   olly watch                       follow what olly does, live
   olly daemon [--config PATH] [--root PATH]";
 
@@ -35,7 +38,19 @@ enum LocalCmd {
         from: String,
         to: String,
     },
+    /// `olly update`, talking to the daemon with several requests.
+    Update(UpdateMode),
     Help,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum UpdateMode {
+    /// Just look for a new version.
+    Check,
+    /// Start an update and follow it to the end.
+    Wait,
+    /// Start an update and return at once.
+    NoWait,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -172,6 +187,12 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             }
             Ok(Cli::Local(LocalCmd::Daemon { config, root }))
         }
+        "update" => match rest {
+            [] => Ok(Cli::Local(LocalCmd::Update(UpdateMode::Wait))),
+            [f] if f == "--check" => Ok(Cli::Local(LocalCmd::Update(UpdateMode::Check))),
+            [f] if f == "--no-wait" => Ok(Cli::Local(LocalCmd::Update(UpdateMode::NoWait))),
+            _ => Err("\u{1F916} try `olly update`, `olly update --check` or `olly update --no-wait`.".to_string()),
+        },
         "update-supervise" => match rest {
             [root, from, to] => Ok(Cli::Local(LocalCmd::Supervise {
                 root: PathBuf::from(root),
@@ -228,9 +249,16 @@ fn target_lines(label: &str, targets: &[Target]) -> String {
 }
 
 fn render_status(st: &StatusData) -> String {
+    let update = st.update.as_ref().map_or(String::new(), |u| {
+        format!(
+            "\nolly {} is ready! Run `olly update` to install it.",
+            u.version
+        )
+    });
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
         st.message,
+        update,
         target_lines("Frozen", &st.frozen),
         target_lines("Slowed", &st.throttled)
     )
@@ -264,6 +292,9 @@ fn render_event(line: &str) -> Option<String> {
     let EventLine { event, wall_ms } = serde_json::from_str(line).ok()?;
     let m = match event {
         Event::Acted { message, .. } | Event::Notice { message, .. } => message,
+        Event::Updated { message, .. } => {
+            return Some(format!("{}  {message}", fmt_time(wall_ms, false)));
+        }
         _ => return None,
     };
     Some(format!(
@@ -300,11 +331,35 @@ fn render(req: &Request, data: serde_json::Value) -> Result<String, String> {
         Request::FrozenKill { id } => format!("\u{1F916} okay, closing [{id}]."),
         Request::FrozenResume { id } => format!("\u{1F916} okay, letting [{id}] carry on."),
         Request::Subscribe => String::new(),
-        // The CLI doesn't send these yet.
-        Request::UpdateCheck | Request::Update | Request::UpdateFinished => {
-            serde_json::to_string_pretty(&data).map_err(bad)?
-        }
+        Request::UpdateCheck => render_check(
+            serde_json::from_value::<Option<UpdateInfo>>(data)
+                .map_err(bad)?
+                .as_ref(),
+            env!("CARGO_PKG_VERSION"),
+        ),
+        Request::Update => "\u{1F916} updating…".to_string(),
+        // Only the supervisor sends this.
+        Request::UpdateFinished => String::new(),
     })
+}
+
+/// What `olly update --check` prints.
+fn render_check(info: Option<&UpdateInfo>, current: &str) -> String {
+    let Some(u) = info else {
+        return format!("\u{1F916} you're on the newest olly ({current}).");
+    };
+    let mut s = format!("\u{1F916} olly {} is ready!", u.version);
+    for n in &u.notes {
+        s.push_str(&format!("\n  • {n}"));
+    }
+    s.push_str("\nRun `olly update` to install it.");
+    s
+}
+
+/// Is `last` the result of the update we started? `baseline` is the
+/// `at_wall_ms` seen just before asking (0 if there was none).
+fn is_new_result(last: Option<&LastUpdate>, baseline: u64) -> bool {
+    last.is_some_and(|l| l.at_wall_ms > baseline)
 }
 
 fn unreachable(socket: &str) -> ! {
@@ -419,10 +474,85 @@ fn client(req: Request, out: Output) -> ! {
     }
 }
 
+fn socket_path() -> String {
+    std::env::var("OLLY_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_string())
+}
+
+/// One request, one reply, on a fresh connection. `None` if olly can't be
+/// reached or the reply isn't readable.
+fn ask(socket: &str, req: &Request, timeout: Duration) -> Option<serde_json::Value> {
+    let mut stream = UnixStream::connect(socket).ok()?;
+    let line = serde_json::to_string(req).ok()?;
+    stream.write_all(format!("{line}\n").as_bytes()).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    let first = BufReader::new(stream).lines().next()?.ok()?;
+    serde_json::from_str(&first).ok()
+}
+
+fn status_of(socket: &str) -> Option<StatusData> {
+    let v = ask(socket, &Request::Status, Duration::from_secs(10))?;
+    if v["ok"] != true {
+        return None;
+    }
+    serde_json::from_value(v["data"].clone()).ok()
+}
+
+fn update_cmd(mode: UpdateMode) -> ! {
+    let socket = socket_path();
+    if mode == UpdateMode::Check {
+        // The daemon waits up to 75 s for the fetch.
+        let Some(v) = ask(&socket, &Request::UpdateCheck, Duration::from_secs(80)) else {
+            fail("olly didn't answer.")
+        };
+        if v["ok"] != true {
+            fail(v["error"].as_str().unwrap_or("olly said no."));
+        }
+        match render(&Request::UpdateCheck, v["data"].clone()) {
+            Ok(t) => {
+                println!("{t}");
+                std::process::exit(0)
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1)
+            }
+        }
+    }
+    let Some(before) = status_of(&socket) else {
+        unreachable(&socket)
+    };
+    let baseline = before.last_update.as_ref().map_or(0, |l| l.at_wall_ms);
+    let Some(v) = ask(&socket, &Request::Update, Duration::from_secs(10)) else {
+        fail("olly didn't answer.")
+    };
+    if v["ok"] != true {
+        fail(v["error"].as_str().unwrap_or("olly said no."));
+    }
+    println!("\u{1F916} updating…");
+    if mode == UpdateMode::NoWait {
+        std::process::exit(0);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(1));
+        // Failures are expected while the daemon restarts.
+        let Some(st) = status_of(&socket) else {
+            continue;
+        };
+        if is_new_result(st.last_update.as_ref(), baseline) {
+            let l = st.last_update.expect("checked above");
+            println!("\u{1F916} {}", l.message);
+            std::process::exit(if l.ok { 0 } else { 1 });
+        }
+    }
+    fail("I lost track of the update; check `olly status`.")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_cli(&args) {
         Ok(Cli::Req(req, out)) => client(req, out),
+        Ok(Cli::Local(LocalCmd::Update(mode))) => update_cmd(mode),
         Ok(Cli::Local(LocalCmd::Help)) => println!("{USAGE}"),
         Ok(Cli::Local(LocalCmd::Daemon { config, root })) => {
             let (cfg, cfg_err) = olly::config::load(&config);
@@ -555,6 +685,81 @@ mod tests {
         assert!(p("allowlist remove obs").is_err());
         assert!(p("pause 99999999999999999999").is_err());
         assert!(p("pause 307445734561825861").is_err());
+    }
+
+    fn info(notes: &[&str]) -> UpdateInfo {
+        UpdateInfo {
+            version: "0.2.0".into(),
+            notes: notes.iter().map(|s| s.to_string()).collect(),
+            url: "u".into(),
+        }
+    }
+
+    #[test]
+    fn parses_update() {
+        let u = |m| Ok(Cli::Local(LocalCmd::Update(m)));
+        assert_eq!(p("update"), u(UpdateMode::Wait));
+        assert_eq!(p("update --check"), u(UpdateMode::Check));
+        assert_eq!(p("update --no-wait"), u(UpdateMode::NoWait));
+        let e = p("update --bogus").unwrap_err();
+        assert!(e.starts_with('\u{1F916}'), "{e}");
+        assert!(p("update --check --no-wait").is_err());
+        assert!(USAGE.contains(
+            "olly update [--check]             install a new version, or just look for one"
+        ));
+    }
+
+    #[test]
+    fn renders_check() {
+        assert_eq!(
+            render_check(None, "0.1.0"),
+            "\u{1F916} you're on the newest olly (0.1.0)."
+        );
+        assert_eq!(
+            render_check(Some(&info(&["a", "b"])), "0.1.0"),
+            "\u{1F916} olly 0.2.0 is ready!\n  • a\n  • b\nRun `olly update` to install it."
+        );
+        let t = render(&Request::UpdateCheck, serde_json::Value::Null).unwrap();
+        assert!(t.contains("newest olly"), "{t}");
+    }
+
+    #[test]
+    fn status_mentions_offered_update() {
+        let mut st: StatusData = serde_json::from_str(
+            r#"{"level":"calm","dry_run":false,"paused_until_wall_ms":null,"mem_available":1,"mem_total":2,
+            "throttled":[],"frozen":[],"self_rss":1,"message":"All calm."}"#,
+        )
+        .unwrap();
+        assert!(!render_status(&st).contains("ready"));
+        st.update = Some(info(&[]));
+        assert_eq!(
+            render_status(&st),
+            "All calm.\nolly 0.2.0 is ready! Run `olly update` to install it."
+        );
+    }
+
+    #[test]
+    fn renders_updated_event() {
+        let line = r#"{"event":{"Updated":{"from":"0.1.0","to":"0.2.0","ok":true,"message":"updated to 0.2.0! ✨","widget_changed":false}},"wall_ms":0}"#;
+        assert!(render_event(line)
+            .unwrap()
+            .ends_with("updated to 0.2.0! ✨"));
+    }
+
+    #[test]
+    fn waits_only_for_a_newer_result() {
+        let l = |at| LastUpdate {
+            from: "a".into(),
+            to: "b".into(),
+            ok: true,
+            at_wall_ms: at,
+            message: String::new(),
+            widget_changed: false,
+        };
+        assert!(!is_new_result(None, 0));
+        assert!(!is_new_result(Some(&l(5)), 5));
+        assert!(is_new_result(Some(&l(6)), 5));
+        assert!(is_new_result(Some(&l(1)), 0));
     }
 
     #[test]
