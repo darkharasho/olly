@@ -13,6 +13,8 @@ use std::time::Duration;
 
 /// How long the new daemon has to answer `status` with the new version.
 const HEALTH_MS: u64 = 30_000;
+/// How long the old daemon has to answer `status` with the old version after a rollback.
+const ROLLBACK_HEALTH_MS: u64 = 15_000;
 const POLL_MS: u64 = 500;
 const SOCKET: &str = "/run/olly/olly.sock";
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
@@ -197,6 +199,14 @@ impl Item {
     /// directory is renamed.
     fn back_up(&mut self) -> Result<(), String> {
         let prev = self.prev();
+        // A crashed earlier run may have left the only good copy at `.prev`: put it back first.
+        if !exists(&self.dst) && exists(&prev) {
+            fs::rename(&prev, &self.dst).map_err(|e| err("recover", &prev, e))?;
+            eprintln!(
+                "\u{1F916} recovered {} from an earlier update",
+                self.dst.display()
+            );
+        }
         remove_any(&prev).map_err(|e| err("clear", &prev, e))?;
         if !exists(&self.dst) {
             self.backed_up = Some(false);
@@ -300,16 +310,16 @@ fn write_result(layout: &Layout, r: &LastUpdate) {
     }
 }
 
-/// Polls until the daemon reports `to`, for up to `HEALTH_MS` (by sleeps and by the clock).
-fn healthy(host: &mut dyn Host, to: &str) -> bool {
+/// Polls until the daemon reports `version`, for up to `budget_ms` (by sleeps and by the clock).
+fn healthy(host: &mut dyn Host, version: &str, budget_ms: u64) -> bool {
     let start = host.wall_ms();
     let mut waited = 0;
     loop {
-        if host.status_version().as_deref() == Some(to) {
+        if host.status_version().as_deref() == Some(version) {
             return true;
         }
         let elapsed = host.wall_ms().saturating_sub(start);
-        if waited >= HEALTH_MS || elapsed >= HEALTH_MS {
+        if waited >= budget_ms || elapsed >= budget_ms {
             return false;
         }
         host.sleep_ms(POLL_MS);
@@ -381,28 +391,39 @@ pub fn supervise(
             host.daemon_reload()?;
         }
         host.restart_olly()?;
-        if healthy(host, to) {
+        if healthy(host, to, HEALTH_MS) {
             Ok(())
         } else {
             Err(format!("olly didn't report {to} within {HEALTH_MS} ms"))
         }
     };
 
-    let ok = match swap(&mut items, host) {
+    // `None` on success; otherwise what went wrong with the rollback, if anything.
+    let rollback: Option<Vec<String>> = match swap(&mut items, host) {
         Ok(()) => {
             for it in &items {
                 it.drop_backup();
             }
-            true
+            None
         }
         Err(e) => {
             eprintln!("\u{1F916} update to {to} failed, rolling back: {e}");
-            let mut restored = true;
-            for it in items.iter().rev() {
-                restored &= it.restore();
-            }
-            if !restored {
-                eprintln!("\u{1F916} some files couldn't be put back; see above.");
+            let mut problems = Vec::new();
+            let not_restored: Vec<String> = items
+                .iter()
+                .rev()
+                .filter(|it| !it.restore())
+                .map(|it| it.dst.display().to_string())
+                .collect();
+            if !not_restored.is_empty() {
+                eprintln!(
+                    "\u{1F916} rollback incomplete: couldn't restore {}",
+                    not_restored.join(", ")
+                );
+                problems.push(format!(
+                    "some files couldn't be restored: {}",
+                    not_restored.join(", ")
+                ));
             }
             if items[UNIT].installed && unit_changed {
                 if let Err(e) = host.daemon_reload() {
@@ -410,21 +431,39 @@ pub fn supervise(
                 }
             }
             if let Err(e) = host.restart_olly() {
-                eprintln!("\u{1F916} {e}");
+                eprintln!("\u{1F916} {e}; trying once more");
+                if let Err(e) = host.restart_olly() {
+                    eprintln!("\u{1F916} {e}");
+                }
             }
-            false
+            // Poll even if restart failed: systemd may still bring it up.
+            if !healthy(host, from, ROLLBACK_HEALTH_MS) {
+                eprintln!(
+                    "\u{1F916} rollback incomplete: olly didn't report {from} within {ROLLBACK_HEALTH_MS} ms"
+                );
+                problems.push(
+                    "but olly didn't come back up; run `sudo systemctl status olly`".to_string(),
+                );
+            }
+            Some(problems)
         }
     };
+    let ok = rollback.is_none();
 
     let result = LastUpdate {
         from: from.to_string(),
         to: to.to_string(),
         ok,
         at_wall_ms: host.wall_ms(),
-        message: if ok {
-            format!("updated to {to}! \u{2728}")
-        } else {
-            format!("that update didn't work, so I went back to {from}.")
+        message: match &rollback {
+            None => format!("updated to {to}! \u{2728}"),
+            Some(p) if p.is_empty() => {
+                format!("that update didn't work, so I went back to {from}.")
+            }
+            Some(p) => format!(
+                "that update didn't work, so I went back to {from}. ({})",
+                p.join("; ")
+            ),
         },
         widget_changed: ok && widget_changed,
     };
@@ -681,7 +720,7 @@ mod tests {
     #[test]
     fn restart_failure_rolls_back() {
         let e = env();
-        let mut h = FakeHost::new(&[Some("0.2.0")]);
+        let mut h = FakeHost::new(&[Some("0.1.0")]);
         h.restart_fails.push_back(true);
         let r = supervise(&e.layout, &e.staged, "0.1.0", "0.2.0", &mut h);
         assert!(!r.ok);
@@ -691,7 +730,8 @@ mod tests {
         );
         assert_old(&e.layout);
         assert_eq!(h.count("restart_olly"), 2);
-        assert_eq!(h.polls, 0);
+        // Only the rollback check polled, and the old version answered at once.
+        assert_eq!(h.polls, 1);
         assert_eq!(saved(&e.layout), r);
         assert_eq!(h.count("notify_finished"), 1);
     }
@@ -700,11 +740,103 @@ mod tests {
     fn missing_staged_file_rolls_back() {
         let e = env();
         fs::remove_file(e.staged.join("dist/olly-notify.service")).unwrap();
-        let mut h = FakeHost::new(&[Some("0.2.0")]);
+        let mut h = FakeHost::new(&[Some("0.1.0")]);
         let r = supervise(&e.layout, &e.staged, "0.1.0", "0.2.0", &mut h);
         assert!(!r.ok);
         assert_old(&e.layout);
         assert_eq!(saved(&e.layout), r);
+    }
+
+    const PLAIN_ROLLBACK: &str = "that update didn't work, so I went back to 0.1.0.";
+
+    #[test]
+    fn rollback_with_old_version_answering_is_plain() {
+        let e = env();
+        // New daemon never answers; the old one does straight after rollback.
+        let mut h = FakeHost::new(&[None]);
+        h.versions = std::iter::repeat_n(None, 61)
+            .chain([Some("0.1.0".to_string())])
+            .collect();
+        let r = supervise(&e.layout, &e.staged, "0.1.0", "0.2.0", &mut h);
+        assert!(!r.ok);
+        assert_eq!(r.message, PLAIN_ROLLBACK);
+        assert_old(&e.layout);
+    }
+
+    #[test]
+    fn rollback_restart_failing_twice_says_so() {
+        let e = env();
+        let mut h = FakeHost::new(&[None]);
+        h.restart_fails.extend([true, true, true]);
+        let start = h.clock;
+        let r = supervise(&e.layout, &e.staged, "0.1.0", "0.2.0", &mut h);
+        assert!(!r.ok);
+        assert_eq!(
+            r.message,
+            format!(
+                "{PLAIN_ROLLBACK} (but olly didn't come back up; run `sudo systemctl status olly`)"
+            )
+        );
+        assert_eq!(h.count("restart_olly"), 3);
+        assert!(h.clock - start >= 15_000, "{}", h.clock - start);
+        assert!(h.clock - start <= 16_000, "{}", h.clock - start);
+        assert_old(&e.layout);
+        assert_eq!(saved(&e.layout), r);
+        assert_eq!(h.count("notify_finished"), 1);
+    }
+
+    #[test]
+    fn rollback_restart_retry_succeeds() {
+        let e = env();
+        let mut h = FakeHost::new(&[Some("0.1.0")]);
+        h.restart_fails.extend([true, true, false]);
+        let r = supervise(&e.layout, &e.staged, "0.1.0", "0.2.0", &mut h);
+        assert_eq!(r.message, PLAIN_ROLLBACK);
+        assert_eq!(h.count("restart_olly"), 3);
+    }
+
+    #[test]
+    fn stale_plasmoid_backup_is_recovered() {
+        // A crashed run left the old widget only at `plasmoid.prev`.
+        let e = env();
+        let share = &e.layout.share;
+        fs::rename(share.join("plasmoid"), share.join("plasmoid.prev")).unwrap();
+        let mut h = FakeHost::new(&[Some("0.1.0")]);
+        let r = supervise(&e.layout, &e.staged, "0.1.0", "0.2.0", &mut h);
+        assert!(!r.ok);
+        assert_eq!(r.message, PLAIN_ROLLBACK);
+        assert_old(&e.layout);
+        assert_eq!(read(&share.join("plasmoid/metadata.json")), meta("0.1.0"));
+    }
+
+    #[test]
+    fn backup_failure_partway_restores_and_installs_nothing() {
+        let e = env();
+        let l = &e.layout;
+        // The unit path is a non-empty directory, so copying it to `.prev` fails after
+        // both binaries were backed up.
+        let unit = l.unit_dir.join("olly.service");
+        fs::remove_file(&unit).unwrap();
+        write(&unit.join("inner"), "old-unit-dir");
+        let mut h = FakeHost::new(&[Some("0.1.0")]);
+        let r = supervise(l, &e.staged, "0.1.0", "0.2.0", &mut h);
+        assert!(!r.ok);
+        assert_eq!(r.message, PLAIN_ROLLBACK);
+        assert_eq!(read(&l.bin.join("olly")), "old-olly");
+        assert_eq!(read(&l.bin.join("olly-notify")), "old-notify");
+        assert_eq!(read(&unit.join("inner")), "old-unit-dir");
+        assert_eq!(
+            read(&l.share.join("olly-notify.service")),
+            "old-notify-unit"
+        );
+        assert_eq!(
+            read(&l.share.join("plasmoid/contents/ui/main.qml")),
+            "old-qml"
+        );
+        assert_eq!(all_leftovers(l), Vec::<String>::new());
+        // Nothing was swapped, so no reload; one restart for the rollback.
+        assert_eq!(h.count("daemon_reload"), 0);
+        assert_eq!(h.count("restart_olly"), 1);
     }
 
     #[test]
