@@ -4,7 +4,7 @@
 //! daemon's, since they need the engine.
 
 use crate::engine::Event;
-use crate::supervise::{LastUpdate, Layout};
+use crate::supervise::{self, LastUpdate, Layout};
 use crate::update::{self, Fetch, Manifest, Staged, UpdateInfo, UpdateState};
 use std::fs;
 use std::os::fd::RawFd;
@@ -34,6 +34,8 @@ pub enum Done {
     Checked(Result<Option<Manifest>, String>),
     Staged(Result<Staged, String>),
     Launched(Result<(), String>),
+    /// An interrupted swap was finished or undone; true when a result was written.
+    Recovered(bool),
 }
 
 pub struct Updater {
@@ -200,6 +202,20 @@ impl Updater {
         Ok(())
     }
 
+    /// Finishes or undoes a swap whose supervisor died. Plain file work, run on the main
+    /// thread at start only; true when it wrote a result.
+    pub fn recover(&mut self, wall_ms: u64) -> bool {
+        supervise::recover(&self.layout, CURRENT, wall_ms).is_some()
+    }
+
+    /// The same, on a worker, for an install that timed out.
+    pub fn spawn_recover(&mut self, wall_ms: u64) -> Result<(), String> {
+        let layout = self.layout.clone();
+        self.spawn("olly-update-recover", Done::Recovered(false), move || {
+            Done::Recovered(supervise::recover(&layout, CURRENT, wall_ms).is_some())
+        })
+    }
+
     /// The supervisor never reported back (killed, or the machine was busy): give up on the
     /// install after `INSTALL_TIMEOUT_MS`. True when it just gave up.
     pub fn expire_install(&mut self, now: u64) -> bool {
@@ -263,6 +279,19 @@ impl Updater {
     }
 }
 
+/// The supervisor runs in its own unit, as protected from the OOM killer as olly is.
+fn supervisor_command(sup: &Path, root: &Path, to: &str) -> Command {
+    let unit = format!("--unit=olly-update-{to}");
+    let mut cmd = Command::new("systemd-run");
+    cmd.args([unit.as_str(), "--collect", "--quiet"])
+        .args(["-p", "OOMScoreAdjust=-1000"])
+        .arg(sup)
+        .arg("update-supervise")
+        .arg(root)
+        .args([CURRENT, to]);
+    cmd
+}
+
 fn widget_version(path: &Path) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -277,13 +306,7 @@ fn launch(work: &Path, root: &Path, to: &str, live: bool) -> Result<(), String> 
         .map_err(|e| format!("cannot copy olly to {}: {e}", sup.display()))?;
     fs::set_permissions(&sup, fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("cannot chmod {}: {e}", sup.display()))?;
-    let unit = format!("--unit=olly-update-{to}");
-    let mut cmd = Command::new("systemd-run");
-    cmd.args([unit.as_str(), "--collect", "--quiet"])
-        .arg(&sup)
-        .arg("update-supervise")
-        .arg(root)
-        .args([CURRENT, to]);
+    let mut cmd = supervisor_command(&sup, root, to);
     if !live {
         eprintln!("olly: OLLY_RUN_DIR is set; not running {cmd:?}");
         return Ok(());
@@ -296,5 +319,35 @@ fn launch(work: &Path, root: &Path, to: &str, live: bool) -> Result<(), String> 
         Ok(())
     } else {
         Err(format!("systemd-run failed ({status})"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supervisor_unit_is_oom_protected() {
+        let cmd = supervisor_command(Path::new("/w/sup"), Path::new("/w/0.2.0/root"), "0.2.0");
+        assert_eq!(cmd.get_program(), "systemd-run");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--unit=olly-update-0.2.0",
+                "--collect",
+                "--quiet",
+                "-p",
+                "OOMScoreAdjust=-1000",
+                "/w/sup",
+                "update-supervise",
+                "/w/0.2.0/root",
+                CURRENT,
+                "0.2.0",
+            ]
+        );
     }
 }

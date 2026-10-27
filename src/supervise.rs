@@ -31,6 +31,7 @@ pub struct LastUpdate {
 }
 
 /// Where an install lives.
+#[derive(Clone)]
 pub struct Layout {
     pub bin: PathBuf,
     pub unit_dir: PathBuf,
@@ -51,11 +52,27 @@ impl Layout {
     pub fn result_path(&self) -> PathBuf {
         self.state.join("update-result.json")
     }
+
+    /// Written before the first backup and removed after the result: while it exists, a swap
+    /// is running or was interrupted.
+    pub fn journal_path(&self) -> PathBuf {
+        self.state.join("update/swap.json")
+    }
+}
+
+/// What a swap was doing, so an interrupted one can be finished or undone.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct Journal {
+    from: String,
+    to: String,
 }
 
 /// What the supervisor needs from the system, so tests can fake it.
 pub trait Host {
     fn daemon_reload(&mut self) -> Result<(), String>;
+    /// Clears systemd's failed state and restart counter for olly, so a rollback restart
+    /// isn't refused after the new daemon crash-looped.
+    fn reset_failed(&mut self) -> Result<(), String>;
     fn restart_olly(&mut self) -> Result<(), String>;
     fn status_version(&mut self) -> Option<String>;
     fn notify_finished(&mut self);
@@ -90,6 +107,10 @@ fn ask(line: &str) -> Option<serde_json::Value> {
 impl Host for SystemHost {
     fn daemon_reload(&mut self) -> Result<(), String> {
         systemctl(&["daemon-reload"])
+    }
+
+    fn reset_failed(&mut self) -> Result<(), String> {
+        systemctl(&["reset-failed", "olly"])
     }
 
     fn restart_olly(&mut self) -> Result<(), String> {
@@ -196,9 +217,21 @@ impl Item {
     }
 
     /// Files are copied to `.prev` (the old one stays in place until the swap); the plasmoid
-    /// directory is renamed.
-    fn back_up(&mut self) -> Result<(), String> {
+    /// directory is renamed. With `keep_prev` (an earlier swap was interrupted) an existing
+    /// `.prev` is the known-good copy and is kept.
+    fn back_up(&mut self, keep_prev: bool) -> Result<(), String> {
         let prev = self.prev();
+        if keep_prev && exists(&prev) {
+            if self.kind == Kind::Dir {
+                remove_any(&self.dst).map_err(|e| err("clear", &self.dst, e))?;
+            }
+            eprintln!(
+                "\u{1F916} keeping {} from an interrupted update",
+                prev.display()
+            );
+            self.backed_up = Some(true);
+            return Ok(());
+        }
         // A crashed earlier run may have left the only good copy at `.prev`: put it back first.
         if !exists(&self.dst) && exists(&prev) {
             fs::rename(&prev, &self.dst).map_err(|e| err("recover", &prev, e))?;
@@ -214,7 +247,15 @@ impl Item {
         }
         match self.kind {
             Kind::File(_) => {
-                fs::copy(&self.dst, &prev).map_err(|e| err("back up", &self.dst, e))?;
+                // Via a temp name, so a `.prev` is always complete.
+                let tmp = sibling(&prev, ".tmp");
+                let copied = fs::copy(&self.dst, &tmp)
+                    .and_then(|_| fs::File::open(&tmp)?.sync_all())
+                    .and_then(|_| fs::rename(&tmp, &prev));
+                if let Err(e) = copied {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(err("back up", &self.dst, e));
+                }
             }
             Kind::Dir => fs::rename(&self.dst, &prev).map_err(|e| err("back up", &self.dst, e))?,
         }
@@ -287,10 +328,211 @@ impl Item {
     }
 }
 
+const UNIT: usize = 2;
+const WIDGET: usize = 3;
+
 fn widget_version(dir: &Path) -> Option<String> {
     let text = fs::read_to_string(dir.join("metadata.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     v["KPlugin"]["Version"].as_str().map(String::from)
+}
+
+/// Writes the journal atomically and keeps it locked (flock) until the returned file is
+/// dropped, so a daemon starting meanwhile can tell the swap is still running.
+fn write_journal(layout: &Layout, from: &str, to: &str) -> Result<fs::File, String> {
+    use std::os::fd::AsRawFd;
+    let path = layout.journal_path();
+    let tmp = sibling(&path, ".tmp");
+    let j = Journal {
+        from: from.to_string(),
+        to: to.to_string(),
+    };
+    let write = || -> io::Result<fs::File> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let json = serde_json::to_string(&j).map_err(io::Error::other)?;
+        let mut f = fs::File::create(&tmp)?;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+        fs::rename(&tmp, &path)?;
+        Ok(f)
+    };
+    write().map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        err("write", &path, e)
+    })
+}
+
+fn remove_journal(layout: &Layout) {
+    let path = layout.journal_path();
+    if let Err(e) = remove_any(&path) {
+        eprintln!("\u{1F916} {}", err("remove", &path, e));
+    }
+}
+
+/// The installed paths and where a release stages each one.
+fn items(layout: &Layout, staged_root: &Path) -> [Item; 5] {
+    let item = |src: PathBuf, dst: PathBuf, kind| Item {
+        src,
+        dst,
+        kind,
+        backed_up: None,
+        installed: false,
+    };
+    [
+        item(
+            staged_root.join("olly"),
+            layout.bin.join("olly"),
+            Kind::File(0o755),
+        ),
+        item(
+            staged_root.join("olly-notify"),
+            layout.bin.join("olly-notify"),
+            Kind::File(0o755),
+        ),
+        item(
+            staged_root.join("dist/olly.service"),
+            layout.unit_dir.join("olly.service"),
+            Kind::File(0o644),
+        ),
+        item(
+            staged_root.join("plasmoid/package"),
+            layout.share.join("plasmoid"),
+            Kind::Dir,
+        ),
+        item(
+            staged_root.join("dist/olly-notify.service"),
+            layout.share.join("olly-notify.service"),
+            Kind::File(0o644),
+        ),
+    ]
+}
+
+/// Puts back every `.prev` an install left. Returns the paths that couldn't be restored.
+pub fn restore_backups(layout: &Layout) -> Vec<String> {
+    let mut items = items(layout, Path::new(""));
+    items
+        .iter_mut()
+        .rev()
+        .filter_map(|it| {
+            let _ = remove_any(&sibling(&it.prev(), ".tmp"));
+            if !exists(&it.prev()) {
+                let _ = remove_any(&it.new_path());
+                return None;
+            }
+            it.backed_up = Some(true);
+            (!it.restore()).then(|| it.dst.display().to_string())
+        })
+        .collect()
+}
+
+fn rollback_message(from: &str, problems: &[String]) -> String {
+    if problems.is_empty() {
+        format!("that update didn't work, so I went back to {from}.")
+    } else {
+        format!(
+            "that update didn't work, so I went back to {from}. ({})",
+            problems.join("; ")
+        )
+    }
+}
+
+fn not_restored_problem(paths: &[String]) -> String {
+    format!("some files couldn't be restored: {}", paths.join(", "))
+}
+
+/// Finishes or undoes a swap whose supervisor died, from the daemon (on start, and when an
+/// install times out). `current` is the running daemon's version. Returns the result it
+/// wrote, if any. Leaves a swap alone while its supervisor still holds the journal lock.
+pub fn recover(layout: &Layout, current: &str, wall_ms: u64) -> Option<LastUpdate> {
+    use std::os::fd::AsRawFd;
+    let path = layout.journal_path();
+    let f = match fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!("olly: {}", err("read", &path, e));
+            return None;
+        }
+    };
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        eprintln!("olly: an update is still swapping files; leaving it to finish");
+        return None;
+    }
+    let j: Journal = match fs::read_to_string(&path)
+        .map_err(io::Error::other)
+        .and_then(|t| serde_json::from_str(&t).map_err(io::Error::other))
+    {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!(
+                "olly: {}; leaving the update files as they are",
+                err("read", &path, e)
+            );
+            return None;
+        }
+    };
+    let result = if j.from == current {
+        // The old binary runs, so the swap never finished: undo it.
+        eprintln!(
+            "olly: an update to {} was interrupted; putting {} back",
+            j.to, j.from
+        );
+        let not_restored = restore_backups(layout);
+        let problems: Vec<String> = if not_restored.is_empty() {
+            Vec::new()
+        } else {
+            vec![not_restored_problem(&not_restored)]
+        };
+        LastUpdate {
+            message: rollback_message(&j.from, &problems),
+            from: j.from,
+            to: j.to,
+            ok: false,
+            at_wall_ms: wall_ms,
+            widget_changed: false,
+        }
+    } else if j.to == current {
+        // The new binary runs, so the supervisor died after the restart: keep it.
+        eprintln!(
+            "olly: the update to {} finished without its supervisor; keeping it",
+            j.to
+        );
+        let items = items(layout, Path::new(""));
+        let widget = &items[WIDGET].dst;
+        let old_widget = widget_version(&sibling(widget, ".prev"));
+        let widget_changed = old_widget.is_none() || widget_version(widget) != old_widget;
+        for mut it in items {
+            let _ = remove_any(&it.new_path());
+            let _ = remove_any(&sibling(&it.prev(), ".tmp"));
+            if exists(&it.prev()) {
+                it.backed_up = Some(true);
+                it.drop_backup();
+            }
+        }
+        LastUpdate {
+            message: format!("updated to {}! \u{2728}", j.to),
+            from: j.from,
+            to: j.to,
+            ok: true,
+            at_wall_ms: wall_ms,
+            widget_changed,
+        }
+    } else {
+        eprintln!(
+            "olly: found an interrupted update from {} to {}, but I'm {current}; leaving its files as they are",
+            j.from, j.to
+        );
+        return None;
+    };
+    write_result(layout, &result);
+    remove_journal(layout);
+    drop(f);
+    Some(result)
 }
 
 fn write_result(layout: &Layout, r: &LastUpdate) {
@@ -336,42 +578,7 @@ pub fn supervise(
     to: &str,
     host: &mut dyn Host,
 ) -> LastUpdate {
-    let item = |src: PathBuf, dst: PathBuf, kind| Item {
-        src,
-        dst,
-        kind,
-        backed_up: None,
-        installed: false,
-    };
-    const UNIT: usize = 2;
-    const WIDGET: usize = 3;
-    let mut items = [
-        item(
-            staged_root.join("olly"),
-            layout.bin.join("olly"),
-            Kind::File(0o755),
-        ),
-        item(
-            staged_root.join("olly-notify"),
-            layout.bin.join("olly-notify"),
-            Kind::File(0o755),
-        ),
-        item(
-            staged_root.join("dist/olly.service"),
-            layout.unit_dir.join("olly.service"),
-            Kind::File(0o644),
-        ),
-        item(
-            staged_root.join("plasmoid/package"),
-            layout.share.join("plasmoid"),
-            Kind::Dir,
-        ),
-        item(
-            staged_root.join("dist/olly-notify.service"),
-            layout.share.join("olly-notify.service"),
-            Kind::File(0o644),
-        ),
-    ];
+    let mut items = items(layout, staged_root);
 
     let unit_changed = match (fs::read(&items[UNIT].src), fs::read(&items[UNIT].dst)) {
         (Ok(new), Ok(old)) => new != old,
@@ -380,9 +587,13 @@ pub fn supervise(
     let old_widget = widget_version(&items[WIDGET].dst);
     let widget_changed = old_widget.is_none() || widget_version(&items[WIDGET].src) != old_widget;
 
-    let swap = |items: &mut [Item], host: &mut dyn Host| -> Result<(), String> {
+    // A journal left by an interrupted swap means the `.prev` copies are the good ones.
+    let keep_prev = exists(&layout.journal_path());
+    let mut journal = None;
+    let mut swap = |items: &mut [Item], host: &mut dyn Host| -> Result<(), String> {
+        journal = Some(write_journal(layout, from, to)?);
         for it in items.iter_mut() {
-            it.back_up()?;
+            it.back_up(keep_prev)?;
         }
         for it in items.iter_mut() {
             it.install()?;
@@ -420,16 +631,14 @@ pub fn supervise(
                     "\u{1F916} rollback incomplete: couldn't restore {}",
                     not_restored.join(", ")
                 );
-                problems.push(format!(
-                    "some files couldn't be restored: {}",
-                    not_restored.join(", ")
-                ));
+                problems.push(not_restored_problem(&not_restored));
             }
             if items[UNIT].installed && unit_changed {
                 if let Err(e) = host.daemon_reload() {
                     eprintln!("\u{1F916} {e}");
                 }
             }
+            let _ = host.reset_failed();
             if let Err(e) = host.restart_olly() {
                 eprintln!("\u{1F916} {e}; trying once more");
                 if let Err(e) = host.restart_olly() {
@@ -457,17 +666,16 @@ pub fn supervise(
         at_wall_ms: host.wall_ms(),
         message: match &rollback {
             None => format!("updated to {to}! \u{2728}"),
-            Some(p) if p.is_empty() => {
-                format!("that update didn't work, so I went back to {from}.")
-            }
-            Some(p) => format!(
-                "that update didn't work, so I went back to {from}. ({})",
-                p.join("; ")
-            ),
+            Some(p) => rollback_message(from, p),
         },
         widget_changed: ok && widget_changed,
     };
     write_result(layout, &result);
+    // Removed before the lock is released, so recovery never sees a finished swap.
+    if let Some(lock) = journal.take() {
+        remove_journal(layout);
+        drop(lock);
+    }
     host.notify_finished();
     result
 }
@@ -506,6 +714,10 @@ mod tests {
         fn daemon_reload(&mut self) -> Result<(), String> {
             self.calls.push("daemon_reload".into());
             Ok(())
+        }
+        fn reset_failed(&mut self) -> Result<(), String> {
+            self.calls.push("reset_failed".into());
+            Err("reset-failed fails here; it must not matter".into())
         }
         fn restart_olly(&mut self) -> Result<(), String> {
             self.calls.push("restart_olly".into());
@@ -709,6 +921,14 @@ mod tests {
             meta("0.1.0")
         );
         assert_eq!(h.count("restart_olly"), 2);
+        // The failed state is cleared before the rollback's restart, never before the first.
+        let calls: Vec<&str> = h
+            .calls
+            .iter()
+            .map(String::as_str)
+            .filter(|c| *c == "reset_failed" || *c == "restart_olly")
+            .collect();
+        assert_eq!(calls, ["restart_olly", "reset_failed", "restart_olly"]);
         assert!(h.clock - start >= 30_000, "{}", h.clock - start);
         assert!(h.clock - start <= 31_000, "{}", h.clock - start);
         // The unit changed, so systemd reloads on the way in and on the way back.
@@ -924,5 +1144,148 @@ mod tests {
         assert_eq!(saved(&e.layout), r);
         assert_eq!(r.at_wall_ms, h.clock);
         assert!(!e.layout.state.join("update-result.json.tmp").exists());
+    }
+
+    fn journal(l: &Layout, from: &str, to: &str) {
+        write(
+            &l.journal_path(),
+            &format!(r#"{{"from":"{from}","to":"{to}"}}"#),
+        );
+    }
+
+    /// The state a supervisor killed after installing leaves: new files in place, old ones
+    /// at `.prev`, and the journal.
+    fn interrupted() -> Env {
+        let e = env_with("new-unit", Some("0.1.0"), "0.1.1");
+        let l = &e.layout;
+        for (dst, new) in [
+            (l.bin.join("olly"), "new-olly"),
+            (l.bin.join("olly-notify"), "new-notify"),
+            (l.unit_dir.join("olly.service"), "new-unit"),
+            (l.share.join("olly-notify.service"), "new-notify-unit"),
+        ] {
+            fs::copy(&dst, sibling(&dst, ".prev")).unwrap();
+            write(&dst, new);
+        }
+        let w = l.share.join("plasmoid");
+        fs::rename(&w, sibling(&w, ".prev")).unwrap();
+        write(&w.join("metadata.json"), &meta("0.1.1"));
+        write(&w.join("contents/ui/main.qml"), "new-qml");
+        journal(l, "0.1.0", "0.2.0");
+        e
+    }
+
+    #[test]
+    fn swap_writes_and_removes_the_journal() {
+        let e = env();
+        let mut h = FakeHost::new(&[Some("0.2.0")]);
+        assert!(supervise(&e.layout, &e.staged, "0.1.0", "0.2.0", &mut h).ok);
+        assert!(!e.layout.journal_path().exists());
+        assert!(!sibling(&e.layout.journal_path(), ".tmp").exists());
+
+        let e = env();
+        let mut h = FakeHost::new(&[Some("0.1.0")]);
+        assert!(!supervise(&e.layout, &e.staged, "0.1.0", "0.2.0", &mut h).ok);
+        assert!(!e.layout.journal_path().exists());
+    }
+
+    #[test]
+    fn retry_with_journal_keeps_the_original_backup() {
+        let e = interrupted();
+        let l = &e.layout;
+        // The staged release is broken this time too: the rollback must reach the
+        // original files, not the half-installed ones.
+        let mut h = FakeHost::new(&[Some("0.1.0")]);
+        let r = supervise(l, &e.staged, "0.1.0", "0.2.0", &mut h);
+        assert!(!r.ok);
+        assert_eq!(r.message, PLAIN_ROLLBACK);
+        assert_old(l);
+        assert_eq!(read(&l.share.join("plasmoid/metadata.json")), meta("0.1.0"));
+        assert!(!l.journal_path().exists());
+
+        // And a retry that works drops the old backups.
+        let e = interrupted();
+        let mut h = FakeHost::new(&[Some("0.2.0")]);
+        assert!(supervise(&e.layout, &e.staged, "0.1.0", "0.2.0", &mut h).ok);
+        assert_eq!(read(&e.layout.bin.join("olly")), "new-olly");
+        assert_eq!(all_leftovers(&e.layout), Vec::<String>::new());
+    }
+
+    #[test]
+    fn without_journal_a_stale_backup_is_replaced() {
+        let e = env();
+        let l = &e.layout;
+        write(&l.bin.join("olly.prev"), "stale");
+        let mut h = FakeHost::new(&[Some("0.1.0")]);
+        assert!(!supervise(l, &e.staged, "0.1.0", "0.2.0", &mut h).ok);
+        assert_eq!(read(&l.bin.join("olly")), "old-olly");
+    }
+
+    #[test]
+    fn recover_on_the_old_version_restores_files() {
+        let e = interrupted();
+        let l = &e.layout;
+        let r = recover(l, "0.1.0", 42).expect("a result");
+        assert!(!r.ok);
+        assert_eq!((r.from.as_str(), r.to.as_str()), ("0.1.0", "0.2.0"));
+        assert_eq!(r.message, PLAIN_ROLLBACK);
+        assert_eq!(r.at_wall_ms, 42);
+        assert!(!r.widget_changed);
+        assert_old(l);
+        assert_eq!(read(&l.share.join("plasmoid/metadata.json")), meta("0.1.0"));
+        assert_eq!(saved(l), r);
+        assert!(!l.journal_path().exists());
+    }
+
+    #[test]
+    fn recover_on_the_new_version_keeps_it() {
+        let e = interrupted();
+        let l = &e.layout;
+        let r = recover(l, "0.2.0", 42).expect("a result");
+        assert!(r.ok);
+        assert_eq!(r.message, "updated to 0.2.0! \u{2728}");
+        assert!(r.widget_changed);
+        assert_eq!(read(&l.bin.join("olly")), "new-olly");
+        assert_eq!(
+            read(&l.share.join("plasmoid/contents/ui/main.qml")),
+            "new-qml"
+        );
+        assert_eq!(all_leftovers(l), Vec::<String>::new());
+        assert_eq!(saved(l), r);
+        assert!(!l.journal_path().exists());
+    }
+
+    #[test]
+    fn recover_without_journal_does_nothing() {
+        let e = env();
+        let l = &e.layout;
+        write(&l.bin.join("olly.prev"), "something");
+        assert_eq!(recover(l, "0.1.0", 42), None);
+        assert_eq!(read(&l.bin.join("olly.prev")), "something");
+        assert_eq!(read(&l.bin.join("olly")), "old-olly");
+        assert!(!l.result_path().exists());
+    }
+
+    #[test]
+    fn recover_for_another_version_leaves_everything() {
+        let e = interrupted();
+        let l = &e.layout;
+        assert_eq!(recover(l, "0.3.0", 42), None);
+        assert!(l.journal_path().exists());
+        assert_eq!(read(&l.bin.join("olly")), "new-olly");
+        assert_eq!(read(&l.bin.join("olly.prev")), "old-olly");
+        assert!(!l.result_path().exists());
+    }
+
+    #[test]
+    fn recover_leaves_a_running_swap_alone() {
+        let e = interrupted();
+        let l = &e.layout;
+        // A live supervisor holds the journal lock.
+        let _lock = write_journal(l, "0.1.0", "0.2.0").unwrap();
+        assert_eq!(recover(l, "0.2.0", 42), None);
+        assert!(l.journal_path().exists());
+        assert_eq!(read(&l.bin.join("olly.prev")), "old-olly");
+        assert!(!l.result_path().exists());
     }
 }

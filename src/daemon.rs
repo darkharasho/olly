@@ -431,6 +431,10 @@ impl Daemon {
     fn update_due(&mut self, now: u64) {
         if self.upd.expire_install(now) {
             eprintln!("olly: the update supervisor never reported back; giving up on that install");
+            if let Err(e) = self.upd.spawn_recover(wall_ms()) {
+                self.rlog
+                    .log("update_recover", now, &format!("update: {e}"));
+            }
         }
         if now < self.upd.next_check {
             return;
@@ -457,6 +461,11 @@ impl Daemon {
             match done {
                 Done::Checked(r) => self.on_checked(r),
                 Done::Staged(r) => self.on_staged(r),
+                Done::Recovered(wrote) => {
+                    if wrote {
+                        self.load_update_result();
+                    }
+                }
                 Done::Launched(r) => {
                     self.upd.launching = false;
                     if let Err(e) = r {
@@ -1018,6 +1027,7 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         start: Instant::now(),
         cfg,
     };
+    d.upd.recover(wall_ms());
     d.load_update_result();
     if cfg_err.is_some() {
         let ev = Event::Notice {
@@ -1727,5 +1737,34 @@ mod tests {
         assert_eq!(d.upd.state, UpdateState::Idle);
         // The update is still offered and can be tried again.
         assert_eq!(d.respond(Request::Update), ok_line(&"started"));
+    }
+
+    #[test]
+    fn install_timeout_undoes_an_interrupted_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut d = test_daemon(root);
+        d.upd.update = Some(offered());
+        assert_eq!(d.respond(Request::Update), ok_line(&"started"));
+        d.on_staged(Ok(staged(root)));
+        pump_until(&mut d, |d| !d.upd.launching);
+        // The supervisor died mid-swap: the new binary is in place, the old one at `.prev`.
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/olly"), "new").unwrap();
+        fs::write(root.join("bin/olly.prev"), "old").unwrap();
+        fs::write(
+            root.join("update/swap.json"),
+            format!(r#"{{"from":"{}","to":"9.9.9"}}"#, upd::CURRENT),
+        )
+        .unwrap();
+        d.update_due(60_000 + upd::INSTALL_TIMEOUT_MS + 1);
+        pump_until(&mut d, |d| d.upd.last_update.is_some());
+        let last = d.status().last_update.unwrap();
+        assert!(!last.ok);
+        assert_eq!(last.to, "9.9.9");
+        assert_eq!(fs::read_to_string(root.join("bin/olly")).unwrap(), "old");
+        assert!(!root.join("bin/olly.prev").exists());
+        assert!(!root.join("update/swap.json").exists());
+        assert_eq!(updated_lines(&d), 1);
     }
 }
