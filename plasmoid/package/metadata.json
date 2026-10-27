@@ -8,7 +8,7 @@
         "Id": "org.olly.tray",
         "License": "MIT",
         "Name": "olly",
-        "Version": "0.2.2"
+        "Version": "0.2.3"
     },
     "X-Plasma-API": "declarativeappletscript",
     "X-Plasma-API-Minimum-Version": "6.0",
