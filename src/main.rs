@@ -224,7 +224,15 @@ fn render_event(line: &str) -> Option<String> {
 fn render(req: &Request, data: serde_json::Value) -> Result<String, String> {
     let bad = |e: serde_json::Error| format!("\u{1F916} olly's answer wasn't what I expected: {e}");
     Ok(match req {
-        Request::Status | Request::Pause { .. } | Request::Resume => {
+        Request::Pause { .. } => {
+            let st: StatusData = serde_json::from_value(data).map_err(bad)?;
+            let mut text = render_status(&st);
+            if !st.frozen.is_empty() {
+                text.push_str("\nApps olly has already frozen keep their timers: if you don't answer, olly still closes them when the time is up.");
+            }
+            text
+        }
+        Request::Status | Request::Resume => {
             render_status(&serde_json::from_value(data).map_err(bad)?)
         }
         Request::Incidents { .. } => {
@@ -387,6 +395,25 @@ mod tests {
         assert!(p("allowlist remove obs").is_err());
         assert!(p("pause 99999999999999999999").is_err());
         assert!(p("pause 307445734561825861").is_err());
+    }
+
+    #[test]
+    fn pause_reply_mentions_frozen_timers() {
+        let status = |frozen: &str| {
+            serde_json::from_str::<serde_json::Value>(&format!(
+                r#"{{"level":"critical","dry_run":false,"paused_until_wall_ms":1,"mem_available":1,"mem_total":2,
+                "throttled":[],"frozen":[{frozen}],"self_rss":1,"message":"Paused."}}"#
+            ))
+            .unwrap()
+        };
+        let one = r#"{"id":2,"key":{"cgroup":"/a","root_pid":null},"name":"game.exe","kind":"Cgroup","bytes":1}"#;
+        let text = render(&Request::Pause { secs: 60 }, status(one)).unwrap();
+        assert!(text.contains("already frozen"), "{text}");
+        let text = render(&Request::Pause { secs: 60 }, status("")).unwrap();
+        assert!(!text.contains("already frozen"), "{text}");
+        // Only the pause reply carries the note.
+        let text = render(&Request::Status, status(one)).unwrap();
+        assert!(!text.contains("already frozen"), "{text}");
     }
 
     #[test]

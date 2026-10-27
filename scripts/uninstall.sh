@@ -19,10 +19,15 @@ fi
 
 echo "🤖 stopping olly (sudo will ask for your password)..."
 systemctl --user disable --now olly-notify 2>/dev/null || true
-sudo systemctl disable --now olly 2>/dev/null || true
+if [ -e /etc/systemd/system/olly.service ]; then
+    if ! sudo systemctl disable --now olly; then
+        echo "🤖 couldn't stop olly, so I left it installed. Check 'systemctl status olly' and run uninstall.sh again." >&2
+        exit 1
+    fi
+fi
 
 rm -f "$HOME/.config/systemd/user/olly-notify.service"
-systemctl --user daemon-reload
+systemctl --user daemon-reload || true
 sudo rm -f /etc/systemd/system/olly.service /usr/local/bin/olly /usr/local/bin/olly-notify
 sudo systemctl daemon-reload
 

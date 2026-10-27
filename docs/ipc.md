@@ -25,9 +25,9 @@ Every request gets exactly one response line (except `subscribe`, which then str
 | `{"cmd":"incidents","limit":10,"offset":0}` | array of `Incident`, newest first. `limit` defaults to 10, `offset` to 0 |
 | `{"cmd":"incident","id":7}` | one `Incident`, or an error if unknown |
 | `{"cmd":"subscribe"}` | `"subscribed"`, then a stream of event lines |
-| `{"cmd":"pause","secs":600}` | pause status. `secs` must be at least 1 and at most the daemon's `max_pause_secs` (default 3600). While paused, throttle and freeze are suspended; emergency kills still happen |
+| `{"cmd":"pause","secs":600}` | pause status. `secs` must be at least 1 and at most the daemon's `max_pause_secs` (default 3600). While paused, throttle and freeze are suspended; emergency kills still happen. A pause does not cancel the kill timers of apps that are already frozen: they are still closed at the end of their grace period or after the no-answer timeout unless you send `frozen_resume` |
 | `{"cmd":"resume"}` | ends a pause early |
-| `{"cmd":"allowlist_add","name":"obs"}` | adds a never-kill process name. Must be non-empty and contain no `*` |
+| `{"cmd":"allowlist_add","name":"obs"}` | adds a never-kill process name. Must be non-empty and contain no `*`. It matches a process's name (cut at 15 characters by the kernel) or its executable's file name, so long names work |
 | `{"cmd":"allowlist_list"}` | array of names |
 | `{"cmd":"frozen_kill","id":2}` | kills a currently frozen target (`id` is `Target.id`) |
 | `{"cmd":"frozen_resume","id":2}` | resumes a currently frozen target |
@@ -56,7 +56,7 @@ Every request gets exactly one response line (except `subscribe`, which then str
 {"id":2,"key":{"cgroup":"/user.slice/.../app-steam.scope","root_pid":102},"name":"game.exe","kind":{"Processes":{"pids":[[102,1102]]}},"bytes":21000000000}
 ```
 
-`kind` is `"Cgroup"` or `{"Processes":{"pids":[[pid,start_time],...]}}`.
+`kind` is `"Cgroup"` or `{"Processes":{"pids":[[pid,start_time],...]}}`. Target ids start from the daemon's start time in milliseconds since the epoch, so they are large numbers, and an id from before a restart never matches a new target.
 
 ### Incident
 

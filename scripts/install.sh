@@ -24,12 +24,19 @@ else
 fi
 install -Dm644 dist/olly-notify.service "$HOME/.config/systemd/user/olly-notify.service"
 
+# enable, then restart: a re-run after a rebuild picks up the new binaries.
 sudo systemctl daemon-reload
-sudo systemctl enable --now olly
+sudo systemctl enable olly
+sudo systemctl restart olly
 systemctl --user daemon-reload
-systemctl --user enable --now olly-notify
+systemctl --user enable olly-notify
+systemctl --user restart olly-notify
 
-echo "🤖 olly is up and watching, in dry-run mode: it will tell you what it would do, but won't act yet."
-echo "   Check in with: olly status"
-echo "   When you're happy, let it act with:"
-echo "   sudo sed -i 's/^dry_run = true/dry_run = false/' /etc/olly/config.toml && sudo systemctl restart olly"
+if grep -q '^dry_run = true' /etc/olly/config.toml; then
+    echo "🤖 olly is up and watching, in dry-run mode: it will tell you what it would do, but won't act yet."
+    echo "   Check in with: olly status"
+    echo "   When you're happy, let it act with:"
+    echo "   sudo sed -i 's/^dry_run = true/dry_run = false/' /etc/olly/config.toml && sudo systemctl restart olly"
+else
+    echo "🤖 olly is up and watching. Check in with: olly status"
+fi

@@ -9,7 +9,14 @@ Nice=-5
 Restart=always
 RestartSec=1
 RuntimeDirectory=olly
+# olly chmods the socket to 0600 itself; the directory must stay traversable.
+RuntimeDirectoryMode=0755
+# Keep /run/olly/active.json across a crash-restart, so the new olly can undo freezes.
+RuntimeDirectoryPreserve=yes
 StateDirectory=olly
+UMask=0077
+# systemd-oomd should never pick olly itself.
+ManagedOOMPreference=omit
 LimitMEMLOCK=infinity
 
 [Install]

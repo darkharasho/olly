@@ -11,8 +11,8 @@ desktop_uid = 1000
 # Longest pause `olly pause` may ask for, in seconds.
 max_pause_secs = 3600
 
-# Process names olly never freezes, throttles, or kills. A trailing * matches
-# any ending. Names you add with `olly allow` are kept separately, in
+# Process names olly never freezes, throttles, or kills. A name matches the
+# process name or its executable's file name. A trailing * matches any ending. Names you add with `olly allow` are kept separately, in
 # /var/lib/olly/allowlist.toml.
 allowlist = [
     "olly",

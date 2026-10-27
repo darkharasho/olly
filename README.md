@@ -6,8 +6,8 @@ The emergency path is plain local rules: no network, no LLM, no spawning process
 
 ## What it does
 
-- **Watches** PSI memory pressure and available memory, sampling once a minute when things are calm and once a second when they aren't.
-- **Acts in steps** as things get worse: throttle a growing app, freeze it and ask you what to do, and in an emergency close it. `olly pause` suspends throttling and freezing for a while, but emergency kills still happen.
+- **Watches** PSI memory pressure and available memory, sampling once a minute when things are calm and once a second when they aren't. If the kernel's PSI trigger isn't available, it samples every 2 seconds even when calm.
+- **Acts in steps** as things get worse: throttle a growing app, freeze it and ask you what to do, and in an emergency close it. After closing an app, olly waits until it is really gone and memory has had 10 seconds to settle, and it only closes another if memory is still in trouble right now (not just in the 10-second average). When nothing is clearly growing it closes the biggest app as a last resort, at most twice per incident and never a desktop session service. `olly pause` suspends throttling and freezing for a while, but emergency kills still happen, and apps that are already frozen keep their timers.
 - **Notifies you** with a desktop notification whenever it acts.
 - **Keeps an incident log** in `/var/lib/olly/incidents.jsonl`, with what happened, which app was the biggest, and what olly did.
 - **Asks Claude for a hunch** about slow leaks and after incidents (at most 3 a day by default). This runs sandboxed as your desktop user: only the read-only Read, Grep and Glob tools (no shell), no MCP, and your user settings are not loaded. For an incident, olly reads the kernel log itself (up to 200 lines from the incident window) and passes it along as untrusted data. Claude never acts, never edits the never-kill list, and never changes config.
@@ -51,7 +51,7 @@ olly watch                  follow what olly does, live
 
 ## The never-kill list
 
-olly never freezes, throttles, or kills an app that contains one of these process names (a trailing `*` matches any ending):
+olly never freezes, throttles, or kills an app that contains one of these process names (a trailing `*` matches any ending). A name matches the process name or its executable's file name, so names longer than the kernel's 15-character process name work too:
 
 `olly`, `olly-notify`, `systemd`, `systemd-*`, `dbus-broker`, `dbus-broker-launch`, `dbus-daemon`, `kwin_wayland`, `kwin_wayland_wrapper`, `plasmashell`, `ksmserver`, `kded6`, `Xwayland`, `xdg-desktop-portal*`, `pipewire`, `pipewire-pulse`, `wireplumber`, `sddm`, `NetworkManager`, `sshd`, `polkitd`, `gamescope`
 
