@@ -41,7 +41,7 @@ Each mood has a fixed eye colour (not themed). The screen is always dark (`#1417
 | All good | happy upward arcs (^ ^) | green `#3ddc84` | level `calm` and nothing below applies |
 | Watching | tall rounded rects, upright | blue `#4fc3f7` | level `watch` |
 | Worried | rounded rects, lids drooping toward the outside | amber `#ffb74d` | level `warning`, `critical` or `emergency` (the On it! rule already took any case where olly acted) |
-| On it! | rounded rects, lids slanting down toward the middle (determined) | red `#ff5252` | `incident_active` and olly has acted in it, or `last_action_wall_ms` is within the last 60 s. Any action counts, including throttles and dry-run "would" actions (my call: during a dry-run trial you can see olly would have stepped in; the popup's dry-run badge says it didn't really) |
+| On it! | rounded rects, lids slanting down toward the middle (determined) | red `#ff5252` | `incident_active && incident_acted`, or `last_action_wall_ms` is within the last 60 s. Any action counts, including throttles and dry-run "would" actions (my call: during a dry-run trial you can see olly would have stepped in; the popup's dry-run badge says it didn't really) |
 | Needs you | one short eye, one tall eye, pulsing "?" | orange `#ffa726` | at least one app is frozen |
 | Napping | flat lines, small "z" | purple `#9575cd` | olly is paused |
 | Offline | three dim dots | grey `#6b7378` | the daemon can't be reached |
@@ -72,7 +72,7 @@ The approved mockup is in `docs/superpowers/specs/2026-10-27-olly-tray-mockup.ht
 4. **Recent incidents:** the last 3. Each shows:
    - a coloured dot (red for a kill, orange for a freeze, amber for a throttle only),
    - a one-line summary,
-   - a sub-line with the peak level and, if present, Claude's diagnosis cut to one line,
+   - a sub-line with Claude's diagnosis cut to one line if present, otherwise the peak stall (`peak_full`, since the incident record stores no level),
    - a relative time.
 
    Clicking one expands it in place to show the full summary, the list of actions with times, and the full diagnosis.
@@ -96,7 +96,7 @@ Errors from commands (e.g. "already resumed") show as a short inline line under 
   - `swap_used`, `swap_total` (bytes).
   - `some_avg10` (the PSI `some avg10` percentage).
   - `top`: `{name, bytes, rate}` of the biggest app by bytes in the latest sample, or null.
-  - `incident_active` (bool) and `last_action_wall_ms` (wall ms of olly's most recent action of any kind, dry run included, or null). Used for "On it!".
+  - `incident_active` (bool), `incident_acted` (bool: olly acted during the open incident) and `last_action_wall_ms` (wall ms of olly's most recent action of any kind, dry run included, or null). Used for "On it!".
   - `last_incident_id` (or null). Used to refresh the incident list.
   - `frozen_info`: one entry per frozen target, `{id, name, bytes, rate, kill_at_wall_ms}`. Used for the needs-you card and countdown.
     - `rate` is the growth rate at freeze time; the engine stores it on the frozen entry, since a frozen app doesn't grow.
