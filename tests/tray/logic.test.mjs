@@ -6,7 +6,7 @@ const path = new URL("../../plasmoid/package/contents/ui/logic.js", import.meta.
 const src = fs.readFileSync(path, "utf8").replace(/^\.pragma library.*$/m, "");
 const L = new Function(
   src +
-    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, swapWarning, actionLine, hasUpdate, updateCard, updateSeenAt, shouldCheck, checkLine};",
+    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, swapWarning, gameLine, actionLine, hasUpdate, updateCard, updateSeenAt, shouldCheck, checkLine};",
 )();
 
 const C = {
@@ -404,4 +404,12 @@ test("swapWarning", () => {
   assert.equal(L.swapWarning({ swap_warning: false, swap_used: 9e9, swap_total: 16e9 }), "");
   assert.equal(L.swapWarning({ swap_used: 9e9, swap_total: 16e9 }), "");
   assert.equal(L.swapWarning(null), "");
+});
+
+test("gameLine", () => {
+  assert.equal(L.gameLine({ game: "Elden Ring" }), "🎮 Elden Ring is running. I'll pick other apps first.");
+  assert.equal(L.gameLine({ game: null }), "");
+  assert.equal(L.gameLine({ game: "" }), "");
+  assert.equal(L.gameLine({}), "");
+  assert.equal(L.gameLine(null), "");
 });

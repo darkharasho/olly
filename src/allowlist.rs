@@ -129,6 +129,7 @@ mod tests {
             ram: 1,
             names: vec!["bash".into(), "kwin_wayland".into()],
             exe_names: vec![],
+            is_game: false,
         };
         assert!(a.allows_app(&app));
         let mut other = app.clone();
@@ -153,6 +154,7 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned()],
+            is_game: false,
         }
     }
 

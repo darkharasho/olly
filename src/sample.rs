@@ -53,6 +53,36 @@ pub struct AppSample {
     pub names: Vec<String>,
     /// exe basename of every member (comm is cut at 15 chars), for allowlist matching.
     pub exe_names: Vec<String>,
+    /// A game: split from the Steam client by lineage, run by a wine/proton loader,
+    /// or running under gamescope. Game mode picks other apps first.
+    pub is_game: bool,
+}
+
+/// Exe basenames of the wine/proton loaders a Windows game runs under.
+const GAME_LOADERS: [&str; 4] = ["wine64-preloader", "wine-preloader", "wineserver", "proton"];
+
+fn is_steam(p: &Proc) -> bool {
+    p.status.name == "steam" || exe_name(p).as_deref() == Some("steam")
+}
+
+fn is_gamescope(name: &str) -> bool {
+    name.starts_with("gamescope")
+}
+
+/// True if some ancestor of `pid` (not `pid` itself) is gamescope. `lineage` maps every
+/// desktop-user pid to (ppid, comm, exe basename).
+fn under_gamescope(lineage: &HashMap<i32, (i32, String, Option<String>)>, pid: i32) -> bool {
+    let mut cur = lineage.get(&pid).map(|l| l.0);
+    for _ in 0..lineage.len() {
+        let Some(l) = cur.and_then(|c| lineage.get(&c)) else {
+            return false;
+        };
+        if is_gamescope(&l.1) || l.2.as_deref().is_some_and(is_gamescope) {
+            return true;
+        }
+        cur = Some(l.0);
+    }
+    false
 }
 
 pub struct Sampler {
@@ -138,8 +168,12 @@ impl Sampler {
     pub fn apps(&self) -> Vec<AppSample> {
         let prefix = format!("{}/", self.user_service());
         let mut by_cgroup: HashMap<String, Vec<Proc>> = HashMap::new();
+        let mut lineage = HashMap::new();
         for pid in list_pids(&self.root) {
             if let Some(p) = read_proc(&self.root, pid) {
+                if p.uid == self.uid {
+                    lineage.insert(p.pid, (p.status.ppid, p.status.name.clone(), exe_name(&p)));
+                }
                 if p.uid == self.uid && p.cgroup.starts_with(&prefix) {
                     by_cgroup.entry(p.cgroup.clone()).or_default().push(p);
                 }
@@ -155,6 +189,7 @@ impl Sampler {
             }
             // The whole cgroup is a target only if every process in it is the user's.
             let single = groups.len() == 1 && !self.has_foreign(cgroup, &index);
+            let steam = procs.iter().any(is_steam);
             for (root_pid, mut members) in groups {
                 members.sort_by_key(|p| p.pid);
                 let root = index[&root_pid];
@@ -190,6 +225,15 @@ impl Sampler {
                         exe_names.push(n);
                     }
                 }
+                // Split from the Steam client by lineage: its root's parent is in the
+                // same cgroup, so it is a child the client launched, not the client.
+                let split_from_steam = steam
+                    && !single
+                    && !members.iter().any(|p| is_steam(p))
+                    && index.contains_key(&root.status.ppid);
+                let is_game = split_from_steam
+                    || exe_names.iter().any(|n| GAME_LOADERS.contains(&n.as_str()))
+                    || under_gamescope(&lineage, root_pid);
                 out.push(AppSample {
                     key,
                     name: root.status.name.clone(),
@@ -199,6 +243,7 @@ impl Sampler {
                     ram,
                     names: members.iter().map(|p| p.status.name.clone()).collect(),
                     exe_names,
+                    is_game,
                 });
             }
         }
@@ -409,6 +454,47 @@ mod tests {
         assert_eq!(game.exe_names, vec!["wine64-preloader"]);
         let client = apps.iter().find(|a| a.name == "steam").unwrap();
         assert_eq!(client.exe_names, vec!["steam", "reaper"]);
+    }
+
+    #[test]
+    fn steam_game_is_a_game_client_and_firefox_are_not() {
+        let apps = sampler().apps();
+        let game = |n: &str| apps.iter().find(|a| a.name == n).unwrap().is_game;
+        assert!(game("game.exe"));
+        assert!(!game("steam"));
+        assert!(!game("firefox"));
+    }
+
+    #[test]
+    fn app_under_gamescope_is_a_game() {
+        let d = fixture_copy();
+        // Re-parent firefox under a gamescope process outside the user service.
+        let gs = d.path().join("proc/400");
+        fs::create_dir_all(&gs).unwrap();
+        fs::write(
+            gs.join("status"),
+            "Name:\tgamescope-wl\nPPid:\t1\nUid:\t1000\t1000\t1000\t1000\nVmRSS:\t1024 kB\nVmSwap:\t0 kB\n",
+        )
+        .unwrap();
+        fs::write(
+            gs.join("stat"),
+            "400 (gamescope-wl) S 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 1400 1 1 0\n",
+        )
+        .unwrap();
+        fs::write(
+            gs.join("cgroup"),
+            "0::/user.slice/user-1000.slice/session-2.scope\n",
+        )
+        .unwrap();
+        let st = d.path().join("proc/200/status");
+        let text = fs::read_to_string(&st)
+            .unwrap()
+            .replace("PPid:\t1\n", "PPid:\t400\n");
+        fs::write(&st, text).unwrap();
+        let apps = Sampler::new(d.path().to_path_buf(), 1000).apps();
+        let ff = apps.iter().find(|a| a.name == "firefox").unwrap();
+        assert!(ff.is_game);
+        assert!(!apps.iter().find(|a| a.name == "steam").unwrap().is_game);
     }
 
     #[test]

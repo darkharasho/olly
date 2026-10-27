@@ -409,7 +409,15 @@ impl Engine {
                 )
             })
             .collect();
-        cands.sort_by(|x, y| y.1.total_cmp(&x.1).then(y.0.bytes.cmp(&x.0.bytes)));
+        // Game mode: every non-game comes before any game, at every level.
+        let games_last = self.cfg.game_mode;
+        let is_game = |a: &AppSample| games_last && a.is_game;
+        cands.sort_by(|x, y| {
+            is_game(x.0)
+                .cmp(&is_game(y.0))
+                .then(y.1.total_cmp(&x.1))
+                .then(y.0.bytes.cmp(&x.0.bytes))
+        });
         let top_growing = cands.iter().find(|c| c.2).map(|c| c.0);
 
         // 4. Cooldown (throttle is exempt).
@@ -423,8 +431,10 @@ impl Engine {
         match level {
             Level::Warning if !paused => {
                 for &(a, rate, growing, gentle) in &cands {
+                    // Never throttle a game in game mode: it would stutter.
                     if !growing
                         || !gentle
+                        || is_game(a)
                         || a.kind != TargetKind::Cgroup
                         || self.is_throttled(&a.key)
                     {
@@ -471,7 +481,7 @@ impl Engine {
                         .iter()
                         .map(|c| c.0)
                         .filter(|a| !in_session_slice(a))
-                        .max_by_key(|a| a.bytes)
+                        .max_by_key(|a| (!is_game(a), a.bytes))
                         .map(|a| (a, KillReason::LastResort)),
                 };
                 if let Some((a, reason)) = pick {
@@ -690,6 +700,7 @@ mod tests {
             ram: bytes,
             names: vec![name.into()],
             exe_names: vec![],
+            is_game: false,
         }
     }
 
@@ -717,7 +728,10 @@ mod tests {
 
     impl Sim {
         fn new() -> Self {
-            let cfg = Config::default();
+            Self::with_cfg(Config::default())
+        }
+
+        fn with_cfg(cfg: Config) -> Self {
             let hist = History::new(&cfg.growth);
             let allow = Allowlist::load(
                 cfg.allowlist.clone(),
@@ -974,7 +988,11 @@ mod tests {
         let mut sim = Sim::new();
         sim.warm(10, leak_only);
         let out = sim.step(critical(11_000), &leak_only(11_000));
-        assert!(matches!(&out.actions[..], [Action::Freeze { .. }]), "{:?}", out.actions);
+        assert!(
+            matches!(&out.actions[..], [Action::Freeze { .. }]),
+            "{:?}",
+            out.actions
+        );
         assert_eq!(sim.eng.frozen().len(), 1);
 
         allow_leaky(&mut sim);
@@ -994,7 +1012,11 @@ mod tests {
         let mut sim = Sim::new();
         sim.warm(10, leak_only);
         let out = sim.step(warning(11_000), &leak_only(11_000));
-        assert!(matches!(&out.actions[..], [Action::Throttle { .. }]), "{:?}", out.actions);
+        assert!(
+            matches!(&out.actions[..], [Action::Throttle { .. }]),
+            "{:?}",
+            out.actions
+        );
         assert_eq!(sim.eng.throttled().len(), 1);
 
         allow_leaky(&mut sim);
@@ -1706,5 +1728,113 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, Event::IncidentEnd { id: 1, .. })));
+    }
+
+    /// A game in its own cgroup, growing faster than `other`: 2 GiB per 10s from 10 GiB.
+    fn game(t: u64) -> AppSample {
+        let mut g = app(
+            "game.exe",
+            "/game",
+            TargetKind::Cgroup,
+            10 * GIB + t * (GIB / 5) / 1000,
+        );
+        g.is_game = true;
+        g
+    }
+
+    fn throttled_names(out: &StepOutput) -> Vec<String> {
+        out.actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Throttle { target, .. } => Some(target.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn frozen_name(out: &StepOutput) -> Option<String> {
+        out.actions.iter().find_map(|a| match a {
+            Action::Freeze { target } => Some(target.name.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn game_mode_picks_non_game_first_and_never_throttles_game() {
+        let mut sim = Sim::new();
+        let apps = |t: u64| vec![game(t), other(t)];
+        sim.warm(10, apps);
+        let out = sim.step(warning(11_000), &apps(11_000));
+        assert_eq!(throttled_names(&out), vec!["other".to_string()]);
+        let out = sim.step(critical(12_000), &apps(12_000));
+        assert_eq!(frozen_name(&out).as_deref(), Some("other"));
+        assert!(sim.eng.throttled().iter().all(|t| t.name != "game.exe"));
+    }
+
+    #[test]
+    fn game_mode_never_throttles_a_lone_growing_game() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![game(t)]);
+        for s in 11..=40 {
+            let out = sim.step(warning(s * 1000), &[game(s * 1000)]);
+            assert!(out.actions.is_empty(), "step {s}: {:?}", out.actions);
+        }
+        assert!(sim.eng.throttled().is_empty());
+    }
+
+    #[test]
+    fn game_mode_still_freezes_a_growing_game_when_alone() {
+        let mut sim = Sim::new();
+        // A stable non-game can't be frozen (it isn't the problem), so the game is.
+        let apps = |t: u64| vec![game(t), app("idle", "/idle", TargetKind::Cgroup, 4 * GIB)];
+        sim.warm(10, apps);
+        let out = sim.step(critical(11_000), &apps(11_000));
+        assert_eq!(frozen_name(&out).as_deref(), Some("game.exe"));
+    }
+
+    #[test]
+    fn game_mode_last_resort_prefers_non_game() {
+        let mut sim = Sim::new();
+        let apps = |_t: u64| {
+            let mut g = app("game.exe", "/game", procs(), 20 * GIB);
+            g.is_game = true;
+            vec![g, app("mid", "/mid", TargetKind::Cgroup, 6 * GIB)]
+        };
+        sim.warm(10, apps);
+        let out = sim.step(emergency(11_000), &apps(11_000));
+        assert_eq!(
+            kills(&out),
+            vec![("mid".to_string(), KillReason::LastResort)]
+        );
+    }
+
+    #[test]
+    fn game_mode_off_keeps_old_ordering() {
+        let cfg = Config {
+            game_mode: false,
+            ..Config::default()
+        };
+        let mut sim = Sim::with_cfg(cfg.clone());
+        let apps = |t: u64| vec![game(t), other(t)];
+        sim.warm(10, apps);
+        let out = sim.step(warning(11_000), &apps(11_000));
+        let mut names = throttled_names(&out);
+        names.sort();
+        assert_eq!(names, vec!["game.exe".to_string(), "other".to_string()]);
+        let out = sim.step(critical(12_000), &apps(12_000));
+        assert_eq!(frozen_name(&out).as_deref(), Some("game.exe"));
+
+        let mut sim = Sim::with_cfg(cfg);
+        let apps = |_t: u64| {
+            let mut g = app("game.exe", "/game", procs(), 20 * GIB);
+            g.is_game = true;
+            vec![g, app("mid", "/mid", TargetKind::Cgroup, 6 * GIB)]
+        };
+        sim.warm(10, apps);
+        let out = sim.step(emergency(11_000), &apps(11_000));
+        assert_eq!(
+            kills(&out),
+            vec![("game.exe".to_string(), KillReason::LastResort)]
+        );
     }
 }

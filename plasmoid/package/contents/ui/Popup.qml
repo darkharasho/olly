@@ -23,6 +23,7 @@ ColumnLayout {
         : Logic.updateCard(status, app.updateDismissedAt, app.now, Plasmoid.metaData.version)
     readonly property var stats: Logic.statRows(status)
     readonly property string swapText: offline ? "" : Logic.swapWarning(status)
+    readonly property string gameText: offline ? "" : Logic.gameLine(status)
     readonly property var shown: app.incidents.slice(0, showAll ? 20 : 3)
 
     // A card action's error shows on its card while the card is up, else in the footer.
@@ -205,6 +206,16 @@ ColumnLayout {
                 horizontalAlignment: Text.AlignRight
                 text: popup.status && popup.status.top ? Logic.gb(popup.status.top.bytes) : ""
             }
+        }
+
+        // Game mode: a quiet line, the face is unchanged
+        PlasmaComponents3.Label {
+            Layout.fillWidth: true
+            visible: popup.gameText !== ""
+            text: popup.gameText
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            opacity: 0.7
         }
 
         // Swap warning: information only, so a quiet card under the bars

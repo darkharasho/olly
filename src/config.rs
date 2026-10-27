@@ -17,6 +17,8 @@ pub struct Config {
     pub max_pause_secs: u64,
     /// Look for a new olly release now and then (only while things are calm).
     pub update_check: bool,
+    /// While a game runs, pick other apps first and never throttle the game.
+    pub game_mode: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -106,6 +108,7 @@ impl Default for Config {
             claude: ClaudeConfig::default(),
             max_pause_secs: 3600,
             update_check: true,
+            game_mode: true,
         }
     }
 }
@@ -201,6 +204,7 @@ mod tests {
         assert_eq!(c.timing.freeze_giveup_secs, 300);
         assert_eq!(c.max_pause_secs, 3600);
         assert!(c.update_check);
+        assert!(c.game_mode);
         assert!(c.allowlist.iter().any(|s| s == "kwin_wayland"));
         assert!(!c.allowlist.iter().any(|s| s == "steam"));
     }

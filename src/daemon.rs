@@ -197,6 +197,8 @@ struct Daemon {
     incident_open: bool,
     /// The biggest app in the latest sample.
     last_top: Option<TopApp>,
+    /// The running game's display name in the latest sample (game mode only).
+    last_game: Option<String>,
     /// Wall time of the latest action olly took.
     last_action_wall_ms: Option<u64>,
     /// Whether olly has acted during the open incident.
@@ -279,6 +281,13 @@ fn top_app(apps: &[AppSample], hist: &History, now: u64) -> Option<TopApp> {
     })
 }
 
+/// Display name of the running game, the largest one if there are several:
+/// its process name without a trailing ".exe".
+fn running_game(apps: &[AppSample]) -> Option<String> {
+    let a = apps.iter().filter(|a| a.is_game).max_by_key(|a| a.bytes)?;
+    Some(a.name.strip_suffix(".exe").unwrap_or(&a.name).to_string())
+}
+
 /// An intervention (throttle, freeze, kill), not the undoing of one.
 fn is_intervention(a: &Action) -> bool {
     matches!(
@@ -332,6 +341,7 @@ impl Daemon {
             sys.mem.swap_total,
         );
         self.last_top = top_app(&apps, &self.hist, now);
+        self.last_game = running_game(&apps).filter(|_| self.cfg.game_mode);
         let out = self.engine.step(&sys, &apps, &self.hist, &self.allow);
         self.process(out);
         self.recorder.on_sample(&sys, &apps, &self.hist, wall_ms());
@@ -812,6 +822,7 @@ impl Daemon {
             swap_total,
             swap_used: swap_total.saturating_sub(swap_free),
             swap_warning: self.swap_watch.is_on(),
+            game: self.last_game.clone(),
             some_avg10: self.last_sys.map_or(0.0, |s| s.psi.some_avg10),
             top: self.last_top.clone(),
             incident_active: self.engine.incident().is_some(),
@@ -1045,6 +1056,7 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         last_sys: None,
         incident_open: false,
         last_top: None,
+        last_game: None,
         last_action_wall_ms: None,
         incident_acted: false,
         last_incident_id: store_last_id,
@@ -1326,6 +1338,7 @@ mod tests {
             last_sys: None,
             incident_open: false,
             last_top: None,
+            last_game: None,
             last_action_wall_ms: None,
             incident_acted: false,
             last_incident_id: None,
@@ -1483,7 +1496,30 @@ mod tests {
             ram: 10 * GIB + t * (GIB / 10) / 1000,
             names: vec!["leaky".into()],
             exe_names: vec![],
+            is_game: false,
         }
+    }
+
+    #[test]
+    fn running_game_is_the_largest_game_without_exe() {
+        let game = |name: &str, bytes: u64| AppSample {
+            name: name.into(),
+            bytes,
+            is_game: true,
+            ..leaky(0)
+        };
+        assert_eq!(running_game(&[leaky(0)]), None);
+        let apps = [
+            leaky(0),
+            game("small.exe", GIB),
+            game("Big Game.exe", 12 * GIB),
+        ];
+        assert_eq!(running_game(&apps).as_deref(), Some("Big Game"));
+        let dir = tempfile::tempdir().unwrap();
+        let d = test_daemon(dir.path());
+        assert_eq!(d.status().game, None);
+        let json = serde_json::to_value(d.status()).unwrap();
+        assert!(json["game"].is_null());
     }
 
     fn step(d: &mut Daemon, t: u64, full: f32) {

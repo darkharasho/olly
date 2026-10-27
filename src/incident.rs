@@ -374,6 +374,7 @@ mod tests {
             ram: bytes,
             names: vec![format!("app{i}")],
             exe_names: vec![],
+            is_game: false,
         }
     }
 

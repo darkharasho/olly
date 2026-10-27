@@ -51,6 +51,7 @@ Every request gets exactly one response line (except `subscribe`, which then str
   "swap_total": 8589934592,
   "swap_used": 104857600,
   "swap_warning": false,
+  "game": null,
   "some_avg10": 1.5,
   "top": {"name":"firefox","key":{"cgroup":"/user.slice/.../app-firefox.scope","root_pid":null},"bytes":4000000000,"rate":0.0},
   "incident_active": false,
@@ -74,6 +75,7 @@ The fields from `swap_total` on are newer; a reply from an older daemon may lack
 - `swap_total`: bytes of swap in total (0 when there is none).
 - `swap_used`: bytes of swap in use.
 - `swap_warning`: `true` while swap is filling up: at least 50% used and up by 1 GiB or more over the last 15 minutes. It clears when usage drops below 40% or that growth is gone, and is never `true` with no swap. Information only; olly takes no action.
+- `game`: the running game's display name (its process name without a trailing `.exe`), the largest one if several are running, or `null` when none is or `game_mode` is off. A game is one Steam launched (split from the Steam client), one run by a wine/proton loader, or one running under gamescope. While one runs, olly picks other apps first and never throttles the game. Absent from older daemons; treat absent as `null`.
 - `some_avg10`: memory "some" pressure over the last 10 s, in percent.
 - `top`: the biggest app by memory in the latest sample, an `Incident` `top_at_peak` entry (`name`, `key`, `bytes`, and `rate` in bytes/s), or `null` before the first sample.
 - `incident_active`: whether an incident is open.

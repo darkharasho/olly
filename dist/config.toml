@@ -15,6 +15,11 @@ max_pause_secs = 3600
 # while things are calm. olly never installs one until you ask (`olly update`).
 update_check = true
 
+# While a game is running, olly picks other apps first, at every level, and
+# never throttles the game (that makes it stutter). It still freezes or closes
+# the game if the game itself is what's eating memory and nothing else can help.
+game_mode = true
+
 # Process names olly never freezes, throttles, or kills. A name matches the
 # process name or its executable's file name. A trailing * matches any ending. Names you add with `olly allow` are kept separately, in
 # /var/lib/olly/allowlist.toml.

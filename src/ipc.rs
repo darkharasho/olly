@@ -119,6 +119,9 @@ pub struct StatusData {
     /// Swap is over half full and has grown by 1 GiB or more in the last 15 minutes.
     #[serde(default)]
     pub swap_warning: bool,
+    /// The running game's display name (the largest if several), while game mode is on.
+    #[serde(default)]
+    pub game: Option<String>,
 }
 
 /// What the tray shows for one frozen app.

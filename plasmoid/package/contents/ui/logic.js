@@ -261,6 +261,14 @@ function swapWarning(status) {
         + " and climbing. Things may get sluggish. Closing an app you don't need would help.";
 }
 
+// The quiet game-mode line, or "" when no game is running (or the daemon is too old to say).
+function gameLine(status) {
+    var g = (status || {}).game;
+    if (typeof g !== "string" || g === "")
+        return "";
+    return "🎮 " + g + " is running. I'll pick other apps first.";
+}
+
 // One incident action `[wall_ms, {Name: {target, ...}}, dry_run]` as "HH:MM  Name target",
 // with " (would have)" when it was a dry run.
 function actionLine(action) {
