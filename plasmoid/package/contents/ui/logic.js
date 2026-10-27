@@ -174,7 +174,7 @@ function command(verb, id) {
         return OLLY + " update --no-wait";
     if (verb === "check")
         return OLLY + " update --check";
-    if ((verb === "kill" || verb === "unfreeze")
+    if ((verb === "kill" || verb === "unfreeze" || verb === "diagnose")
             && Number.isInteger(id) && id >= 0 && id <= Number.MAX_SAFE_INTEGER)
         return OLLY + " " + verb + " " + id;
     return "";
@@ -250,6 +250,23 @@ function statRows(status) {
                     value: (p < 10 ? p.toFixed(1) : Math.round(p)) + "%" });
     }
     return rows;
+}
+
+// The "Ask Claude why" button for an incident: "hidden" (already diagnosed, or the daemon
+// is too old to take the request), "ask", or "looking" while Claude has that incident.
+function diagnoseButton(status, incident) {
+    if (!incident || (incident.diagnosis && String(incident.diagnosis).trim() !== ""))
+        return "hidden";
+    if (status && status.diagnosing === incident.id)
+        return "looking";
+    return "ask";
+}
+
+// True when a diagnosis just finished (or stopped): the incident list should be re-read.
+function diagnosisDone(prev, cur) {
+    var was = prev ? prev.diagnosing : null;
+    var now = cur ? cur.diagnosing : null;
+    return was !== null && was !== undefined && cur !== null && now !== was;
 }
 
 // The soft swap card's text, or "" when the daemon isn't warning about swap.

@@ -11,6 +11,9 @@ Rectangle {
     required property var incident
     required property double now
     property bool expanded: false
+    property string diagnoseState: "hidden"  // "hidden" | "ask" | "looking"
+    property string diagnoseError: ""
+    signal askClaude(var id)
 
     implicitHeight: content.implicitHeight + 2 * Kirigami.Units.smallSpacing
     color: hover.hovered ? Kirigami.Theme.hoverColor : "transparent"
@@ -83,6 +86,24 @@ Rectangle {
                 textFormat: Text.PlainText
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                 color: Kirigami.Theme.disabledTextColor
+                wrapMode: Text.Wrap
+            }
+
+            PlasmaComponents3.ToolButton {
+                visible: row.expanded && row.diagnoseState !== "hidden"
+                enabled: row.diagnoseState === "ask"
+                text: row.diagnoseState === "looking" ? "Claude is looking\u2026" : "Ask Claude why"
+                icon.name: "dialog-question"
+                onClicked: row.askClaude(row.incident.id)
+            }
+
+            PlasmaComponents3.Label {
+                Layout.fillWidth: true
+                visible: row.expanded && row.diagnoseError !== ""
+                text: row.diagnoseError
+                textFormat: Text.PlainText
+                font.pointSize: Kirigami.Theme.smallFont.pointSize
+                color: Kirigami.Theme.negativeTextColor
                 wrapMode: Text.Wrap
             }
         }

@@ -106,9 +106,18 @@ pub fn all_clear() -> Message {
 }
 
 pub fn hunch(summary: &str) -> Message {
+    hunch_about(None, summary)
+}
+
+/// A hunch that names the app it is about, when that is known.
+pub fn hunch_about(app: Option<&str>, summary: &str) -> Message {
+    let body = match app {
+        Some(a) => clip(&format!("{a}: {summary}"), 200),
+        None => clip(summary, 200),
+    };
     Message {
         title: "olly has a hunch \u{1F50D}".to_string(),
-        body: clip(summary, 200),
+        body,
     }
 }
 

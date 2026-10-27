@@ -6,7 +6,7 @@ const path = new URL("../../plasmoid/package/contents/ui/logic.js", import.meta.
 const src = fs.readFileSync(path, "utf8").replace(/^\.pragma library.*$/m, "");
 const L = new Function(
   src +
-    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, swapWarning, gameLine, leakCards, pruneDismissed, dismissLeak, actionLine, hasUpdate, updateCard, updateSeenAt, shouldCheck, checkLine};",
+    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, swapWarning, diagnoseButton, diagnosisDone, gameLine, leakCards, pruneDismissed, dismissLeak, actionLine, hasUpdate, updateCard, updateSeenAt, shouldCheck, checkLine};",
 )();
 
 const C = {
@@ -194,6 +194,8 @@ test("command is shell-safe", () => {
   assert.equal(L.command("unfreeze", 2), O + " unfreeze 2");
   for (const bad of ["2; rm -rf ~", "2", 2.5, -1, NaN, Infinity, null, undefined, 2 ** 60])
     assert.equal(L.command("kill", bad), "", String(bad));
+  assert.equal(L.command("diagnose", 7), "/usr/local/bin/olly diagnose 7");
+  assert.equal(L.command("diagnose", "7; id"), "");
   assert.equal(L.command("rm", 2), "");
   assert.equal(L.command("kill $(id)", 2), "");
 });
@@ -441,4 +443,25 @@ test("pruneDismissed and dismissLeak", () => {
   assert.deepEqual(next, { firefox: true, slack: true });
   assert.deepEqual(same, { firefox: true });
   assert.deepEqual(L.dismissLeak(undefined, "a"), { a: true });
+});
+
+test("diagnoseButton", () => {
+  assert.equal(L.diagnoseButton(null, { id: 3 }), "ask");
+  assert.equal(L.diagnoseButton({ diagnosing: null }, { id: 3 }), "ask");
+  assert.equal(L.diagnoseButton({ diagnosing: 4 }, { id: 3 }), "ask");
+  assert.equal(L.diagnoseButton({ diagnosing: 3 }, { id: 3 }), "looking");
+  assert.equal(L.diagnoseButton({}, { id: 3, diagnosis: "  " }), "ask");
+  assert.equal(L.diagnoseButton({ diagnosing: 3 }, { id: 3, diagnosis: "a leak" }), "hidden");
+  assert.equal(L.diagnoseButton({}, null), "hidden");
+});
+
+test("diagnosisDone", () => {
+  assert.equal(L.diagnosisDone({ diagnosing: 3 }, { diagnosing: null }), true);
+  assert.equal(L.diagnosisDone({ diagnosing: 3 }, {}), true);
+  assert.equal(L.diagnosisDone({ diagnosing: 3 }, { diagnosing: 4 }), true);
+  assert.equal(L.diagnosisDone({ diagnosing: 3 }, { diagnosing: 3 }), false);
+  assert.equal(L.diagnosisDone({ diagnosing: null }, { diagnosing: null }), false);
+  assert.equal(L.diagnosisDone({}, { diagnosing: 3 }), false);
+  assert.equal(L.diagnosisDone(null, { diagnosing: 3 }), false);
+  assert.equal(L.diagnosisDone({ diagnosing: 3 }, null), false);
 });

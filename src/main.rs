@@ -21,6 +21,7 @@ const USAGE: &str = "\u{1F916} here's what I can do:
   olly allow <name>                never close this process name
   olly allowlist                   show the never-close list
   olly kill <id>                   close a paused app (id from `olly status`)
+  olly diagnose <id>               ask Claude why an incident happened
   olly unfreeze <id>               let a paused app carry on
   olly update [--check]            install a new version, or just look for one
   olly watch                       follow what olly does, live
@@ -137,6 +138,12 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         )),
         "kill" => Ok(Cli::Req(
             Request::FrozenKill {
+                id: need_id(sub, rest)?,
+            },
+            Output::Text,
+        )),
+        "diagnose" => Ok(Cli::Req(
+            Request::Diagnose {
                 id: need_id(sub, rest)?,
             },
             Output::Text,
@@ -330,6 +337,10 @@ fn render(req: &Request, data: serde_json::Value) -> Result<String, String> {
         Request::AllowlistAdd { name } => format!("\u{1F916} okay, olly will never close {name}."),
         Request::FrozenKill { id } => format!("\u{1F916} okay, closing [{id}]."),
         Request::FrozenResume { id } => format!("\u{1F916} okay, letting [{id}] carry on."),
+        Request::Diagnose { .. } => format!(
+            "\u{1F916} {}",
+            serde_json::from_value::<String>(data).map_err(bad)?
+        ),
         Request::Subscribe => String::new(),
         Request::UpdateCheck => render_check(
             serde_json::from_value::<Option<UpdateInfo>>(data)
@@ -641,6 +652,7 @@ mod tests {
         );
         assert_eq!(req("allowlist"), Request::AllowlistList);
         assert_eq!(req("kill 2"), Request::FrozenKill { id: 2 });
+        assert_eq!(req("diagnose 4"), Request::Diagnose { id: 4 });
         assert_eq!(req("unfreeze 2"), Request::FrozenResume { id: 2 });
         assert_eq!(req("incident 7"), Request::Incident { id: 7 });
         assert_eq!(
@@ -714,6 +726,8 @@ mod tests {
             "pause -5",
             "kill",
             "kill x",
+            "diagnose",
+            "diagnose x",
             "kill 1 2",
             "allow",
             "incidents -n 0",

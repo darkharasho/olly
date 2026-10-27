@@ -27,6 +27,9 @@ PlasmoidItem {
     property var dismissedLeaks: ({})    // app name -> true, until it stops being a leak suspect
     property string actionError: ""
     property var actionErrorTarget: null // frozen id of the failed card action, null for the footer
+    property var diagnoseTargets: ({})   // diagnose command -> incident id
+    property double diagnoseErrorId: -1  // incident whose "Ask Claude why" was turned down
+    property string diagnoseError: ""
     property var commandTargets: ({})    // action command -> frozen id (or null), set when connecting
     // Back off while offline so a stalled daemon doesn't collect abandoned connections.
     property int pollInterval: 2000
@@ -68,6 +71,15 @@ PlasmoidItem {
         connectOnce(cmd);
     }
 
+    // "Ask Claude why" for one incident. A turned-down request shows inline on its row.
+    function askClaude(id) {
+        var cmd = Logic.command("diagnose", id);
+        if (cmd === "")
+            return;
+        diagnoseTargets[cmd] = id;
+        connectOnce(cmd);
+    }
+
     // Asks olly to look for a release; a found one shows up in status as the update card.
     function checkForUpdate() {
         if (connectOnce(checkCmd))
@@ -82,7 +94,10 @@ PlasmoidItem {
             pollSoon();
         } else if (source === statusCmd) {
             now = Date.now();
+            var prev = status;
             status = Logic.parseStatus(code, stdout);
+            if (Logic.diagnosisDone(prev, status))
+                fetchIncidents(status.last_incident_id);
             dismissedLeaks = Logic.pruneDismissed(status, dismissedLeaks);
             pollInterval = status ? 2000 : 5000;
             if (status && status.last_incident_id !== seenIncidentId)
@@ -97,6 +112,18 @@ PlasmoidItem {
                 incidents = list;
                 seenIncidentId = fetchingIncidentId;
             }
+        } else if (diagnoseTargets.hasOwnProperty(source)) {
+            var asked = diagnoseTargets[source];
+            delete diagnoseTargets[source];
+            if (code === 0) {
+                diagnoseError = "";
+                diagnoseTimer.stop();
+            } else {
+                diagnoseErrorId = asked;
+                diagnoseError = Logic.stripBot(stderr || "") || "Hmm, that didn't work.";
+                diagnoseTimer.restart();
+            }
+            pollSoon();
         } else {
             var target = commandTargets.hasOwnProperty(source) ? commandTargets[source] : null;
             delete commandTargets[source];
@@ -145,6 +172,12 @@ PlasmoidItem {
         repeat: true
         running: root.mood === "needs" || root.mood === "onit"
         onTriggered: root.now = Date.now()
+    }
+
+    Timer {
+        id: diagnoseTimer
+        interval: 6000
+        onTriggered: root.diagnoseError = ""
     }
 
     Timer {

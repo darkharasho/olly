@@ -307,6 +307,9 @@ ColumnLayout {
                     Layout.fillWidth: true
                     incident: modelData
                     now: popup.app.now
+                    diagnoseState: Logic.diagnoseButton(popup.status, modelData)
+                    diagnoseError: popup.app.diagnoseErrorId === modelData.id ? popup.app.diagnoseError : ""
+                    onAskClaude: id => popup.app.askClaude(id)
                 }
             }
         }

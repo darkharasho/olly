@@ -63,6 +63,10 @@ pub enum Request {
     FrozenResume {
         id: u64,
     },
+    /// Ask Claude why an incident happened (again, if it already has a diagnosis).
+    Diagnose {
+        id: u64,
+    },
     /// Look for a new release now; answered when the check finishes.
     UpdateCheck,
     /// Download and install the known new release.
@@ -125,6 +129,9 @@ pub struct StatusData {
     /// Apps that have been slowly growing, largest first, at most 3.
     #[serde(default)]
     pub leaks: Vec<LeakInfo>,
+    /// The incident Claude is looking at or has queued, if any. One asked for by hand wins.
+    #[serde(default)]
+    pub diagnosing: Option<u64>,
 }
 
 /// One slow-leak suspect for the tray.
@@ -617,6 +624,7 @@ mod tests {
                 r#"{"cmd":"frozen_resume","id":2}"#,
                 Request::FrozenResume { id: 2 },
             ),
+            (r#"{"cmd":"diagnose","id":3}"#, Request::Diagnose { id: 3 }),
             (r#"{"cmd":"update_check"}"#, Request::UpdateCheck),
             (r#"{"cmd":"update"}"#, Request::Update),
             (r#"{"cmd":"update_finished"}"#, Request::UpdateFinished),

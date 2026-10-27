@@ -120,6 +120,16 @@ impl ClaudeRunner {
         self.cfg.recovered_avail
     }
 
+    /// The daily cap, for telling the user why a request was turned down.
+    pub fn max_per_day(&self) -> u32 {
+        self.cfg.max_per_day
+    }
+
+    /// Whether today's budget is used up. Unlike `allowed`, this spends nothing.
+    pub fn limit_hit(&self, now_wall_ms: u64) -> bool {
+        self.calls_today.0 == now_wall_ms / DAY_MS && self.calls_today.1 >= self.cfg.max_per_day
+    }
+
     /// Enabled and under `max_per_day`. A `true` answer uses up one call for today.
     pub fn allowed(&mut self, now_wall_ms: u64) -> bool {
         let day = now_wall_ms / DAY_MS;

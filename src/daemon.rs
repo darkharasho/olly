@@ -15,7 +15,7 @@ use crate::supervise::Layout;
 use crate::update::{self, Curl, Fetch, Staged, UpdateError, UpdateState};
 use crate::updater::{self as upd, Done, Updater};
 use crate::voice;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -210,6 +210,10 @@ struct Daemon {
     claude: Option<ClaudeRunner>,
     claude_queue: VecDeque<Job>,
     claude_running: bool,
+    /// The incident the running Claude job is diagnosing, if it is a diagnosis.
+    claude_running_diag: Option<u64>,
+    /// Incidents whose diagnosis was asked for by hand; they get a notice when done.
+    diagnose_asked: HashSet<u64>,
     claude_tx: mpsc::Sender<(Job, Result<String, String>)>,
     claude_rx: mpsc::Receiver<(Job, Result<String, String>)>,
     /// cgroup -> monotonic ms when it was last handed to Claude.
@@ -433,6 +437,7 @@ impl Daemon {
     fn pump_claude(&mut self) {
         while let Ok((job, result)) = self.claude_rx.try_recv() {
             self.claude_running = false;
+            self.claude_running_diag = None;
             self.on_claude_result(job, result);
         }
         if self.claude_running || self.claude_queue.is_empty() {
@@ -458,6 +463,10 @@ impl Daemon {
         }
         if let Some(job) = self.claude_queue.pop_front() {
             self.claude_running = true;
+            self.claude_running_diag = match &job {
+                Job::Diagnose(inc) => Some(inc.id),
+                _ => None,
+            };
             runner.spawn(job, self.claude_tx.clone());
         }
     }
@@ -471,11 +480,16 @@ impl Daemon {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("olly: claude could not look at {what}: {e}");
+                if let Job::Diagnose(inc) = &job {
+                    self.diagnose_asked.remove(&inc.id);
+                }
                 return;
             }
         };
         eprintln!("olly: claude looked at {what}");
+        let mut asked = false;
         if let Job::Diagnose(inc) = &job {
+            asked = self.diagnose_asked.remove(&inc.id);
             if let Err(e) = self.store.append_diagnosis(inc.id, &text) {
                 eprintln!(
                     "olly: cannot save the diagnosis for incident {}: {e}",
@@ -483,11 +497,63 @@ impl Daemon {
                 );
             }
         }
+        // Every answer gets a notice, as before; one asked for by hand also names the app.
+        let summary = first_paragraph(&text);
+        let app = match (&job, asked) {
+            (Job::Diagnose(inc), true) => inc.top_at_peak.first().map(|t| t.name.as_str()),
+            _ => None,
+        };
         let ev = Event::Notice {
-            message: voice::hunch(&first_paragraph(&text)),
+            message: voice::hunch_about(app, &summary),
             frozen_id: None,
         };
         self.subs.broadcast(&ipc::event_line(&ev, wall_ms()));
+    }
+
+    /// The Diagnose job for `id`, queued or running.
+    fn diagnose_pending(&self, id: u64) -> bool {
+        self.claude_running_diag == Some(id)
+            || self
+                .claude_queue
+                .iter()
+                .any(|j| matches!(j, Job::Diagnose(i) if i.id == id))
+    }
+
+    /// `Request::Diagnose`: queue a (re-)diagnosis; the usual rules decide when it runs.
+    fn ask_diagnose(&mut self, id: u64) -> Result<String, String> {
+        let Some(inc) = self.store.get(id) else {
+            return Err(format!("no incident with id {id}"));
+        };
+        let Some(runner) = self.claude.as_ref() else {
+            return Err("Claude is turned off in my config.".to_string());
+        };
+        if self.diagnose_pending(id) {
+            return Ok("Already on it.".to_string());
+        }
+        if runner.limit_hit(wall_ms()) {
+            return Err(format!(
+                "I've asked Claude {} times today already. I'll be able to again tomorrow.",
+                runner.max_per_day()
+            ));
+        }
+        enqueue(&mut self.claude_queue, Job::Diagnose(inc));
+        self.diagnose_asked.insert(id);
+        let (queue, running) = (&self.claude_queue, self.claude_running_diag);
+        self.diagnose_asked.retain(|&a| {
+            running == Some(a) || queue.iter().any(|j| matches!(j, Job::Diagnose(i) if i.id == a))
+        });
+        Ok("I'll ask Claude once things are calm.".to_string())
+    }
+
+    /// The incident being diagnosed or queued; one asked for by hand comes first.
+    fn diagnosing(&self) -> Option<u64> {
+        let mine = |id: &u64| self.diagnose_asked.contains(id);
+        let queued = self.claude_queue.iter().filter_map(|j| match j {
+            Job::Diagnose(i) => Some(i.id),
+            _ => None,
+        });
+        let all: Vec<u64> = self.claude_running_diag.into_iter().chain(queued).collect();
+        all.iter().copied().find(mine).or_else(|| all.first().copied())
     }
 
     fn may_update(&self) -> Result<(), String> {
@@ -833,6 +899,10 @@ impl Daemon {
                     .map_err(|e| format!("could not save the allowlist: {e}")),
             ),
             Request::AllowlistList => ok_line(&self.allow.list()),
+            Request::Diagnose { id } => match self.ask_diagnose(id) {
+                Ok(msg) => ok_line(&msg),
+                Err(e) => err_line(&e),
+            },
             Request::FrozenKill { id } => done(self.command(Command::KillFrozen(id))),
             Request::FrozenResume { id } => done(self.command(Command::ResumeFrozen(id))),
             // `handle` parks these until the check finishes; they never reach here.
@@ -877,6 +947,7 @@ impl Daemon {
             swap_warning: self.swap_watch.is_on(),
             game: self.last_game.clone(),
             leaks: self.leaks.clone(),
+            diagnosing: self.diagnosing(),
             some_avg10: self.last_sys.map_or(0.0, |s| s.psi.some_avg10),
             top: self.last_top.clone(),
             incident_active: self.engine.incident().is_some(),
@@ -1118,6 +1189,8 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         claude,
         claude_queue: VecDeque::new(),
         claude_running: false,
+        claude_running_diag: None,
+        diagnose_asked: HashSet::new(),
         claude_tx,
         claude_rx,
         leak_seen: HashMap::new(),
@@ -1224,6 +1297,7 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClaudeConfig;
     use crate::engine::Target;
     use crate::sample::{AppKey, TargetKind};
     use crate::supervise::{LastUpdate, Layout};
@@ -1402,6 +1476,8 @@ mod tests {
             claude: None,
             claude_queue: VecDeque::new(),
             claude_running: false,
+            claude_running_diag: None,
+            diagnose_asked: HashSet::new(),
             claude_tx,
             claude_rx,
             leak_seen: HashMap::new(),
@@ -1809,6 +1885,81 @@ mod tests {
         pump_until(&mut d, |d| !d.upd.checking);
         assert_eq!(d.upd.state, UpdateState::Idle);
         assert_eq!(d.upd.update, Some(offered()));
+    }
+
+    fn sample_incident(id: u64) -> crate::incident::Incident {
+        crate::incident::Incident {
+            id,
+            start_ms_wall: 0,
+            end_ms_wall: 1,
+            peak_full: 0.0,
+            min_avail: 0,
+            top_at_peak: Vec::new(),
+            actions: Vec::new(),
+            summary: String::new(),
+            diagnosis: None,
+        }
+    }
+
+    fn ask(d: &mut Daemon, id: u64) -> serde_json::Value {
+        let (tx, rx) = mpsc::channel();
+        d.handle(ToDaemon::Req(Request::Diagnose { id }, tx));
+        serde_json::from_str(&rx.try_recv().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn diagnose_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.store.append(&sample_incident(1)).unwrap();
+        assert_eq!(ask(&mut d, 1)["error"], "Claude is turned off in my config.");
+
+        let cfg = ClaudeConfig {
+            max_per_day: 2,
+            ..d.cfg.claude.clone()
+        };
+        d.claude = Some(ClaudeRunner::with_user(cfg, 1000, false, "u", "/tmp"));
+        assert_eq!(ask(&mut d, 99)["error"], "no incident with id 99");
+        assert_eq!(d.diagnosing(), None);
+
+        assert_eq!(ask(&mut d, 1)["data"], "I'll ask Claude once things are calm.");
+        assert_eq!(d.diagnosing(), Some(1));
+        assert_eq!(ask(&mut d, 1)["data"], "Already on it.");
+        assert_eq!(d.claude_queue.len(), 1);
+        // A running job counts as pending too.
+        d.claude_queue.clear();
+        d.claude_running_diag = Some(1);
+        assert_eq!(ask(&mut d, 1)["data"], "Already on it.");
+        assert_eq!(d.diagnosing(), Some(1));
+        d.claude_running_diag = None;
+
+        // A re-ask of a diagnosed incident is allowed; the by-hand id wins in status.
+        d.store.append_diagnosis(1, "text").unwrap();
+        d.store.append(&sample_incident(2)).unwrap();
+        d.claude_queue.clear();
+        d.diagnose_asked.clear();
+        enqueue(&mut d.claude_queue, Job::Diagnose(sample_incident(2)));
+        assert_eq!(ask(&mut d, 1)["data"], "I'll ask Claude once things are calm.");
+        assert_eq!(d.diagnosing(), Some(1));
+    }
+
+    #[test]
+    fn diagnose_daily_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.store.append(&sample_incident(1)).unwrap();
+        let cfg = ClaudeConfig {
+            max_per_day: 1,
+            ..d.cfg.claude.clone()
+        };
+        let mut r = ClaudeRunner::with_user(cfg, 1000, false, "u", "/tmp");
+        assert!(r.allowed(wall_ms()));
+        d.claude = Some(r);
+        assert_eq!(
+            ask(&mut d, 1)["error"],
+            "I've asked Claude 1 times today already. I'll be able to again tomorrow."
+        );
+        assert!(d.claude_queue.is_empty());
     }
 
     #[test]
