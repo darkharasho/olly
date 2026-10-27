@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -66,7 +66,124 @@ fn map_event(ev: &Event) -> Option<Note> {
             },
             frozen_id: *frozen_id,
         }),
+        // An update is announced by the widget and the CLI; the desktop stays quiet.
+        Event::Updated { .. } => None,
         _ => None,
+    }
+}
+
+/// Where the shared (system) copies and the per-user copies live.
+struct UserPaths {
+    share: PathBuf,
+    plasmoid_installed: PathBuf,
+    user_unit: PathBuf,
+}
+
+impl UserPaths {
+    fn from_home(home: &Path) -> Self {
+        Self {
+            share: PathBuf::from("/usr/local/share/olly"),
+            plasmoid_installed: home.join(".local/share/plasma/plasmoids/org.olly.tray"),
+            user_unit: home.join(".config/systemd/user/olly-notify.service"),
+        }
+    }
+}
+
+/// Runs an external program; true when it exited successfully.
+trait Run {
+    fn run(&mut self, prog: &str, args: &[&str]) -> bool;
+}
+
+struct RealRun;
+
+impl Run for RealRun {
+    fn run(&mut self, prog: &str, args: &[&str]) -> bool {
+        std::process::Command::new(prog)
+            .args(args)
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct SyncOutcome {
+    widget_upgraded: bool,
+    unit_updated: bool,
+}
+
+/// `KPlugin.Version` from a plasmoid directory's `metadata.json`.
+fn widget_version(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("metadata.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(v.get("KPlugin")?.get("Version")?.as_str()?.to_string())
+}
+
+/// Brings the user's widget and user unit up to date with the shared copies.
+/// Each failure is logged once and skipped; nothing here retries.
+fn sync_user_side(p: &UserPaths, run: &mut dyn Run) -> SyncOutcome {
+    let mut out = SyncOutcome::default();
+
+    let shared_widget = p.share.join("plasmoid");
+    if p.plasmoid_installed.exists() {
+        match (
+            widget_version(&shared_widget),
+            widget_version(&p.plasmoid_installed),
+        ) {
+            (Some(new), Some(old)) if new != old => {
+                let dir = shared_widget.to_string_lossy().into_owned();
+                if run.run(
+                    "kpackagetool6",
+                    &["--type", "Plasma/Applet", "--upgrade", &dir],
+                ) {
+                    out.widget_upgraded = true;
+                } else {
+                    eprintln!("olly-notify: kpackagetool6 could not upgrade the widget");
+                }
+            }
+            (Some(_), Some(_)) => {}
+            _ => eprintln!("olly-notify: cannot compare widget versions; leaving the widget"),
+        }
+    }
+
+    let shared_unit = p.share.join("olly-notify.service");
+    if let Ok(new) = std::fs::read(&shared_unit) {
+        if std::fs::read(&p.user_unit).ok().as_deref() != Some(new.as_slice()) {
+            let copied = p
+                .user_unit
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&p.user_unit, &new));
+            match copied {
+                Ok(()) => {
+                    out.unit_updated = true;
+                    if !run.run("systemctl", &["--user", "daemon-reload"]) {
+                        eprintln!("olly-notify: systemctl --user daemon-reload failed");
+                    }
+                }
+                Err(e) => eprintln!("olly-notify: cannot update the user unit: {e}"),
+            }
+        }
+    }
+    out
+}
+
+/// True only for a successful update to a version other than ours.
+fn should_restart(ev: &Event, own_version: &str) -> bool {
+    matches!(ev, Event::Updated { ok: true, to, .. } if to != own_version)
+}
+
+/// Runs the sync with the real home and runner.
+fn sync_now() {
+    let Some(home) = std::env::var_os("HOME") else {
+        eprintln!("olly-notify: HOME is not set; skipping the user-side update");
+        return;
+    };
+    let o = sync_user_side(&UserPaths::from_home(Path::new(&home)), &mut RealRun);
+    if o.widget_upgraded || o.unit_updated {
+        eprintln!(
+            "olly-notify: updated the user side (widget: {}, unit: {})",
+            o.widget_upgraded, o.unit_updated
+        );
     }
 }
 
@@ -174,6 +291,13 @@ fn run_once(shown: &Mutex<Shown>) -> std::io::Result<()> {
         let line = line?;
         match serde_json::from_str::<EventLine>(&line) {
             Ok(EventLine { event }) => {
+                if matches!(event, Event::Updated { ok: true, .. }) {
+                    sync_now();
+                    if should_restart(&event, env!("CARGO_PKG_VERSION")) {
+                        eprintln!("olly-notify: olly updated; restarting on the new binary");
+                        std::process::exit(0);
+                    }
+                }
                 if let Some(note) = map_event(&event) {
                     show(&note, shown);
                 }
@@ -185,6 +309,7 @@ fn run_once(shown: &Mutex<Shown>) -> std::io::Result<()> {
 }
 
 fn main() {
+    sync_now();
     let shown = Mutex::new(Shown::default());
     let mut quiet = false;
     loop {
@@ -308,5 +433,130 @@ mod tests {
         let line = olly::ipc::event_line(&ev, 5);
         let parsed: EventLine = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed.event, ev);
+    }
+
+    // --- user-side sync ---
+
+    #[derive(Default)]
+    struct Rec(Vec<String>);
+    impl Run for Rec {
+        fn run(&mut self, prog: &str, args: &[&str]) -> bool {
+            self.0.push(format!("{prog} {}", args.join(" ")));
+            true
+        }
+    }
+
+    fn meta(dir: &std::path::Path, v: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("metadata.json"),
+            format!("{{\"KPlugin\":{{\"Version\":\"{v}\"}}}}"),
+        )
+        .unwrap();
+    }
+
+    fn paths(t: &std::path::Path) -> UserPaths {
+        let p = UserPaths::from_home(t.join("home").as_path());
+        UserPaths {
+            share: t.join("share"),
+            ..p
+        }
+    }
+
+    #[test]
+    fn user_paths_layout() {
+        let p = UserPaths::from_home(std::path::Path::new("/h"));
+        assert_eq!(p.share, PathBuf::from("/usr/local/share/olly"));
+        assert_eq!(
+            p.plasmoid_installed,
+            PathBuf::from("/h/.local/share/plasma/plasmoids/org.olly.tray")
+        );
+        assert_eq!(
+            p.user_unit,
+            PathBuf::from("/h/.config/systemd/user/olly-notify.service")
+        );
+    }
+
+    #[test]
+    fn widget_upgraded_when_versions_differ() {
+        let t = tempfile::tempdir().unwrap();
+        let p = paths(t.path());
+        meta(&p.share.join("plasmoid"), "2");
+        meta(&p.plasmoid_installed, "1");
+        let mut r = Rec::default();
+        let o = sync_user_side(&p, &mut r);
+        assert!(o.widget_upgraded && !o.unit_updated);
+        assert_eq!(r.0.len(), 1);
+        assert!(r.0[0].starts_with("kpackagetool6 --type Plasma/Applet --upgrade "));
+        assert!(r.0[0].ends_with("share/plasmoid"));
+    }
+
+    #[test]
+    fn widget_untouched_when_equal_or_not_installed() {
+        let t = tempfile::tempdir().unwrap();
+        let p = paths(t.path());
+        meta(&p.share.join("plasmoid"), "2");
+        let mut r = Rec::default();
+        assert!(!sync_user_side(&p, &mut r).widget_upgraded);
+        meta(&p.plasmoid_installed, "2");
+        assert!(!sync_user_side(&p, &mut r).widget_upgraded);
+        assert!(r.0.is_empty());
+    }
+
+    #[test]
+    fn widget_failure_is_not_marked_upgraded() {
+        struct Fail;
+        impl Run for Fail {
+            fn run(&mut self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+        }
+        let t = tempfile::tempdir().unwrap();
+        let p = paths(t.path());
+        meta(&p.share.join("plasmoid"), "2");
+        meta(&p.plasmoid_installed, "1");
+        assert!(!sync_user_side(&p, &mut Fail).widget_upgraded);
+    }
+
+    #[test]
+    fn unit_copied_and_reloaded_when_different() {
+        let t = tempfile::tempdir().unwrap();
+        let p = paths(t.path());
+        std::fs::create_dir_all(&p.share).unwrap();
+        std::fs::write(p.share.join("olly-notify.service"), "new").unwrap();
+        let mut r = Rec::default();
+        let o = sync_user_side(&p, &mut r);
+        assert!(o.unit_updated);
+        assert_eq!(std::fs::read_to_string(&p.user_unit).unwrap(), "new");
+        assert_eq!(r.0, vec!["systemctl --user daemon-reload".to_string()]);
+        let mut r = Rec::default();
+        assert!(!sync_user_side(&p, &mut r).unit_updated);
+        assert!(r.0.is_empty());
+    }
+
+    fn updated(ok: bool, to: &str) -> Event {
+        Event::Updated {
+            from: "0.1.0".into(),
+            to: to.into(),
+            ok,
+            message: String::new(),
+            widget_changed: false,
+        }
+    }
+
+    #[test]
+    fn restart_only_for_ok_and_different() {
+        assert!(should_restart(&updated(true, "0.2.0"), "0.1.0"));
+        assert!(!should_restart(&updated(true, "0.2.0"), "0.2.0"));
+        assert!(!should_restart(&updated(false, "0.2.0"), "0.1.0"));
+        assert!(!should_restart(
+            &Event::IncidentStart { id: 1, t_ms: 0 },
+            "0.1.0"
+        ));
+    }
+
+    #[test]
+    fn updated_shows_no_notification() {
+        assert_eq!(map_event(&updated(true, "0.2.0")), None);
     }
 }
