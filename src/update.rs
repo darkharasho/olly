@@ -36,6 +36,14 @@ pub struct UpdateInfo {
     pub url: String,
 }
 
+/// A failure before the hand-off to the supervisor, for `status`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UpdateError {
+    pub at_wall_ms: u64,
+    /// Short and in olly's voice; the details go to the journal.
+    pub message: String,
+}
+
 /// Where an update stands, for `status`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

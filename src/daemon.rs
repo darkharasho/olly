@@ -12,7 +12,7 @@ use crate::procfs::parse_status;
 use crate::psi::{self, PsiTrigger};
 use crate::sample::{AppSample, Sampler, SystemSample};
 use crate::supervise::Layout;
-use crate::update::{self, Curl, Fetch, Staged, UpdateState};
+use crate::update::{self, Curl, Fetch, Staged, UpdateError, UpdateState};
 use crate::updater::{self as upd, Done, Updater};
 use crate::voice;
 use std::collections::{HashMap, VecDeque};
@@ -34,6 +34,8 @@ const PSI_STORM: u32 = 20;
 const CLAUDE_QUEUE: usize = 4;
 /// A leaking cgroup is handed to Claude at most once per day.
 const LEAK_COOLDOWN_MS: u64 = 24 * 60 * 60 * 1000;
+/// What `status` says when the supervisor couldn't be started.
+const LAUNCH_FAILED: &str = "I couldn't start the update";
 
 struct Paths {
     run_dir: PathBuf,
@@ -472,6 +474,7 @@ impl Daemon {
                         if self.upd.state == UpdateState::Installing {
                             self.upd.state = UpdateState::Idle;
                         }
+                        self.update_failed(LAUNCH_FAILED);
                         self.rlog
                             .log("update_launch", self.now(), &format!("update: {e}"));
                     }
@@ -519,6 +522,7 @@ impl Daemon {
             Ok(s) => s,
             Err(e) => {
                 self.upd.state = UpdateState::Idle;
+                self.update_failed("I couldn't download the update");
                 self.rlog
                     .log("update_stage", now, &format!("update download failed: {e}"));
                 return;
@@ -527,6 +531,7 @@ impl Daemon {
         // Things may have changed during the download.
         if let Err(e) = self.may_update() {
             self.upd.state = UpdateState::Idle;
+            self.update_failed(&e);
             eprintln!(
                 "olly: not installing {} after all: {e}",
                 staged.manifest.version
@@ -540,6 +545,7 @@ impl Daemon {
         );
         if let Err(e) = self.upd.spawn_launch(&staged, wall_ms(), now) {
             self.upd.state = UpdateState::Idle;
+            self.update_failed(LAUNCH_FAILED);
             self.rlog.log("update_launch", now, &format!("update: {e}"));
         }
     }
@@ -570,7 +576,17 @@ impl Daemon {
         }
         self.may_update()?;
         eprintln!("olly: event=update_download version={}", u.version);
-        self.upd.spawn_stage()
+        self.upd.spawn_stage()?;
+        self.upd.error = None;
+        Ok(())
+    }
+
+    /// Records why an update stopped before the hand-off, for `status`.
+    fn update_failed(&mut self, message: &str) {
+        self.upd.error = Some(UpdateError {
+            at_wall_ms: wall_ms(),
+            message: message.to_string(),
+        });
     }
 
     /// Reads the supervisor's result (on start and on `update_finished`); a fresh one is
@@ -804,6 +820,7 @@ impl Daemon {
             update_state: self.upd.state,
             last_update: self.upd.last_update.clone(),
             widget_version: self.upd.widget_version.clone(),
+            update_error: self.upd.error.clone(),
         }
     }
 }
@@ -1575,6 +1592,50 @@ mod tests {
         assert!(!dir.path().join("update/olly-supervisor").exists());
         // Nothing staged is deleted.
         assert!(root.join("olly").exists());
+    }
+
+    fn update_error(d: &Daemon) -> Option<String> {
+        d.status().update_error.map(|e| e.message)
+    }
+
+    #[test]
+    fn failures_before_the_hand_off_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.upd.update = Some(offered());
+        assert_eq!(update_error(&d), None);
+
+        // The download fails (the fixture never downloads).
+        let before = wall_ms();
+        assert_eq!(d.respond(Request::Update), ok_line(&"started"));
+        pump_until(&mut d, |d| d.upd.state == UpdateState::Idle);
+        let e = d.status().update_error.expect("an error");
+        assert_eq!(e.message, "I couldn't download the update");
+        assert!(e.at_wall_ms >= before);
+
+        // A new attempt clears it; the recheck after staging fails.
+        assert_eq!(d.respond(Request::Update), ok_line(&"started"));
+        assert_eq!(update_error(&d), None);
+        d.incident_open = true;
+        d.on_staged(Ok(staged(dir.path())));
+        assert_eq!(
+            update_error(&d).as_deref(),
+            Some("I'll update once things are calm")
+        );
+        d.incident_open = false;
+
+        // The launch fails: the supervisor copy can't be written.
+        fs::create_dir_all(dir.path().join("update/olly-supervisor/blocker")).unwrap();
+        pump_until(&mut d, |d| d.upd.state == UpdateState::Idle);
+        assert_eq!(d.respond(Request::Update), ok_line(&"started"));
+        d.on_staged(Ok(staged(dir.path())));
+        assert_eq!(d.upd.state, UpdateState::Installing);
+        pump_until(&mut d, |d| !d.upd.launching);
+        assert_eq!(d.upd.state, UpdateState::Idle);
+        assert_eq!(
+            update_error(&d).as_deref(),
+            Some("I couldn't start the update")
+        );
     }
 
     #[test]

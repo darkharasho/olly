@@ -2,7 +2,7 @@ use olly::engine::{Event, Target};
 use olly::incident::Incident;
 use olly::ipc::{Request, StatusData};
 use olly::supervise::LastUpdate;
-use olly::update::UpdateInfo;
+use olly::update::{UpdateError, UpdateInfo};
 use olly::voice::fmt_bytes;
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
@@ -362,6 +362,12 @@ fn is_new_result(last: Option<&LastUpdate>, baseline: u64) -> bool {
     last.is_some_and(|l| l.at_wall_ms > baseline)
 }
 
+/// Did the update we started stop before the hand-off? `asked_at` is the wall time just
+/// before asking; olly clears older errors when an update starts.
+fn is_new_error(err: Option<&UpdateError>, asked_at: u64) -> bool {
+    err.is_some_and(|e| e.at_wall_ms >= asked_at)
+}
+
 fn unreachable(socket: &str) -> ! {
     eprintln!("\u{1F916} olly isn't running (couldn't reach {socket}).");
     std::process::exit(1)
@@ -541,6 +547,9 @@ fn update_cmd(mode: UpdateMode) -> ! {
         unreachable(&socket)
     };
     let baseline = before.last_update.as_ref().map_or(0, |l| l.at_wall_ms);
+    let asked_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     let v = match ask(&socket, &Request::Update, Duration::from_secs(10)) {
         Ok(v) => v,
         Err(AskErr::Unreachable) => unreachable(&socket),
@@ -564,6 +573,9 @@ fn update_cmd(mode: UpdateMode) -> ! {
             let l = st.last_update.expect("checked above");
             println!("\u{1F916} {}", l.message);
             std::process::exit(if l.ok { 0 } else { 1 });
+        }
+        if is_new_error(st.update_error.as_ref(), asked_at) {
+            fail(&st.update_error.expect("checked above").message);
         }
     }
     fail("I lost track of the update; check `olly status`.")
@@ -784,6 +796,18 @@ mod tests {
         assert!(!is_new_result(Some(&l(5)), 5));
         assert!(is_new_result(Some(&l(6)), 5));
         assert!(is_new_result(Some(&l(1)), 0));
+    }
+
+    #[test]
+    fn new_error_is_at_or_after_the_ask() {
+        let e = |at| UpdateError {
+            at_wall_ms: at,
+            message: "I couldn't download the update".into(),
+        };
+        assert!(!is_new_error(None, 5));
+        assert!(!is_new_error(Some(&e(4)), 5));
+        assert!(is_new_error(Some(&e(5)), 5));
+        assert!(is_new_error(Some(&e(6)), 5));
     }
 
     #[test]

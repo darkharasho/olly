@@ -32,7 +32,7 @@ Every request gets exactly one response line (except `subscribe`, which then str
 | `{"cmd":"frozen_kill","id":2}` | kills a currently frozen target (`id` is `Target.id`) |
 | `{"cmd":"frozen_resume","id":2}` | resumes a currently frozen target |
 | `{"cmd":"update_check"}` | looks for a new olly release now and answers when the check is done (the connection waits up to 75 s for this request; others time out after 5 s). `data` is an `UpdateInfo` (below), or `null` when olly is up to date. A check that fails (no network, bad signature) is an error. Asking while a check runs joins that check. It runs even with `update_check = false` or while paused, but not while the level isn't `calm` or an incident is open: then the error is `I'll look once things are calm` |
-| `{"cmd":"update"}` | starts downloading and installing the known new release; `data` is `"started"`. Errors: `there's no update to install right now` (run `update_check` first, or wait for the periodic check), `I'm already updating` (`update_state` isn't `idle`), `I'll update once things are calm` (level isn't `calm`, an incident is open, or something is frozen or throttled). The rules are checked again when the download finishes; if they fail then, olly drops back to `idle` and keeps offering the update. If the supervisor never reports back within 10 minutes, olly gives up on the install and returns to `idle`. Follow progress with `status` (`update_state`, then `last_update`) or the `Updated` event |
+| `{"cmd":"update"}` | starts downloading and installing the known new release; `data` is `"started"`. Errors: `there's no update to install right now` (run `update_check` first, or wait for the periodic check), `I'm already updating` (`update_state` isn't `idle`), `I'll update once things are calm` (level isn't `calm`, an incident is open, or something is frozen or throttled). The rules are checked again when the download finishes; if they fail then, olly drops back to `idle` and keeps offering the update. If the supervisor never reports back within 10 minutes, olly gives up on the install and returns to `idle`. Follow progress with `status` (`update_state`, then `last_update`, or `update_error` if it stopped before the hand-off) or the `Updated` event |
 | `{"cmd":"update_finished"}` | sent by the update supervisor when it is done; olly re-reads its result (`last_update`) and the shipped widget version. `data` is `null`. Harmless from any client |
 
 ### StatusData
@@ -61,7 +61,8 @@ Every request gets exactly one response line (except `subscribe`, which then str
   "update": {"version":"0.2.0","notes":["..."],"url":"https://github.com/darkharasho/olly/releases/tag/v0.2.0"},
   "update_state": "idle",
   "last_update": null,
-  "widget_version": "1.0"
+  "widget_version": "1.0",
+  "update_error": null
 }
 ```
 
@@ -88,6 +89,7 @@ The fields from `swap_total` on are newer; a reply from an older daemon may lack
 
   `ok` false means the new version didn't come up and the old one was put back; `message` is ready to show. `widget_changed` means the shipped widget's version changed, so the tray widget needs a fresh login (or `olly-notify` upgrades it).
 - `widget_version`: `KPlugin.Version` of the widget copy olly ships (`/usr/local/share/olly/plasmoid/metadata.json`), or `null` if it can't be read.
+- `update_error`: why the latest update stopped before olly handed it to the supervisor, or `null`. `{"at_wall_ms":1761550300000,"message":"I couldn't download the update"}`; `message` is short and ready to show (`I couldn't download the update` for a failed download or check of the release, `I'll update once things are calm` when the rules failed after the download, `I couldn't start the update` when the supervisor couldn't be started). The details are in olly's journal. Cleared when a new update starts; a failure after the hand-off shows up in `last_update` instead. Defaults to `null`.
 - `frozen_info`: one entry per frozen app, in the same order as `frozen`. `bytes` is its memory, `rate` its growth in bytes/s when it was frozen, and `kill_at_wall_ms` is the wall time (ms) olly closes it if you do not answer:
 
 ```json

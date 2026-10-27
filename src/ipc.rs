@@ -3,7 +3,7 @@
 use crate::engine::{Event, Level, Target};
 use crate::incident::TopApp;
 use crate::supervise::LastUpdate;
-use crate::update::{UpdateInfo, UpdateState};
+use crate::update::{UpdateError, UpdateInfo, UpdateState};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -113,6 +113,9 @@ pub struct StatusData {
     /// `KPlugin.Version` of the widget copy olly ships.
     #[serde(default)]
     pub widget_version: Option<String>,
+    /// Why the latest update stopped before the hand-off, cleared when a new one starts.
+    #[serde(default)]
+    pub update_error: Option<UpdateError>,
 }
 
 /// What the tray shows for one frozen app.
@@ -493,6 +496,7 @@ mod tests {
         assert_eq!(st.update_state, crate::update::UpdateState::Idle);
         assert_eq!(st.last_update, None);
         assert_eq!(st.widget_version, None);
+        assert_eq!(st.update_error, None);
     }
 
     struct Harness {

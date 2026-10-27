@@ -5,7 +5,7 @@
 
 use crate::engine::Event;
 use crate::supervise::{self, LastUpdate, Layout};
-use crate::update::{self, Fetch, Manifest, Staged, UpdateInfo, UpdateState};
+use crate::update::{self, Fetch, Manifest, Staged, UpdateError, UpdateInfo, UpdateState};
 use std::fs;
 use std::os::fd::RawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -51,6 +51,8 @@ pub struct Updater {
     pub state: UpdateState,
     pub last_update: Option<LastUpdate>,
     pub widget_version: Option<String>,
+    /// Why the latest update stopped before the hand-off.
+    pub error: Option<UpdateError>,
     /// A check worker runs.
     pub checking: bool,
     /// A launch worker runs.
@@ -114,6 +116,7 @@ impl Updater {
             state: UpdateState::Idle,
             last_update: None,
             widget_version: None,
+            error: None,
             checking: false,
             launching: false,
             waiters: Vec::new(),
