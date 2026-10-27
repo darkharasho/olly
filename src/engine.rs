@@ -112,6 +112,10 @@ pub struct Engine {
     paused_until: Option<u64>,
     next_incident_id: u64,
     next_target_id: u64,
+    /// Resumed by the user this incident: no throttle or freeze, only emergency kills.
+    resumed: Vec<AppKey>,
+    /// Dry run only: already "killed" this incident, so not chosen again.
+    dry_killed: Vec<AppKey>,
 }
 
 impl Engine {
@@ -127,6 +131,8 @@ impl Engine {
             paused_until: None,
             next_incident_id: 1,
             next_target_id: 1,
+            resumed: Vec::new(),
+            dry_killed: Vec::new(),
         }
     }
 
@@ -205,12 +211,19 @@ impl Engine {
             true
         });
         self.frozen = frozen;
+        self.throttled.retain(|t| find(&t.key).is_some());
 
         // 3. Candidates, best first: rate, then bytes.
-        let mut cands: Vec<(&AppSample, f64, bool)> = apps
+        // (app, rate, recently growing, eligible for throttle/freeze)
+        let mut cands: Vec<(&AppSample, f64, bool, bool)> = apps
             .iter()
-            .filter(|a| !allow.allows_app(a) && !self.is_frozen(&a.key))
-            .map(|a| (a, hist.rate(&a.key, now), hist.recently_growing(&a.key, now)))
+            .filter(|a| {
+                !allow.allows_app(a) && !self.is_frozen(&a.key) && !self.dry_killed.contains(&a.key)
+            })
+            .map(|a| {
+                let gentle = !self.resumed.contains(&a.key);
+                (a, hist.rate(&a.key, now), hist.recently_growing(&a.key, now), gentle)
+            })
             .collect();
         cands.sort_by(|x, y| y.1.total_cmp(&x.1).then(y.0.bytes.cmp(&x.0.bytes)));
         let top_growing = cands.iter().find(|c| c.2).map(|c| c.0);
@@ -225,8 +238,8 @@ impl Engine {
         // 5. Act by level.
         match level {
             Level::Warning if !paused => {
-                for &(a, rate, growing) in &cands {
-                    if !growing || a.kind != TargetKind::Cgroup || self.is_throttled(&a.key) {
+                for &(a, rate, growing, gentle) in &cands {
+                    if !growing || !gentle || a.kind != TargetKind::Cgroup || self.is_throttled(&a.key) {
                         continue;
                     }
                     let target = self.target_for(a);
@@ -237,7 +250,7 @@ impl Engine {
                 }
             }
             Level::Critical if !paused && cooled => {
-                if let Some(a) = top_growing {
+                if let Some(&(a, ..)) = cands.iter().find(|c| c.2 && c.3) {
                     let target = self.target_for(a);
                     self.frozen.push(FrozenState {
                         target: target.clone(),
@@ -272,6 +285,8 @@ impl Engine {
                 let message = voice::unthrottled(&target.name);
                 self.act(&mut out, Action::Unthrottle { target }, message);
             }
+            self.resumed.clear();
+            self.dry_killed.clear();
             if let Some(id) = self.incident.take() {
                 out.events.push(Event::IncidentEnd { id, t_ms: now });
                 out.events.push(Event::Notice { message: voice::all_clear(), frozen_id: None });
@@ -294,6 +309,7 @@ impl Engine {
             }
             Command::ResumeFrozen(id) => {
                 let target = self.take_frozen(id)?;
+                self.resumed.push(target.key.clone());
                 let message = voice::resumed(&target.name);
                 self.act(&mut out, Action::Resume { target }, message);
             }
@@ -353,6 +369,9 @@ impl Engine {
         self.frozen.retain(|f| f.target.key != target.key);
         self.throttled.retain(|t| t.key != target.key);
         self.last_action_ms = Some(now);
+        if self.cfg.dry_run {
+            self.dry_killed.push(target.key.clone());
+        }
         let message = voice::killed(&target.name, target.bytes, reason, self.cfg.dry_run);
         self.act(out, Action::Kill { target, reason }, message);
     }
@@ -810,5 +829,112 @@ mod tests {
         let out = sim.step(critical(12_000), &[]);
         assert!(out.actions.is_empty());
         assert!(sim.eng.frozen().is_empty());
+    }
+
+    fn freeze_id(out: &StepOutput) -> u64 {
+        match &out.actions[..] {
+            [Action::Freeze { target }] => target.id,
+            a => panic!("expected freeze, got {a:?}"),
+        }
+    }
+
+    #[test]
+    fn resumed_target_not_refrozen_until_emergency() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t)]);
+        let id = freeze_id(&sim.step(critical(11_000), &[leak(11_000)]));
+        sim.eng.command(Command::ResumeFrozen(id), 11_500).unwrap();
+        for s in 12..=31 {
+            let t = s * 1000;
+            let out = sim.step(critical(t), &[leak(t)]);
+            assert!(out.actions.is_empty(), "t {t}: {:?}", out.actions);
+        }
+        let out = sim.step(emergency(32_000), &[leak(32_000)]);
+        assert_eq!(kills(&out), vec![("leaky".to_string(), KillReason::Emergency)]);
+    }
+
+    #[test]
+    fn resumed_set_cleared_when_incident_closes() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t)]);
+        let id = freeze_id(&sim.step(critical(11_000), &[leak(11_000)]));
+        sim.eng.command(Command::ResumeFrozen(id), 11_500).unwrap();
+        let mut ended = false;
+        for s in 12..=72 {
+            let out = sim.step(calm(s * 1000), &[leak(s * 1000)]);
+            ended |= out.events.iter().any(|e| matches!(e, Event::IncidentEnd { .. }));
+        }
+        assert!(ended);
+        let out = sim.step(critical(80_000), &[leak(80_000)]);
+        freeze_id(&out);
+    }
+
+    #[test]
+    fn dry_run_kills_each_app_once_per_incident() {
+        let mut sim = Sim::new();
+        sim.eng.cfg.dry_run = true;
+        sim.warm(10, |t| vec![leak(t)]);
+        let mut all = Vec::new();
+        for s in 11..=41 {
+            let t = s * 1000;
+            all.extend(kills(&sim.step(emergency(t), &[leak(t)])));
+        }
+        assert_eq!(all, vec![("leaky".to_string(), KillReason::Emergency)]);
+
+        // Same at Critical: freeze, grace kill, then never refrozen.
+        let mut sim = Sim::new();
+        sim.eng.cfg.dry_run = true;
+        sim.warm(10, |t| vec![leak(t)]);
+        let mut actions = Vec::new();
+        for s in 11..=60 {
+            let t = s * 1000;
+            actions.extend(sim.step(critical(t), &[leak(t)]).actions);
+        }
+        assert_eq!(actions.len(), 2, "{actions:?}");
+        assert!(matches!(actions[0], Action::Freeze { .. }));
+        assert!(matches!(actions[1], Action::Kill { reason: KillReason::GraceExpired, .. }));
+    }
+
+    #[test]
+    fn exited_throttled_app_pruned() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t)]);
+        let out = sim.step(warning(11_000), &[leak(11_000)]);
+        assert!(matches!(&out.actions[..], [Action::Throttle { .. }]));
+        assert_eq!(sim.eng.throttled().len(), 1);
+        let out = sim.step(warning(12_000), &[]);
+        assert!(out.actions.is_empty());
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        assert!(sim.eng.throttled().is_empty());
+    }
+
+    #[test]
+    fn irregular_gap_after_freeze() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t)]);
+        freeze_id(&sim.step(critical(11_000), &[leak(11_000)]));
+        let out = sim.step(critical(81_000), &[leak(81_000)]);
+        assert_eq!(kills(&out), vec![("leaky".to_string(), KillReason::GraceExpired)]);
+        assert_eq!(out.actions.len(), 1);
+        assert!(notices(&out).is_empty(), "{:?}", out.events);
+    }
+
+    #[test]
+    fn incident_stays_open_while_frozen() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t)]);
+        let id = freeze_id(&sim.step(critical(11_000), &[leak(11_000)]));
+        // Grace at 21s: pressure has fallen, so the target is spared. Calm from 22s.
+        let out = sim.step(warning(21_000), &[leak(21_000)]);
+        assert!(out.actions.is_empty());
+        for s in 22..=150 {
+            let out = sim.step(calm(s * 1000), &[leak(s * 1000)]);
+            assert!(out.actions.is_empty(), "step {s}: {:?}", out.actions);
+            assert!(!out.events.iter().any(|e| matches!(e, Event::IncidentEnd { .. })));
+        }
+        assert_eq!(sim.eng.frozen().len(), 1);
+        sim.eng.command(Command::ResumeFrozen(id), 150_500).unwrap();
+        let out = sim.step(calm(151_000), &[leak(151_000)]);
+        assert!(out.events.iter().any(|e| matches!(e, Event::IncidentEnd { id: 1, .. })));
     }
 }
