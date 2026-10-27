@@ -122,6 +122,17 @@ pub struct StatusData {
     /// The running game's display name (the largest if several), while game mode is on.
     #[serde(default)]
     pub game: Option<String>,
+    /// Apps that have been slowly growing, largest first, at most 3.
+    #[serde(default)]
+    pub leaks: Vec<LeakInfo>,
+}
+
+/// One slow-leak suspect for the tray.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LeakInfo {
+    pub name: String,
+    pub growth_bytes: u64,
+    pub window_secs: u64,
 }
 
 /// What the tray shows for one frozen app.

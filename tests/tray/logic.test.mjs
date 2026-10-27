@@ -6,7 +6,7 @@ const path = new URL("../../plasmoid/package/contents/ui/logic.js", import.meta.
 const src = fs.readFileSync(path, "utf8").replace(/^\.pragma library.*$/m, "");
 const L = new Function(
   src +
-    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, swapWarning, gameLine, actionLine, hasUpdate, updateCard, updateSeenAt, shouldCheck, checkLine};",
+    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, swapWarning, gameLine, leakCards, pruneDismissed, dismissLeak, actionLine, hasUpdate, updateCard, updateSeenAt, shouldCheck, checkLine};",
 )();
 
 const C = {
@@ -412,4 +412,33 @@ test("gameLine", () => {
   assert.equal(L.gameLine({ game: "" }), "");
   assert.equal(L.gameLine({}), "");
   assert.equal(L.gameLine(null), "");
+});
+
+test("leakCards", () => {
+  const st = { leaks: [
+    { name: "firefox", growth_bytes: 3e9, window_secs: 7200 },
+    { name: "slack", growth_bytes: 600e6, window_secs: 3600 },
+  ] };
+  const cards = L.leakCards(st, {});
+  assert.deepEqual(cards[0], { name: "firefox",
+    text: "firefox has grown 3.0 GB in the last 2 hours. Restarting it when convenient would free that up." });
+  assert.equal(cards[1].text, "slack has grown 600 MB in the last hour. Restarting it when convenient would free that up.");
+  assert.deepEqual(L.leakCards(st, { firefox: true }).map((c) => c.name), ["slack"]);
+  assert.deepEqual(L.leakCards({}, {}), []);
+  assert.deepEqual(L.leakCards({ leaks: null }, undefined), []);
+  assert.deepEqual(L.leakCards(null, {}), []);
+});
+
+test("pruneDismissed and dismissLeak", () => {
+  const st = { leaks: [{ name: "firefox", growth_bytes: 1, window_secs: 1 }] };
+  const d = { firefox: true, slack: true };
+  assert.deepEqual(L.pruneDismissed(st, d), { firefox: true });
+  const same = { firefox: true };
+  assert.equal(L.pruneDismissed(st, same), same);
+  assert.deepEqual(L.pruneDismissed({}, d), {});
+  assert.equal(L.pruneDismissed(null, d), d);
+  const next = L.dismissLeak(same, "slack");
+  assert.deepEqual(next, { firefox: true, slack: true });
+  assert.deepEqual(same, { firefox: true });
+  assert.deepEqual(L.dismissLeak(undefined, "a"), { a: true });
 });

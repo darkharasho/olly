@@ -24,6 +24,7 @@ PlasmoidItem {
     property bool checking: false       // an update check is in flight
     property double checkedAt: 0        // when the last update check finished
     property string checkError: ""      // why the last update check failed, "" if it didn't
+    property var dismissedLeaks: ({})    // app name -> true, until it stops being a leak suspect
     property string actionError: ""
     property var actionErrorTarget: null // frozen id of the failed card action, null for the footer
     property var commandTargets: ({})    // action command -> frozen id (or null), set when connecting
@@ -82,6 +83,7 @@ PlasmoidItem {
         } else if (source === statusCmd) {
             now = Date.now();
             status = Logic.parseStatus(code, stdout);
+            dismissedLeaks = Logic.pruneDismissed(status, dismissedLeaks);
             pollInterval = status ? 2000 : 5000;
             if (status && status.last_incident_id !== seenIncidentId)
                 fetchIncidents(status.last_incident_id);

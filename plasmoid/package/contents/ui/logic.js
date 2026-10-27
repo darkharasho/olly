@@ -269,6 +269,66 @@ function gameLine(status) {
     return "🎮 " + g + " is running. I'll pick other apps first.";
 }
 
+// "2 hours", "hour" or "N minutes", as in "in the last ..." (matches the daemon's notification).
+function leakSpan(secs) {
+    var hours = Math.floor((secs + 1800) / 3600);
+    if (hours === 0)
+        return Math.max(1, Math.floor(secs / 60)) + " minutes";
+    return hours === 1 ? "hour" : hours + " hours";
+}
+
+// One soft card per slow-growing app the user hasn't dismissed: [{name, text}], as the daemon
+// ordered them (largest first). `dismissed` is an object keyed by app name.
+function leakCards(status, dismissed) {
+    var leaks = (status || {}).leaks;
+    if (!Array.isArray(leaks))
+        return [];
+    var gone = dismissed || {};
+    var out = [];
+    for (var i = 0; i < leaks.length; i++) {
+        var l = leaks[i];
+        if (!l || typeof l.name !== "string" || gone[l.name] === true)
+            continue;
+        out.push({
+            name: l.name,
+            text: l.name + " has grown " + gb(l.growth_bytes || 0) + " in the last "
+                + leakSpan(l.window_secs || 0) + ". Restarting it when convenient would free that up."
+        });
+    }
+    return out;
+}
+
+// Keeps only the dismissals whose app is still a suspect. Returns `dismissed` itself when nothing
+// changes, and leaves it alone while offline (status null) so a restart doesn't bring cards back.
+function pruneDismissed(status, dismissed) {
+    var d = dismissed || {};
+    if (!status || status.offline)
+        return d;
+    var live = {};
+    var leaks = Array.isArray(status.leaks) ? status.leaks : [];
+    for (var i = 0; i < leaks.length; i++)
+        if (leaks[i] && typeof leaks[i].name === "string")
+            live[leaks[i].name] = true;
+    var out = {};
+    var changed = false;
+    for (var k in d) {
+        if (live[k])
+            out[k] = d[k];
+        else
+            changed = true;
+    }
+    return changed ? out : d;
+}
+
+// `dismissed` plus `name`, as a new object so QML sees the property change.
+function dismissLeak(dismissed, name) {
+    var out = {};
+    for (var k in (dismissed || {}))
+        out[k] = dismissed[k];
+    out[name] = true;
+    return out;
+}
+
 // One incident action `[wall_ms, {Name: {target, ...}}, dry_run]` as "HH:MM  Name target",
 // with " (would have)" when it was a dry run.
 function actionLine(action) {

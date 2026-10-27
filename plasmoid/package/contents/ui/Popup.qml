@@ -24,6 +24,7 @@ ColumnLayout {
     readonly property var stats: Logic.statRows(status)
     readonly property string swapText: offline ? "" : Logic.swapWarning(status)
     readonly property string gameText: offline ? "" : Logic.gameLine(status)
+    readonly property var leakCards: offline ? [] : Logic.leakCards(status, app.dismissedLeaks)
     readonly property var shown: app.incidents.slice(0, showAll ? 20 : 3)
 
     // A card action's error shows on its card while the card is up, else in the footer.
@@ -235,6 +236,40 @@ ColumnLayout {
                 textFormat: Text.PlainText
                 wrapMode: Text.Wrap
                 opacity: 0.85
+            }
+        }
+
+        // Slow-leak heads-up: one soft card per app, information only
+        Repeater {
+            model: popup.leakCards
+
+            Rectangle {
+                id: leakCard
+                required property var modelData
+                Layout.fillWidth: true
+                implicitHeight: leakRow.implicitHeight + 2 * Kirigami.Units.smallSpacing
+                radius: Kirigami.Units.cornerRadius
+                color: Qt.rgba(Kirigami.Theme.neutralBackgroundColor.r, Kirigami.Theme.neutralBackgroundColor.g,
+                               Kirigami.Theme.neutralBackgroundColor.b, 0.5)
+
+                RowLayout {
+                    id: leakRow
+                    anchors.fill: parent
+                    anchors.margins: Kirigami.Units.smallSpacing
+                    spacing: Kirigami.Units.smallSpacing
+
+                    PlasmaComponents3.Label {
+                        Layout.fillWidth: true
+                        text: leakCard.modelData.text
+                        textFormat: Text.PlainText
+                        wrapMode: Text.Wrap
+                        opacity: 0.85
+                    }
+                    PlasmaComponents3.ToolButton {
+                        text: "Dismiss"
+                        onClicked: popup.app.dismissedLeaks = Logic.dismissLeak(popup.app.dismissedLeaks, leakCard.modelData.name)
+                    }
+                }
             }
         }
     }

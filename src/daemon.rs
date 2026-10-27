@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::engine::{Action, Command, Engine, Event, FrozenView, Level, StepOutput};
 use crate::history::{History, LeakWatch, SwapWatch};
 use crate::incident::{IncidentRecorder, IncidentStore, TopApp};
-use crate::ipc::{self, err_line, ok_line, FrozenInfo, Request, StatusData, Subscribers, ToDaemon};
+use crate::ipc::{self, err_line, ok_line, FrozenInfo, LeakInfo, Request, StatusData, Subscribers, ToDaemon};
 use crate::procfs::parse_status;
 use crate::psi::{self, PsiTrigger};
 use crate::sample::{AppSample, Sampler, SystemSample};
@@ -214,6 +214,10 @@ struct Daemon {
     claude_rx: mpsc::Receiver<(Job, Result<String, String>)>,
     /// cgroup -> monotonic ms when it was last handed to Claude.
     leak_seen: HashMap<String, u64>,
+    /// cgroup -> display name of the largest app sampled in it, for naming leak suspects.
+    app_names: HashMap<String, String>,
+    /// Current slow-leak suspects for status, largest first.
+    leaks: Vec<LeakInfo>,
     upd: Updater,
 }
 
@@ -281,6 +285,39 @@ fn top_app(apps: &[AppSample], hist: &History, now: u64) -> Option<TopApp> {
     })
 }
 
+/// cgroup -> display name of the largest app sampled in it.
+fn cgroup_names(apps: &[AppSample]) -> HashMap<String, String> {
+    let mut best: HashMap<String, (u64, String)> = HashMap::new();
+    for a in apps {
+        let e = best.entry(a.key.cgroup.clone()).or_default();
+        if a.bytes >= e.0 {
+            *e = (a.bytes, a.name.clone());
+        }
+    }
+    best.into_iter().map(|(k, (_, n))| (k, n)).collect()
+}
+
+/// Status entries for the suspects that are still sampled as an app: largest first, at most 3.
+fn leak_infos(
+    suspects: &[(String, u64)],
+    names: &HashMap<String, String>,
+    window_secs: u64,
+) -> Vec<LeakInfo> {
+    let mut v: Vec<LeakInfo> = suspects
+        .iter()
+        .filter_map(|(cg, growth)| {
+            Some(LeakInfo {
+                name: names.get(cg)?.clone(),
+                growth_bytes: *growth,
+                window_secs,
+            })
+        })
+        .collect();
+    v.sort_by(|a, b| b.growth_bytes.cmp(&a.growth_bytes).then(a.name.cmp(&b.name)));
+    v.truncate(3);
+    v
+}
+
 /// Display name of the running game, the largest one if there are several:
 /// its process name without a trailing ".exe".
 fn running_game(apps: &[AppSample]) -> Option<String> {
@@ -335,6 +372,7 @@ impl Daemon {
         };
         let apps = self.sampler.apps();
         self.hist.record(now, &apps);
+        self.app_names = cgroup_names(&apps);
         self.swap_watch.record(
             now,
             sys.mem.swap_total.saturating_sub(sys.mem.swap_free),
@@ -352,6 +390,11 @@ impl Daemon {
         let totals = self.sampler.cgroup_totals();
         self.leak.record(now, &totals);
         let suspects = self.leak.suspects(now);
+        self.leaks = leak_infos(
+            &suspects,
+            &self.app_names,
+            self.cfg.growth.leak_window_secs,
+        );
         if !suspects.is_empty() {
             self.on_suspects(suspects);
         }
@@ -367,10 +410,20 @@ impl Daemon {
                 "olly: event=leak_suspect target={cgroup} growth={}",
                 voice::fmt_bytes(growth)
             );
-            if self.claude.is_none() || in_cooldown(&self.leak_seen, &cgroup, now) {
+            if in_cooldown(&self.leak_seen, &cgroup, now) {
                 continue;
             }
             self.leak_seen.insert(cgroup.clone(), now);
+            if let Some(name) = self.app_names.get(&cgroup) {
+                let ev = Event::Notice {
+                    message: voice::leak(name, growth, self.cfg.growth.leak_window_secs),
+                    frozen_id: None,
+                };
+                self.subs.broadcast(&ipc::event_line(&ev, wall_ms()));
+            }
+            if self.claude.is_none() {
+                continue;
+            }
             enqueue(&mut self.claude_queue, Job::Leak { cgroup, growth });
         }
     }
@@ -823,6 +876,7 @@ impl Daemon {
             swap_used: swap_total.saturating_sub(swap_free),
             swap_warning: self.swap_watch.is_on(),
             game: self.last_game.clone(),
+            leaks: self.leaks.clone(),
             some_avg10: self.last_sys.map_or(0.0, |s| s.psi.some_avg10),
             top: self.last_top.clone(),
             incident_active: self.engine.incident().is_some(),
@@ -1067,6 +1121,8 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         claude_tx,
         claude_rx,
         leak_seen: HashMap::new(),
+        app_names: HashMap::new(),
+        leaks: Vec::new(),
         upd: updater,
         start: Instant::now(),
         cfg,
@@ -1349,6 +1405,8 @@ mod tests {
             claude_tx,
             claude_rx,
             leak_seen: HashMap::new(),
+            app_names: HashMap::new(),
+            leaks: Vec::new(),
             upd: test_updater(&root, cfg.update_check),
             start: Instant::now(),
             cfg,
@@ -1498,6 +1556,20 @@ mod tests {
             exe_names: vec![],
             is_game: false,
         }
+    }
+
+    #[test]
+    fn leak_infos_are_sorted_capped_and_need_a_sampled_app() {
+        let names: HashMap<String, String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| (format!("/{n}"), n.to_string()))
+            .collect();
+        let s = |n: &str, g: u64| (format!("/{n}"), g);
+        let sus = vec![s("a", 3), s("b", 9), s("c", 5), s("d", 7), s("gone", 99)];
+        let v = leak_infos(&sus, &names, 7200);
+        let got: Vec<_> = v.iter().map(|l| (l.name.as_str(), l.growth_bytes)).collect();
+        assert_eq!(got, vec![("b", 9), ("d", 7), ("c", 5)]);
+        assert_eq!(v[0].window_secs, 7200);
     }
 
     #[test]

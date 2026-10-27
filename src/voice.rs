@@ -112,6 +112,28 @@ pub fn hunch(summary: &str) -> Message {
     }
 }
 
+/// Plain heads-up for an app that has slowly grown over the leak window.
+pub fn leak(app: &str, growth: u64, window_secs: u64) -> Message {
+    Message {
+        title: "olly noticed something \u{1F50D}".to_string(),
+        body: leak_text(app, growth, window_secs),
+    }
+}
+
+/// The sentence shared by the notification and the widget card.
+pub fn leak_text(app: &str, growth: u64, window_secs: u64) -> String {
+    let hours = (window_secs + 1800) / 3600;
+    let span = match hours {
+        0 => format!("{} minutes", (window_secs / 60).max(1)),
+        1 => "hour".to_string(),
+        n => format!("{n} hours"),
+    };
+    format!(
+        "{app} has grown {} in the last {span}. Restarting it when convenient would free that up.",
+        fmt_bytes(growth)
+    )
+}
+
 /// At most `max` chars, cut at a word boundary with an ellipsis when it had to be shortened.
 fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -189,6 +211,7 @@ mod tests {
             unthrottled("Firefox"),
             all_clear(),
             hunch("something odd"),
+            leak("Firefox", 3_000_000_000, 7200),
             config_fallback(),
             last_resort_cap(),
         ];
@@ -301,6 +324,16 @@ mod tests {
         assert_eq!(k.title, "olly closed X");
         let n = killed("X", 3_000_000_000, KillReason::NoAnswer, false);
         assert!(n.body.starts_with("Nobody answered"));
+    }
+
+    #[test]
+    fn leak_text_reads_plainly() {
+        assert_eq!(
+            leak_text("Firefox", 3_000_000_000, 7200),
+            "Firefox has grown 3.0 GB in the last 2 hours. Restarting it when convenient would free that up."
+        );
+        assert!(leak_text("x", 1_000_000_000, 3600).contains("in the last hour."));
+        assert_eq!(leak("x", 1, 7200).body, leak_text("x", 1, 7200));
     }
 
     #[test]
