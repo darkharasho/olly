@@ -438,16 +438,19 @@ impl Daemon {
                     .log("update_recover", now, &format!("update: {e}"));
             }
         }
-        if now < self.upd.next_check {
-            return;
-        }
-        self.upd.next_check = now + upd::CHECK_EVERY_MS;
         let paused = self.engine.paused_until().is_some_and(|u| u > now);
         let calm = update::may_check(
             self.engine.level(),
             self.incident_open || self.engine.incident().is_some(),
             paused,
         );
+        if calm {
+            self.upd.drop_backups_when_settled(now);
+        }
+        if now < self.upd.next_check {
+            return;
+        }
+        self.upd.next_check = now + upd::CHECK_EVERY_MS;
         if !self.upd.enabled || !calm || self.upd.checking || self.upd.state != UpdateState::Idle {
             return;
         }
@@ -1689,6 +1692,24 @@ mod tests {
         pump_until(&mut d, |d| !d.upd.checking);
         assert_eq!(d.upd.state, UpdateState::Idle);
         assert_eq!(d.upd.update, Some(offered()));
+    }
+
+    #[test]
+    fn kept_backups_go_once_olly_has_run_a_while_in_calm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        let prev = dir.path().join("bin/olly.prev");
+        fs::create_dir_all(prev.parent().unwrap()).unwrap();
+        fs::write(&prev, "old").unwrap();
+        d.upd.next_check = u64::MAX;
+        d.update_due(upd::KEEP_BACKUPS_MS - 1);
+        assert!(prev.exists());
+        d.incident_open = true;
+        d.update_due(upd::KEEP_BACKUPS_MS);
+        assert!(prev.exists());
+        d.incident_open = false;
+        d.update_due(upd::KEEP_BACKUPS_MS);
+        assert!(!prev.exists());
     }
 
     #[test]

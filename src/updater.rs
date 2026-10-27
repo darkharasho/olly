@@ -23,6 +23,8 @@ const FRESH_RESULT_MS: u64 = 10 * 60 * 1000;
 const WORKER_STACK: usize = 256 * 1024;
 /// An install with no result after this long (monotonic ms) is given up on.
 pub const INSTALL_TIMEOUT_MS: u64 = 600_000;
+/// How long olly runs before it drops the backups a recovered update kept.
+pub const KEEP_BACKUPS_MS: u64 = 600_000;
 const WORKER_LOST: &str = "update worker stopped unexpectedly";
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
@@ -67,6 +69,8 @@ pub struct Updater {
     installing_since: Option<u64>,
     /// The same moment, monotonic ms, for the install timeout.
     installing_mono: Option<u64>,
+    /// The backups a recovered update kept are gone (or there never were any to drop).
+    backups_dropped: bool,
     tx: mpsc::Sender<Done>,
     rx: mpsc::Receiver<Done>,
 }
@@ -124,6 +128,7 @@ impl Updater {
             emitted_at: None,
             installing_since: None,
             installing_mono: None,
+            backups_dropped: false,
             tx,
             rx,
         }
@@ -208,15 +213,32 @@ impl Updater {
     /// Finishes or undoes a swap whose supervisor died. Plain file work, run on the main
     /// thread at start only; true when it wrote a result.
     pub fn recover(&mut self, wall_ms: u64) -> bool {
-        supervise::recover(&self.layout, CURRENT, wall_ms).is_some()
+        supervise::recover(&self.layout, CURRENT, wall_ms, &mut reloader(self.live)).is_some()
     }
 
     /// The same, on a worker, for an install that timed out.
     pub fn spawn_recover(&mut self, wall_ms: u64) -> Result<(), String> {
         let layout = self.layout.clone();
+        let live = self.live;
         self.spawn("olly-update-recover", Done::Recovered(false), move || {
-            Done::Recovered(supervise::recover(&layout, CURRENT, wall_ms).is_some())
+            Done::Recovered(
+                supervise::recover(&layout, CURRENT, wall_ms, &mut reloader(live)).is_some(),
+            )
         })
+    }
+
+    /// Once olly has run `KEEP_BACKUPS_MS` with no update going, drops the backups a
+    /// recovered update kept. Small file work; the caller only asks when things are calm.
+    pub fn drop_backups_when_settled(&mut self, now: u64) {
+        if self.backups_dropped
+            || now < KEEP_BACKUPS_MS
+            || self.state != UpdateState::Idle
+            || self.launching
+        {
+            return;
+        }
+        self.backups_dropped = true;
+        supervise::drop_backups(&self.layout);
     }
 
     /// The supervisor never reported back (killed, or the machine was busy): give up on the
@@ -279,6 +301,21 @@ impl Updater {
         }
         self.last_update = Some(r);
         ev
+    }
+}
+
+/// `systemctl daemon-reload`, for after recovery put an old unit file back. Not under
+/// `OLLY_RUN_DIR`.
+fn reloader(live: bool) -> impl FnMut() {
+    move || {
+        if !live {
+            return;
+        }
+        match Command::new("systemctl").arg("daemon-reload").status() {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!("olly: systemctl daemon-reload failed: {s}"),
+            Err(e) => eprintln!("olly: couldn't run systemctl: {e}"),
+        }
     }
 }
 
