@@ -6,7 +6,7 @@ const path = new URL("../../plasmoid/package/contents/ui/logic.js", import.meta.
 const src = fs.readFileSync(path, "utf8").replace(/^\.pragma library.*$/m, "");
 const L = new Function(
   src +
-    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, actionLine, hasUpdate, updateCard};",
+    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, actionLine, hasUpdate, updateCard, updateSeenAt};",
 )();
 
 const C = {
@@ -291,7 +291,7 @@ test("updateCard null when nothing to show", () => {
 
 test("updateCard ready: notes capped at 5 with more", () => {
   const c = L.updateCard({ update: upd, update_state: "idle" }, 0, NOW, "0.1.0");
-  assert.deepEqual(c, { kind: "ready", title: "olly 0.2.0 is ready!", notes: ["a", "b"], more: 0, url: upd.url, hint: "", button: "Update" });
+  assert.deepEqual(c, { kind: "ready", title: "olly 0.2.0 is ready!", notes: ["a", "b"], more: 0, url: upd.url, hint: "", error: "", button: "Update" });
   const n7 = ["1", "2", "3", "4", "5", "6", "7"];
   const c7 = L.updateCard({ update: { ...upd, notes: n7 } }, 0, NOW, "0.1.0");
   assert.deepEqual(c7.notes, ["1", "2", "3", "4", "5"]);
@@ -338,4 +338,45 @@ test("updateCard dismissed and stale results hidden", () => {
   assert.equal(L.updateCard({ last_update: lastOk({ at_wall_ms: NOW - 3600001 }) }, 0, NOW, "0.1.0"), null);
   // hidden result falls through to ready
   assert.equal(L.updateCard({ update: upd, last_update: lastOk() }, at, NOW, "0.1.0").kind, "ready");
+});
+
+const uerr = (o) => Object.assign({ at_wall_ms: NOW - 1000, message: "I couldn't download the update" }, o);
+
+test("updateCard ready shows a recent update_error", () => {
+  const c = L.updateCard({ update: upd, update_state: "idle", update_error: uerr() }, 0, NOW, "0.1.0");
+  assert.equal(c.kind, "ready");
+  assert.equal(c.error, "I couldn't download the update");
+  assert.equal(c.button, "Update");
+  // older than an hour, dismissed, or older than the last result: hidden
+  assert.equal(L.updateCard({ update: upd, update_error: uerr({ at_wall_ms: NOW - 3600000 }) }, 0, NOW, "0.1.0").error,
+    "I couldn't download the update");
+  assert.equal(L.updateCard({ update: upd, update_error: uerr({ at_wall_ms: NOW - 3600001 }) }, 0, NOW, "0.1.0").error, "");
+  assert.equal(L.updateCard({ update: upd, update_error: uerr() }, NOW - 1000, NOW, "0.1.0").error, "");
+  assert.equal(L.updateCard({ update: upd, update_error: uerr() }, NOW - 1001, NOW, "0.1.0").error,
+    "I couldn't download the update");
+  const older = lastOk({ ok: false, at_wall_ms: NOW - 500 });
+  assert.equal(L.updateCard({ update: upd, update_error: uerr(), last_update: older }, NOW - 400, NOW, "0.1.0").error, "");
+  const prior = lastOk({ ok: false, at_wall_ms: NOW - 2000 });
+  assert.equal(L.updateCard({ update: upd, update_error: uerr(), last_update: prior }, NOW - 1500, NOW, "0.1.0").error,
+    "I couldn't download the update");
+  assert.equal(L.updateCard({ update: upd, update_error: null }, 0, NOW, "0.1.0").error, "");
+  assert.equal(L.updateCard({ update: upd, update_error: { at_wall_ms: NOW } }, 0, NOW, "0.1.0").error, "");
+});
+
+test("updateCard precedence holds with an update_error", () => {
+  const e = uerr();
+  assert.equal(L.updateCard({ update: upd, update_state: "downloading", update_error: e }, 0, NOW, "0.1.0").kind, "updating");
+  assert.equal(L.updateCard({ update: upd, update_error: e, last_update: lastOk({ at_wall_ms: NOW - 2000 }) }, 0, NOW, "0.1.0").kind, "done");
+  assert.equal(L.updateCard({ update: upd, update_error: e, last_update: lastOk({ ok: false, at_wall_ms: NOW - 2000 }) }, 0, NOW, "0.1.0").kind,
+    "rolledback");
+  // No update offered: nothing to show the error on.
+  assert.equal(L.updateCard({ update: null, update_error: e }, 0, NOW, "0.1.0"), null);
+});
+
+test("updateSeenAt covers results and errors", () => {
+  assert.equal(L.updateSeenAt(null), 0);
+  assert.equal(L.updateSeenAt({}), 0);
+  assert.equal(L.updateSeenAt({ last_update: lastOk() }), NOW - 1000);
+  assert.equal(L.updateSeenAt({ update_error: uerr({ at_wall_ms: NOW - 5 }) }), NOW - 5);
+  assert.equal(L.updateSeenAt({ last_update: lastOk(), update_error: uerr({ at_wall_ms: NOW - 5000 }) }), NOW - 1000);
 });

@@ -289,6 +289,11 @@ function updateCard(status, dismissedAt, now, ownVersion) {
     var u = status.update;
     if (u) {
         var notes = Array.isArray(u.notes) ? u.notes : [];
+        // A failure before the hand-off: recent, not dismissed, and newer than the last result.
+        var e = status.update_error;
+        var showErr = !!e && typeof e.message === "string" && e.message !== ""
+            && e.at_wall_ms > dismissedAt && now - e.at_wall_ms <= 3600000
+            && (!last || e.at_wall_ms > last.at_wall_ms);
         return {
             kind: "ready",
             title: "olly " + u.version + " is ready!",
@@ -296,8 +301,19 @@ function updateCard(status, dismissedAt, now, ownVersion) {
             more: Math.max(0, notes.length - 5),
             url: u.url,
             hint: "",
+            error: showErr ? e.message : "",
             button: "Update"
         };
     }
     return null;
+}
+
+// The newest update moment the user has seen (a result or an error), for dismissing the card.
+function updateSeenAt(status) {
+    if (!status)
+        return 0;
+    var at = status.last_update ? status.last_update.at_wall_ms : 0;
+    if (status.update_error && status.update_error.at_wall_ms > at)
+        at = status.update_error.at_wall_ms;
+    return at;
 }

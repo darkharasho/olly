@@ -19,7 +19,7 @@ PlasmoidItem {
     property var fetchingIncidentId: undefined // last_incident_id the fetch in flight is for
     property double now: Date.now()
     property bool repoll: false         // an action finished while a poll was in flight
-    property double updateDismissedAt: 0 // last_update.at_wall_ms seen when the popup closed
+    property double updateDismissedAt: 0 // newest last_update/update_error at_wall_ms seen when the popup closed
     property string actionError: ""
     property var actionErrorTarget: null // frozen id of the failed card action, null for the footer
     property var commandTargets: ({})    // action command -> frozen id (or null), set when connecting
@@ -98,8 +98,8 @@ PlasmoidItem {
     onExpandedChanged: {
         if (expanded)
             fetchIncidents(status ? status.last_incident_id : seenIncidentId);
-        else if (status && status.last_update)
-            updateDismissedAt = status.last_update.at_wall_ms;
+        else if (status && (status.last_update || status.update_error))
+            updateDismissedAt = Logic.updateSeenAt(status);
     }
 
     Plasma5Support.DataSource {

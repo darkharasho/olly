@@ -60,6 +60,15 @@ Rectangle {
             opacity: 0.8
         }
 
+        PlasmaComponents3.Label {
+            Layout.fillWidth: true
+            visible: !!card.c && !!card.c.error
+            text: card.c && card.c.error ? card.c.error : ""
+            textFormat: Text.PlainText
+            color: Kirigami.Theme.negativeTextColor
+            wrapMode: Text.Wrap
+        }
+
         PlasmaComponents3.Button {
             visible: !!card.c && card.c.kind === "ready"
             text: card.c && card.c.button ? card.c.button : ""
