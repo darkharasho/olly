@@ -6,7 +6,7 @@ const path = new URL("../../plasmoid/package/contents/ui/logic.js", import.meta.
 const src = fs.readFileSync(path, "utf8").replace(/^\.pragma library.*$/m, "");
 const L = new Function(
   src +
-    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, actionLine, hasUpdate, updateCard, updateSeenAt};",
+    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, actionLine, hasUpdate, updateCard, updateSeenAt, shouldCheck, checkLine};",
 )();
 
 const C = {
@@ -275,6 +275,23 @@ const lastOk = (o) => Object.assign({ from: "0.1.0", to: "0.2.0", ok: true, at_w
 
 test("command update", () => {
   assert.equal(L.command("update"), "/usr/local/bin/olly update --no-wait");
+  assert.equal(L.command("check"), "/usr/local/bin/olly update --check");
+});
+
+test("shouldCheck: at most every 10 minutes", () => {
+  assert.equal(L.shouldCheck(0, NOW), true);
+  assert.equal(L.shouldCheck(NOW - 599999, NOW), false);
+  assert.equal(L.shouldCheck(NOW - 600000, NOW), true);
+});
+
+test("checkLine", () => {
+  const st = { version: "0.2.4" };
+  assert.equal(L.checkLine(st, true, NOW, "nope"), "looking for updates…");
+  assert.equal(L.checkLine(st, false, NOW, "I'll look once things are calm"), "I'll look once things are calm");
+  assert.equal(L.checkLine(st, false, NOW, ""), "you're on the newest olly (0.2.4).");
+  assert.equal(L.checkLine(st, false, 0, ""), "");
+  assert.equal(L.checkLine(null, false, NOW, ""), "");
+  assert.equal(L.checkLine({}, false, NOW, ""), "");
 });
 
 test("hasUpdate", () => {

@@ -172,6 +172,8 @@ function command(verb, id) {
         return OLLY + " resume";
     if (verb === "update")
         return OLLY + " update --no-wait";
+    if (verb === "check")
+        return OLLY + " update --check";
     if ((verb === "kill" || verb === "unfreeze")
             && Number.isInteger(id) && id >= 0 && id <= Number.MAX_SAFE_INTEGER)
         return OLLY + " " + verb + " " + id;
@@ -306,6 +308,25 @@ function updateCard(status, dismissedAt, now, ownVersion) {
         };
     }
     return null;
+}
+
+// Opening the popup looks for a release at most this often.
+var CHECK_EVERY_MS = 600000;
+
+function shouldCheck(checkedAt, now) {
+    return now - checkedAt >= CHECK_EVERY_MS;
+}
+
+// The line under the update card when no update is offered: "" hides it.
+// `checkError` is the last check's error, "" if it went fine.
+function checkLine(status, checking, checkedAt, checkError) {
+    if (checking)
+        return "looking for updates…";
+    if (checkError !== "")
+        return checkError;
+    if (checkedAt > 0 && status && status.version)
+        return "you're on the newest olly (" + status.version + ").";
+    return "";
 }
 
 // The newest update moment the user has seen (a result or an error), for dismissing the card.

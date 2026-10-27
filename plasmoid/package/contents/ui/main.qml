@@ -12,6 +12,7 @@ PlasmoidItem {
 
     readonly property string statusCmd: Logic.OLLY + " status --json"
     readonly property string incidentsCmd: Logic.OLLY + " incidents -n 20 --json"
+    readonly property string checkCmd: Logic.command("check")
 
     property var status: null           // StatusData, or null when offline
     property var incidents: []          // kept across offline spells
@@ -20,6 +21,9 @@ PlasmoidItem {
     property double now: Date.now()
     property bool repoll: false         // an action finished while a poll was in flight
     property double updateDismissedAt: 0 // newest last_update/update_error at_wall_ms seen when the popup closed
+    property bool checking: false       // an update check is in flight
+    property double checkedAt: 0        // when the last update check finished
+    property string checkError: ""      // why the last update check failed, "" if it didn't
     property string actionError: ""
     property var actionErrorTarget: null // frozen id of the failed card action, null for the footer
     property var commandTargets: ({})    // action command -> frozen id (or null), set when connecting
@@ -63,8 +67,19 @@ PlasmoidItem {
         connectOnce(cmd);
     }
 
+    // Asks olly to look for a release; a found one shows up in status as the update card.
+    function checkForUpdate() {
+        if (connectOnce(checkCmd))
+            checking = true;
+    }
+
     function handleResult(source, code, stdout, stderr) {
-        if (source === statusCmd) {
+        if (source === checkCmd) {
+            checking = false;
+            checkedAt = Date.now();
+            checkError = code === 0 ? "" : (Logic.stripBot(stderr || "") || "I couldn't look for updates.");
+            pollSoon();
+        } else if (source === statusCmd) {
             now = Date.now();
             status = Logic.parseStatus(code, stdout);
             pollInterval = status ? 2000 : 5000;
@@ -96,9 +111,11 @@ PlasmoidItem {
     }
 
     onExpandedChanged: {
-        if (expanded)
+        if (expanded) {
             fetchIncidents(status ? status.last_incident_id : seenIncidentId);
-        else if (status && (status.last_update || status.update_error))
+            if (status && !status.update && Logic.shouldCheck(checkedAt, Date.now()))
+                checkForUpdate();
+        } else if (status && (status.last_update || status.update_error))
             updateDismissedAt = Logic.updateSeenAt(status);
     }
 

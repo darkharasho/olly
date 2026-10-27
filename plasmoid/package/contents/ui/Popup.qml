@@ -114,6 +114,31 @@ ColumnLayout {
         info: popup.update
     }
 
+    // 2c. Update check, when no update is offered
+    RowLayout {
+        Layout.fillWidth: true
+        Layout.leftMargin: Kirigami.Units.smallSpacing
+        Layout.rightMargin: Kirigami.Units.smallSpacing
+        visible: !popup.offline && popup.update === null
+        spacing: Kirigami.Units.smallSpacing
+
+        PlasmaComponents3.Label {
+            Layout.fillWidth: true
+            text: Logic.checkLine(popup.status, popup.app.checking, popup.app.checkedAt, popup.app.checkError)
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            opacity: 0.8
+            color: popup.app.checkError !== "" && !popup.app.checking
+                   ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
+        }
+        PlasmaComponents3.ToolButton {
+            text: "Check for updates"
+            icon.name: "view-refresh"
+            enabled: !popup.app.checking
+            onClicked: popup.app.checkForUpdate()
+        }
+    }
+
     // 3. Stats
     ColumnLayout {
         Layout.fillWidth: true
