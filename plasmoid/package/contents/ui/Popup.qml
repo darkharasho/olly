@@ -77,7 +77,7 @@ ColumnLayout {
 
         Rectangle {
             Layout.alignment: Qt.AlignTop
-            visible: !popup.offline && !!popup.status.dry_run
+            visible: !popup.offline && !!popup.status && !!popup.status.dry_run
             implicitWidth: badge.implicitWidth + 2 * Kirigami.Units.smallSpacing
             implicitHeight: badge.implicitHeight
             radius: height / 2
@@ -160,7 +160,7 @@ ColumnLayout {
 
         RowLayout {
             Layout.fillWidth: true
-            visible: !popup.offline && !!popup.status.top
+            visible: !popup.offline && !!popup.status && !!popup.status.top
             spacing: Kirigami.Units.smallSpacing
 
             PlasmaComponents3.Label {

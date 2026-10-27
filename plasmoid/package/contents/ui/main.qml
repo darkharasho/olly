@@ -30,7 +30,7 @@ PlasmoidItem {
 
     Plasmoid.status: mood === "needs" ? PlasmaCore.Types.NeedsAttentionStatus : PlasmaCore.Types.ActiveStatus
     toolTipMainText: "olly"
-    toolTipSubText: mood === "offline" ? "olly isn't running right now." : Logic.stripBot(status.message || "")
+    toolTipSubText: mood === "offline" ? "olly isn't running right now." : Logic.stripBot((status && status.message) || "")
 
     function connectOnce(cmd) {
         // A source that is still connected is still running: skip instead of piling up.
