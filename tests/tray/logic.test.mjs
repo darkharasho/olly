@@ -6,7 +6,7 @@ const path = new URL("../../plasmoid/package/contents/ui/logic.js", import.meta.
 const src = fs.readFileSync(path, "utf8").replace(/^\.pragma library.*$/m, "");
 const L = new Function(
   src +
-    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, actionLine};",
+    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, actionLine, hasUpdate, updateCard};",
 )();
 
 const C = {
@@ -268,4 +268,74 @@ test("actionLine", () => {
   assert.equal(L.actionLine([t, { Kill: { target: { name: "memhog" }, reason: "emergency" } }, false]), "09:05  Kill memhog");
   assert.equal(L.actionLine([t, { Freeze: { target: { name: "chrome" } } }, true]), "09:05  Freeze chrome (would have)");
   assert.equal(L.actionLine([t, { Freeze: { target: { name: "chrome" } } }]), "09:05  Freeze chrome");
+});
+
+const upd = { version: "0.2.0", notes: ["a", "b"], url: "https://example.test/r" };
+const lastOk = (o) => Object.assign({ from: "0.1.0", to: "0.2.0", ok: true, at_wall_ms: NOW - 1000, message: "" }, o);
+
+test("command update", () => {
+  assert.equal(L.command("update"), "/usr/local/bin/olly update --no-wait");
+});
+
+test("hasUpdate", () => {
+  assert.equal(L.hasUpdate(null), false);
+  assert.equal(L.hasUpdate({}), false);
+  assert.equal(L.hasUpdate({ update: null }), false);
+  assert.equal(L.hasUpdate({ update: upd }), true);
+});
+
+test("updateCard null when nothing to show", () => {
+  assert.equal(L.updateCard(null, 0, NOW, "0.1.0"), null);
+  assert.equal(L.updateCard({ update: null, update_state: "idle", last_update: null }, 0, NOW, "0.1.0"), null);
+});
+
+test("updateCard ready: notes capped at 5 with more", () => {
+  const c = L.updateCard({ update: upd, update_state: "idle" }, 0, NOW, "0.1.0");
+  assert.deepEqual(c, { kind: "ready", title: "olly 0.2.0 is ready!", notes: ["a", "b"], more: 0, url: upd.url, hint: "", button: "Update" });
+  const n7 = ["1", "2", "3", "4", "5", "6", "7"];
+  const c7 = L.updateCard({ update: { ...upd, notes: n7 } }, 0, NOW, "0.1.0");
+  assert.deepEqual(c7.notes, ["1", "2", "3", "4", "5"]);
+  assert.equal(c7.more, 2);
+  const c5 = L.updateCard({ update: { ...upd, notes: n7.slice(0, 5) } }, 0, NOW, "0.1.0");
+  assert.equal(c5.notes.length, 5);
+  assert.equal(c5.more, 0);
+  const cn = L.updateCard({ update: { version: "0.2.0", url: "u" } }, 0, NOW, "0.1.0");
+  assert.deepEqual(cn.notes, []);
+  assert.equal(cn.more, 0);
+  assert.deepEqual(L.updateCard({ update: { ...upd, notes: null } }, 0, NOW, "0.1.0").notes, []);
+});
+
+test("updateCard updating", () => {
+  for (const s of ["downloading", "installing"]) {
+    const c = L.updateCard({ update: upd, update_state: s, last_update: lastOk() }, 0, NOW, "0.1.0");
+    assert.deepEqual(c, { kind: "updating", title: "updating…" });
+  }
+  assert.equal(L.updateCard({ update: upd, update_state: "checking" }, 0, NOW, "0.1.0").kind, "ready");
+});
+
+test("updateCard done and hint", () => {
+  const s = (o) => Object.assign({ update: null, update_state: "idle", last_update: lastOk(), widget_version: "0.2.0" }, o);
+  let c = L.updateCard(s(), 0, NOW, "0.2.0");
+  assert.deepEqual({ kind: c.kind, title: c.title, hint: c.hint }, { kind: "done", title: "updated to 0.2.0! ✨", hint: "" });
+  c = L.updateCard(s(), 0, NOW, "0.1.0");
+  assert.equal(c.hint, "log out and back in to see my new look");
+  assert.equal(L.updateCard(s({ widget_version: null }), 0, NOW, "0.1.0").hint, "");
+  assert.equal(L.updateCard(s({ widget_version: undefined }), 0, NOW, "0.1.0").hint, "");
+  // done outranks ready
+  assert.equal(L.updateCard(s({ update: upd }), 0, NOW, "0.2.0").kind, "done");
+});
+
+test("updateCard rolledback", () => {
+  const c = L.updateCard({ update: null, last_update: lastOk({ ok: false }) }, 0, NOW, "0.1.0");
+  assert.deepEqual(c, { kind: "rolledback", title: "that update didn't work, so I went back to 0.1.0." });
+});
+
+test("updateCard dismissed and stale results hidden", () => {
+  const at = NOW - 1000;
+  assert.equal(L.updateCard({ last_update: lastOk() }, at, NOW, "0.1.0"), null);
+  assert.equal(L.updateCard({ last_update: lastOk() }, at - 1, NOW, "0.1.0").kind, "done");
+  assert.equal(L.updateCard({ last_update: lastOk({ at_wall_ms: NOW - 3600000 }) }, 0, NOW, "0.1.0").kind, "done");
+  assert.equal(L.updateCard({ last_update: lastOk({ at_wall_ms: NOW - 3600001 }) }, 0, NOW, "0.1.0"), null);
+  // hidden result falls through to ready
+  assert.equal(L.updateCard({ update: upd, last_update: lastOk() }, at, NOW, "0.1.0").kind, "ready");
 });

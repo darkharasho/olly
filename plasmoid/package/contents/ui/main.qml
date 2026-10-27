@@ -19,6 +19,7 @@ PlasmoidItem {
     property var fetchingIncidentId: undefined // last_incident_id the fetch in flight is for
     property double now: Date.now()
     property bool repoll: false         // an action finished while a poll was in flight
+    property double updateDismissedAt: 0 // last_update.at_wall_ms seen when the popup closed
     property string actionError: ""
     property var actionErrorTarget: null // frozen id of the failed card action, null for the footer
     property var commandTargets: ({})    // action command -> frozen id (or null), set when connecting
@@ -52,12 +53,13 @@ PlasmoidItem {
             fetchingIncidentId = forId;
     }
 
-    // verb: "kill" | "unfreeze" (with a frozen id from status) | "pause" | "resume".
+    // verb: "kill" | "unfreeze" (with a frozen id from status) | "pause" | "resume" | "update".
     function run(verb, id) {
         var cmd = Logic.command(verb, id);
         if (cmd === "")
             return;
-        commandTargets[cmd] = (verb === "kill" || verb === "unfreeze") ? id : null;
+        commandTargets[cmd] = (verb === "kill" || verb === "unfreeze") ? id
+            : (verb === "update" ? "update" : null);
         connectOnce(cmd);
     }
 
@@ -93,7 +95,12 @@ PlasmoidItem {
         }
     }
 
-    onExpandedChanged: if (expanded) fetchIncidents(status ? status.last_incident_id : seenIncidentId)
+    onExpandedChanged: {
+        if (expanded)
+            fetchIncidents(status ? status.last_incident_id : seenIncidentId);
+        else if (status && status.last_update)
+            updateDismissedAt = status.last_update.at_wall_ms;
+    }
 
     Plasma5Support.DataSource {
         id: exec
@@ -136,6 +143,7 @@ PlasmoidItem {
         Face {
             anchors.fill: parent
             mood: root.mood
+            updateReady: Logic.hasUpdate(root.status)
         }
     }
 

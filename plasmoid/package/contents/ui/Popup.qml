@@ -4,6 +4,7 @@ import QtQuick
 import QtQuick.Layouts
 import org.kde.plasma.components as PlasmaComponents3
 import org.kde.kirigami as Kirigami
+import org.kde.plasma.plasmoid
 import "logic.js" as Logic
 
 // The click popup: header, needs-you cards, stats, incidents, footer.
@@ -18,6 +19,8 @@ ColumnLayout {
     readonly property var info: Logic.moodInfo(app.mood)
     readonly property bool paused: Logic.pausedNow(status, app.now)
     readonly property var cards: offline ? [] : Logic.needsCards(status, app.now)
+    readonly property var update: offline ? null
+        : Logic.updateCard(status, app.updateDismissedAt, app.now, Plasmoid.metaData.version)
     readonly property var stats: Logic.statRows(status)
     readonly property var shown: app.incidents.slice(0, showAll ? 20 : 3)
 
@@ -44,6 +47,7 @@ ColumnLayout {
             Layout.preferredWidth: 52
             Layout.preferredHeight: 52
             mood: popup.app.mood
+            updateReady: Logic.hasUpdate(popup.status)
         }
 
         ColumnLayout {
@@ -100,6 +104,14 @@ ColumnLayout {
             app: popup.app
             info: popup.cards[index]
         }
+    }
+
+    // 2b. Update card
+    UpdateCard {
+        Layout.fillWidth: true
+        visible: popup.update !== null
+        app: popup.app
+        info: popup.update
     }
 
     // 3. Stats
@@ -237,6 +249,7 @@ ColumnLayout {
         Layout.fillWidth: true
         Layout.leftMargin: Kirigami.Units.smallSpacing
         visible: popup.app.actionError !== ""
+                 && popup.app.actionErrorTarget !== "update"
                  && (popup.app.actionErrorTarget === null || !popup.hasCard(popup.app.actionErrorTarget))
         text: popup.app.actionError
         textFormat: Text.PlainText

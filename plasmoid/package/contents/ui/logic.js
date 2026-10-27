@@ -170,6 +170,8 @@ function command(verb, id) {
         return OLLY + " pause 30";
     if (verb === "resume")
         return OLLY + " resume";
+    if (verb === "update")
+        return OLLY + " update --no-wait";
     if ((verb === "kill" || verb === "unfreeze")
             && Number.isInteger(id) && id >= 0 && id <= Number.MAX_SAFE_INTEGER)
         return OLLY + " " + verb + " " + id;
@@ -258,4 +260,44 @@ function actionLine(action) {
     var hh = d.getHours(), mm = d.getMinutes();
     return (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm + "  " + name + " " + target
         + (action[2] ? " (would have)" : "");
+}
+
+function hasUpdate(status) {
+    return !!(status && status.update);
+}
+
+// The update card, or null. Precedence: updating, then a fresh (undismissed,
+// within the last hour) result, then an offered update. `updating` omits the
+// other fields. `ownVersion` is the running widget's version.
+function updateCard(status, dismissedAt, now, ownVersion) {
+    if (!status)
+        return null;
+    if (status.update_state === "downloading" || status.update_state === "installing")
+        return { kind: "updating", title: "updating…" };
+    var last = status.last_update;
+    if (last && last.at_wall_ms > dismissedAt && now - last.at_wall_ms <= 3600000) {
+        if (last.ok) {
+            var changed = status.widget_version != null && status.widget_version !== ownVersion;
+            return {
+                kind: "done",
+                title: "updated to " + last.to + "! ✨",
+                hint: changed ? "log out and back in to see my new look" : ""
+            };
+        }
+        return { kind: "rolledback", title: "that update didn't work, so I went back to " + last.from + "." };
+    }
+    var u = status.update;
+    if (u) {
+        var notes = Array.isArray(u.notes) ? u.notes : [];
+        return {
+            kind: "ready",
+            title: "olly " + u.version + " is ready!",
+            notes: notes.slice(0, 5),
+            more: Math.max(0, notes.length - 5),
+            url: u.url,
+            hint: "",
+            button: "Update"
+        };
+    }
+    return null;
 }

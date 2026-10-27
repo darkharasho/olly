@@ -8,6 +8,7 @@ Item {
 
     property string mood: "offline"
     property bool blinking: false
+    property bool updateReady: false
     readonly property bool animate: Kirigami.Units.longDuration > 0
 
     implicitWidth: Kirigami.Units.iconSizes.medium
@@ -57,5 +58,16 @@ Item {
             NumberAnimation { to: 1; duration: 600; easing.type: Easing.InOutSine }
             onRunningChanged: if (!running) question.opacity = 1
         }
+    }
+
+    // Antenna glow: the tip at cx 12, cy 2.6, r 1.2 in the 24x24 viewBox.
+    Rectangle {
+        visible: face.updateReady
+        width: svg.width * 2.4 / 24
+        height: width
+        radius: width / 2
+        color: "#4fc3f7"
+        x: svg.x + svg.width * 12 / 24 - width / 2
+        y: svg.y + svg.height * 2.6 / 24 - height / 2
     }
 }
