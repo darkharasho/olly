@@ -145,3 +145,85 @@ function needsCards(status, now) {
 function stripBot(text) {
     return String(text).trim().replace(/^🤖\s*/, "");
 }
+
+var OLLY = "/usr/local/bin/olly";
+
+// Shell-safe action command: only the fixed path, fixed words and an integer id.
+// Returns "" for anything else.
+function command(verb, id) {
+    if (verb === "pause")
+        return OLLY + " pause 30";
+    if (verb === "resume")
+        return OLLY + " resume";
+    if ((verb === "kill" || verb === "unfreeze")
+            && Number.isInteger(id) && id >= 0 && id <= Number.MAX_SAFE_INTEGER)
+        return OLLY + " " + verb + " " + id;
+    return "";
+}
+
+// `olly status --json` result to a StatusData object, or null (offline).
+function parseStatus(exitCode, stdout) {
+    if (exitCode !== 0)
+        return null;
+    try {
+        var s = JSON.parse(stdout);
+        return (s && typeof s === "object" && !Array.isArray(s) && !s.offline) ? s : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// `olly incidents --json` result to an array, or null to keep the old list.
+function parseIncidents(exitCode, stdout) {
+    if (exitCode !== 0)
+        return null;
+    try {
+        var list = JSON.parse(stdout);
+        return Array.isArray(list) ? list : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function esc(text) {
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// The two lines of a needs-you card. `head` is StyledText with the name escaped.
+function needsText(card) {
+    return {
+        head: "<b>" + esc(card.name) + "</b> is frozen at " + card.size
+            + (card.rateText ? " (" + card.rateText + ")" : "") + ".",
+        sub: card.countdown
+            ? "I'll close it in " + card.countdown + " if you don't pick, sooner if memory gets really tight."
+            : "I'll close it if you don't pick, sooner if memory gets really tight."
+    };
+}
+
+function frac(part, total) {
+    return total > 0 ? Math.max(0, Math.min(1, part / total)) : 0;
+}
+
+// The three stat bars: {label, frac (0..1), color, value}.
+function statRows(status) {
+    var s = status || {};
+    var ram = frac(s.mem_available || 0, s.mem_total || 0);
+    var swap = frac(s.swap_used || 0, s.swap_total || 0);
+    var p = s.some_avg10 || 0;
+    return [
+        { label: "RAM free", frac: ram, color: barColor("ram", ram), value: gb(s.mem_available || 0) },
+        { label: "Swap used", frac: swap, color: barColor("swap", swap), value: gb(s.swap_used || 0) },
+        { label: "Pressure", frac: frac(p, 100), color: barColor("pressure", p),
+          value: (p < 10 ? p.toFixed(1) : Math.round(p)) + "%" }
+    ];
+}
+
+// One incident action `[wall_ms, {Name: {target, ...}}, dry_run]` as "HH:MM  Name target".
+function actionLine(action) {
+    var d = new Date(action[0]);
+    var obj = action[1] || {};
+    var name = Object.keys(obj)[0] || "";
+    var target = (obj[name] && obj[name].target && obj[name].target.name) || "";
+    var hh = d.getHours(), mm = d.getMinutes();
+    return (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm + "  " + name + " " + target;
+}

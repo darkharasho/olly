@@ -6,7 +6,7 @@ const path = new URL("../../plasmoid/package/contents/ui/logic.js", import.meta.
 const src = fs.readFileSync(path, "utf8").replace(/^\.pragma library.*$/m, "");
 const L = new Function(
   src +
-    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow};",
+    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, actionLine};",
 )();
 
 const C = {
@@ -159,4 +159,64 @@ test("pausedNow", () => {
   assert.equal(L.pausedNow(base({ paused_until_wall_ms: NOW }), NOW), false);
   assert.equal(L.pausedNow(base(), NOW), false);
   assert.equal(L.pausedNow(null, NOW), false);
+});
+
+test("command is shell-safe", () => {
+  const O = "/usr/local/bin/olly";
+  assert.equal(L.command("pause"), O + " pause 30");
+  assert.equal(L.command("resume"), O + " resume");
+  assert.equal(L.command("kill", 1761550000001), O + " kill 1761550000001");
+  assert.equal(L.command("unfreeze", 2), O + " unfreeze 2");
+  for (const bad of ["2; rm -rf ~", "2", 2.5, -1, NaN, Infinity, null, undefined, 2 ** 60])
+    assert.equal(L.command("kill", bad), "", String(bad));
+  assert.equal(L.command("rm", 2), "");
+  assert.equal(L.command("kill $(id)", 2), "");
+});
+
+test("parseStatus", () => {
+  assert.deepEqual(L.parseStatus(0, '{"level":"calm"}\n'), { level: "calm" });
+  assert.equal(L.parseStatus(1, '{"offline":true}'), null);
+  assert.equal(L.parseStatus(0, '{"offline":true}'), null);
+  assert.equal(L.parseStatus(0, "garbage"), null);
+  assert.equal(L.parseStatus(0, "[]"), null);
+  assert.equal(L.parseStatus(0, "null"), null);
+  assert.equal(L.parseStatus(undefined, ""), null);
+});
+
+test("parseIncidents", () => {
+  assert.deepEqual(L.parseIncidents(0, '[{"id":1}]'), [{ id: 1 }]);
+  assert.equal(L.parseIncidents(1, "[]"), null);
+  assert.equal(L.parseIncidents(0, '{"offline":true}'), null);
+  assert.equal(L.parseIncidents(0, "nope"), null);
+});
+
+test("needsText", () => {
+  const t = L.needsText({ name: "a<b>&c", size: "7.4 GB", rateText: "it was growing 2.1 GB/min", countdown: "4:12" });
+  assert.equal(t.head, "<b>a&lt;b&gt;&amp;c</b> is frozen at 7.4 GB (it was growing 2.1 GB/min).");
+  assert.equal(t.sub, "I'll close it in 4:12 if you don't pick, sooner if memory gets really tight.");
+  const o = L.needsText({ name: "g", size: "21 GB", rateText: "", countdown: "" });
+  assert.equal(o.head, "<b>g</b> is frozen at 21 GB.");
+  assert.equal(o.sub, "I'll close it if you don't pick, sooner if memory gets really tight.");
+});
+
+test("statRows", () => {
+  const r = L.statRows({ mem_available: 13.1e9, mem_total: 32e9, swap_used: 1.9e9, swap_total: 16e9, some_avg10: 0.4 });
+  assert.deepEqual(r.map((x) => x.label), ["RAM free", "Swap used", "Pressure"]);
+  assert.deepEqual(r.map((x) => x.value), ["13 GB", "1.9 GB", "0.4%"]);
+  assert.deepEqual(r.map((x) => x.color), [C.calm, C.calm, C.calm]);
+  assert.ok(Math.abs(r[0].frac - 13.1 / 32) < 1e-9);
+  const hot = L.statRows({ mem_available: 1.9e9, mem_total: 32e9, swap_used: 11.4e9, swap_total: 16e9, some_avg10: 22 });
+  assert.deepEqual(hot.map((x) => x.color), [C.onit, C.worried, C.worried]);
+  assert.equal(hot[2].value, "22%");
+  // Older daemon: no swap or pressure fields, and no swap at all.
+  const old = L.statRows({ mem_available: 1e9, mem_total: 2e9 });
+  assert.deepEqual(old.map((x) => x.frac), [0.5, 0, 0]);
+  assert.deepEqual(old.map((x) => x.value), ["1.0 GB", "0 MB", "0.0%"]);
+  assert.deepEqual(L.statRows(null).map((x) => x.frac), [0, 0, 0]);
+});
+
+test("actionLine", () => {
+  const t = new Date(2026, 9, 27, 9, 5).getTime();
+  assert.equal(L.actionLine([t, { Kill: { target: { name: "memhog" }, reason: "emergency" } }, false]), "09:05  Kill memhog");
+  assert.equal(L.actionLine([t, { Freeze: { target: { name: "chrome" } } }, true]), "09:05  Freeze chrome");
 });
