@@ -545,8 +545,13 @@ impl Daemon {
     }
 
     /// `update_check` from a client: joins the running check or starts one, ignoring the
-    /// calm rule and the config flag. Answered when the check finishes.
+    /// config flag and pause but not the calm rule. Answered when the check finishes.
     fn update_check(&mut self, reply: mpsc::Sender<String>) {
+        let incident = self.incident_open || self.engine.incident().is_some();
+        if !update::may_check(self.engine.level(), incident, false) {
+            let _ = reply.send(err_line("I'll look once things are calm"));
+            return;
+        }
         if !self.upd.checking {
             if let Err(e) = self.upd.spawn_check() {
                 let _ = reply.send(err_line(&e));
@@ -1623,6 +1628,47 @@ mod tests {
         pump_until(&mut d, |d| !d.upd.checking);
         assert_eq!(d.upd.state, UpdateState::Idle);
         assert_eq!(d.upd.update, Some(offered()));
+    }
+
+    #[test]
+    fn on_demand_check_waits_for_calm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        let calm_err = err_line("I'll look once things are calm");
+        d.incident_open = true;
+        let (tx, rx) = mpsc::channel();
+        d.handle(ToDaemon::Req(Request::UpdateCheck, tx));
+        assert_eq!(rx.try_recv().unwrap(), calm_err);
+        assert!(!d.upd.checking);
+        assert_eq!(d.upd.state, UpdateState::Idle);
+        d.incident_open = false;
+
+        for s in 0..=10 {
+            step(&mut d, s * 1000, 0.0);
+        }
+        step(&mut d, 11_000, 30.0);
+        assert_ne!(d.engine.level(), Level::Calm);
+        let (tx, rx) = mpsc::channel();
+        d.handle(ToDaemon::Req(Request::UpdateCheck, tx));
+        assert_eq!(rx.try_recv().unwrap(), calm_err);
+        assert!(!d.upd.checking);
+        assert!(d.upd.waiters.is_empty());
+    }
+
+    #[test]
+    fn on_demand_check_ignores_flag_and_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        d.upd.enabled = false;
+        d.command(Command::Pause {
+            until_ms: u64::MAX / 2,
+        })
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        d.handle(ToDaemon::Req(Request::UpdateCheck, tx));
+        assert!(d.upd.checking);
+        pump_until(&mut d, |d| !d.upd.checking);
+        assert_eq!(rx.try_recv().unwrap(), ok_line(&Some(offered())));
     }
 
     #[test]
