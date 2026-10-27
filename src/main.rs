@@ -11,8 +11,8 @@ use std::time::Duration;
 const DEFAULT_SOCKET: &str = "/run/olly/olly.sock";
 
 const USAGE: &str = "\u{1F916} here's what I can do:
-  olly status                 how memory looks right now
-  olly incidents [-n N]       recent incidents, newest first
+  olly status [--json]        how memory looks right now
+  olly incidents [-n N] [--json]  recent incidents, newest first
   olly incident <id>          one incident in full
   olly pause <minutes>        stop slowing and pausing apps for a while
   olly resume                 end a pause early
@@ -29,9 +29,15 @@ enum LocalCmd {
     Help,
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Output {
+    Text,
+    Json,
+}
+
 #[derive(Debug, PartialEq)]
 enum Cli {
-    Req(Request),
+    Req(Request, Output),
     Local(LocalCmd),
 }
 
@@ -52,9 +58,22 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     let Some((sub, rest)) = args.split_first() else {
         return Ok(Cli::Local(LocalCmd::Help));
     };
+    // `--json` is only accepted by `status` and `incidents`.
+    let (json, rest) = match sub.as_str() {
+        "status" | "incidents" => (
+            rest.iter().any(|a| a == "--json"),
+            &rest
+                .iter()
+                .filter(|a| *a != "--json")
+                .cloned()
+                .collect::<Vec<_>>()[..],
+        ),
+        _ => (false, rest),
+    };
+    let out = if json { Output::Json } else { Output::Text };
     let no_args = |req: Request| {
         if rest.is_empty() {
-            Ok(Cli::Req(req))
+            Ok(Cli::Req(req, out))
         } else {
             Err(format!(
                 "\u{1F916} `olly {sub}` doesn't take any arguments."
@@ -68,12 +87,17 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         "watch" => no_args(Request::Subscribe),
         "help" | "--help" | "-h" => Ok(Cli::Local(LocalCmd::Help)),
         "incidents" => match rest {
-            [] => Ok(Cli::Req(Request::Incidents {
-                limit: 10,
-                offset: 0,
-            })),
+            [] => Ok(Cli::Req(
+                Request::Incidents {
+                    limit: 10,
+                    offset: 0,
+                },
+                out,
+            )),
             [flag, n] if flag == "-n" => match n.parse::<usize>() {
-                Ok(limit) if limit > 0 => Ok(Cli::Req(Request::Incidents { limit, offset: 0 })),
+                Ok(limit) if limit > 0 => {
+                    Ok(Cli::Req(Request::Incidents { limit, offset: 0 }, out))
+                }
                 _ => Err(
                     "\u{1F916} `-n` needs a number of at least 1, like `olly incidents -n 5`."
                         .to_string(),
@@ -81,15 +105,24 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             },
             _ => Err("\u{1F916} try `olly incidents` or `olly incidents -n 5`.".to_string()),
         },
-        "incident" => Ok(Cli::Req(Request::Incident {
-            id: need_id(sub, rest)?,
-        })),
-        "kill" => Ok(Cli::Req(Request::FrozenKill {
-            id: need_id(sub, rest)?,
-        })),
-        "unfreeze" => Ok(Cli::Req(Request::FrozenResume {
-            id: need_id(sub, rest)?,
-        })),
+        "incident" => Ok(Cli::Req(
+            Request::Incident {
+                id: need_id(sub, rest)?,
+            },
+            Output::Text,
+        )),
+        "kill" => Ok(Cli::Req(
+            Request::FrozenKill {
+                id: need_id(sub, rest)?,
+            },
+            Output::Text,
+        )),
+        "unfreeze" => Ok(Cli::Req(
+            Request::FrozenResume {
+                id: need_id(sub, rest)?,
+            },
+            Output::Text,
+        )),
         "pause" => {
             let usage = "\u{1F916} `olly pause` needs a number of minutes, like `olly pause 15`.";
             let [m] = rest else {
@@ -102,12 +135,13 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 );
             }
             let secs = minutes.checked_mul(60).ok_or_else(|| usage.to_string())?;
-            Ok(Cli::Req(Request::Pause { secs }))
+            Ok(Cli::Req(Request::Pause { secs }, Output::Text))
         }
         "allow" => match rest {
-            [name] if !name.trim().is_empty() => {
-                Ok(Cli::Req(Request::AllowlistAdd { name: name.clone() }))
-            }
+            [name] if !name.trim().is_empty() => Ok(Cli::Req(
+                Request::AllowlistAdd { name: name.clone() },
+                Output::Text,
+            )),
             _ => Err(
                 "\u{1F916} `olly allow` needs one process name, like `olly allow obs`.".to_string(),
             ),
@@ -259,19 +293,50 @@ fn fail(msg: &str) -> ! {
     std::process::exit(1)
 }
 
-fn client(req: Request) -> ! {
+/// What `--json` prints for every failure the tray should treat as "offline".
+fn offline() -> ! {
+    println!("{{\"offline\":true}}");
+    std::process::exit(1)
+}
+
+fn client(req: Request, out: Output) -> ! {
+    let json = out == Output::Json;
     let socket = std::env::var("OLLY_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET.to_string());
     let Ok(mut stream) = UnixStream::connect(&socket) else {
+        if json {
+            offline()
+        }
         unreachable(&socket)
     };
     let line = serde_json::to_string(&req).expect("request serializes");
     if stream.write_all(format!("{line}\n").as_bytes()).is_err() {
+        if json {
+            offline()
+        }
         unreachable(&socket);
     }
     let watching = req == Request::Subscribe;
-    let _ = stream.set_read_timeout((!watching).then_some(Duration::from_secs(10)));
+    let timeout = if json {
+        Duration::from_millis(1000)
+    } else {
+        Duration::from_secs(10)
+    };
+    let _ = stream.set_read_timeout((!watching).then_some(timeout));
     let mut lines = BufReader::new(stream).lines();
     let mut next = || lines.next().and_then(Result::ok);
+    if json {
+        let Some(v) = next().and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+        else {
+            offline()
+        };
+        if v["ok"] != true {
+            let msg = v["error"].as_str().unwrap_or("olly said no.");
+            println!("{}", serde_json::json!({ "error": msg }));
+            std::process::exit(1);
+        }
+        println!("{}", v["data"]);
+        std::process::exit(0);
+    }
     let first = next().unwrap_or_else(|| fail("olly didn't answer."));
     let v: serde_json::Value =
         serde_json::from_str(&first).unwrap_or_else(|_| fail("olly's answer wasn't readable."));
@@ -302,7 +367,7 @@ fn client(req: Request) -> ! {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_cli(&args) {
-        Ok(Cli::Req(req)) => client(req),
+        Ok(Cli::Req(req, out)) => client(req, out),
         Ok(Cli::Local(LocalCmd::Help)) => println!("{USAGE}"),
         Ok(Cli::Local(LocalCmd::Daemon { config, root })) => {
             let (cfg, cfg_err) = olly::config::load(&config);
@@ -326,7 +391,7 @@ mod tests {
 
     fn req(s: &str) -> Request {
         match p(s) {
-            Ok(Cli::Req(r)) => r,
+            Ok(Cli::Req(r, Output::Text)) => r,
             other => panic!("{s}: {other:?}"),
         }
     }
@@ -368,6 +433,27 @@ mod tests {
                 root: "/".into()
             }))
         );
+    }
+
+    #[test]
+    fn parses_json_flag() {
+        assert_eq!(
+            p("status --json"),
+            Ok(Cli::Req(Request::Status, Output::Json))
+        );
+        let inc = || Request::Incidents {
+            limit: 20,
+            offset: 0,
+        };
+        assert_eq!(
+            p("incidents -n 20 --json"),
+            Ok(Cli::Req(inc(), Output::Json))
+        );
+        assert_eq!(
+            p("incidents --json -n 20"),
+            Ok(Cli::Req(inc(), Output::Json))
+        );
+        assert!(p("kill 2 --json").is_err());
     }
 
     #[test]
