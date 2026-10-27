@@ -116,9 +116,11 @@ fn install_ships_update_copies() {
 #[test]
 fn uninstall_removes_update_files() {
     let un = read("scripts/uninstall.sh");
-    assert!(un.contains("/usr/local/share/olly"), "{un}");
-    assert!(un.contains("/var/lib/olly/update"), "{un}");
-    assert!(un.contains("/var/lib/olly/update-result.json"), "{un}");
+    assert!(
+        has_line(&un, "sudo rm -rf /usr/local/share/olly /var/lib/olly/update"),
+        "{un}"
+    );
+    assert!(has_line(&un, "sudo rm -f /var/lib/olly/update-result.json"), "{un}");
 }
 
 #[test]
