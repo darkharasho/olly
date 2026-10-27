@@ -451,19 +451,22 @@ fn open_journal(layout: &Layout) -> Found {
     let path = layout.journal_path();
     let mut f = match fs::File::open(&path) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Found::Nothing,
+        // No journal, or no directory one could be in.
+        Err(e)
+            if e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR) =>
+        {
+            return Found::Nothing
+        }
         Err(e) => return Found::Unreadable(err("read", &path, e)),
     };
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Found::Busy;
     }
     // A supervisor that renamed a fresh journal in between holds that one's lock.
-    let same = match (f.metadata(), fs::metadata(&path)) {
-        (Ok(a), Ok(b)) => a.ino() == b.ino() && a.dev() == b.dev(),
-        _ => false,
-    };
-    if !same {
-        return Found::Busy;
+    match (f.metadata(), fs::metadata(&path)) {
+        (Ok(a), Ok(b)) if a.ino() == b.ino() && a.dev() == b.dev() => {}
+        (_, Err(e)) if e.kind() == io::ErrorKind::NotFound => return Found::Nothing,
+        _ => return Found::Busy,
     }
     let mut text = String::new();
     match f
@@ -475,7 +478,8 @@ fn open_journal(layout: &Layout) -> Found {
     }
 }
 
-/// Undoes (`from == current`) or keeps (`to == current`) the swap a journal describes. `None`
+/// Undoes (`from == current`) or keeps (`to == current`) the swap a journal describes, with
+/// the paths an undo couldn't put back (their `.prev` is then the only good copy). `None`
 /// when it is for another version, so nothing is known about its files. `reload` runs after
 /// an old unit file went back.
 fn settle(
@@ -484,7 +488,7 @@ fn settle(
     current: &str,
     wall_ms: u64,
     reload: &mut dyn FnMut(),
-) -> Option<LastUpdate> {
+) -> Option<(LastUpdate, Vec<String>)> {
     if j.from == current {
         // The old binary runs, so the swap never finished: undo it.
         eprintln!(
@@ -503,18 +507,17 @@ fn settle(
         } else {
             vec![not_restored_problem(&not_restored)]
         };
-        Some(LastUpdate {
+        let r = LastUpdate {
             message: rollback_message(&j.from, &problems),
             from: j.from.clone(),
             to: j.to.clone(),
             ok: false,
             at_wall_ms: wall_ms,
             widget_changed: false,
-        })
+        };
+        Some((r, not_restored))
     } else if j.to == current {
-        // The new binary runs, so the supervisor died after the restart: keep it. The
-        // `.prev` copies stay until the daemon has run a while (`drop_backups`), in case
-        // the new binary turns out broken.
+        // The new binary runs, so the supervisor died after the restart: keep it.
         eprintln!(
             "\u{1F916} the update to {} finished without its supervisor; keeping it",
             j.to
@@ -523,18 +526,23 @@ fn settle(
         let widget = &items[WIDGET].dst;
         let old_widget = widget_version(&sibling(widget, ".prev"));
         let widget_changed = old_widget.is_none() || widget_version(widget) != old_widget;
-        for it in &items {
+        for mut it in items {
             let _ = remove_any(&it.new_path());
             let _ = remove_any(&sibling(&it.prev(), ".tmp"));
+            if exists(&it.prev()) {
+                it.backed_up = Some(true);
+                it.drop_backup();
+            }
         }
-        Some(LastUpdate {
+        let r = LastUpdate {
             message: format!("updated to {}! \u{2728}", j.to),
             from: j.from.clone(),
             to: j.to.clone(),
             ok: true,
             at_wall_ms: wall_ms,
             widget_changed,
-        })
+        };
+        Some((r, Vec::new()))
     } else {
         None
     }
@@ -543,7 +551,8 @@ fn settle(
 /// Finishes or undoes a swap whose supervisor died, from the daemon (on start, and when an
 /// install times out). `current` is the running daemon's version; `reload` runs
 /// `systemctl daemon-reload`. Returns the result it wrote, if any. Leaves a swap alone while
-/// its supervisor still holds the journal lock.
+/// its supervisor still holds the journal lock. When some files couldn't be put back, the
+/// journal stays, so their `.prev` copies are kept and the undo is tried again next start.
 pub fn recover(
     layout: &Layout,
     current: &str,
@@ -562,7 +571,7 @@ pub fn recover(
         }
         Found::Swap(j, f) => (j, f),
     };
-    let Some(result) = settle(layout, &j, current, wall_ms, reload) else {
+    let Some((result, not_restored)) = settle(layout, &j, current, wall_ms, reload) else {
         eprintln!(
             "olly: found an interrupted update from {} to {}, but I'm {current}; leaving its files as they are",
             j.from, j.to
@@ -570,22 +579,11 @@ pub fn recover(
         return None;
     };
     write_result(layout, &result);
-    remove_journal(layout);
+    if not_restored.is_empty() {
+        remove_journal(layout);
+    }
     drop(lock);
     Some(result)
-}
-
-/// Removes the `.prev` copies a recovered update kept. Does nothing while a journal exists.
-pub fn drop_backups(layout: &Layout) {
-    if exists(&layout.journal_path()) {
-        return;
-    }
-    for mut it in items(layout, Path::new("")) {
-        if exists(&it.prev()) {
-            it.backed_up = Some(true);
-            it.drop_backup();
-        }
-    }
 }
 
 fn write_result(layout: &Layout, r: &LastUpdate) {
@@ -633,28 +631,34 @@ pub fn supervise(
 ) -> LastUpdate {
     // A journal left by an interrupted swap is settled first, so the backups made below are
     // of what actually runs now.
+    let stay = |host: &mut dyn Host, why: String| {
+        finish(
+            layout,
+            host,
+            None,
+            false,
+            LastUpdate {
+                from: from.to_string(),
+                to: to.to_string(),
+                ok: false,
+                at_wall_ms: 0,
+                message: format!("{why}, so I stayed on {from}."),
+                widget_changed: false,
+            },
+        )
+    };
     match open_journal(layout) {
         Found::Nothing => {}
-        Found::Busy => {
-            return finish(
-                layout,
-                host,
-                None,
-                LastUpdate {
-                    from: from.to_string(),
-                    to: to.to_string(),
-                    ok: false,
-                    at_wall_ms: 0,
-                    message: format!(
-                        "another update is still swapping files, so I stayed on {from}."
-                    ),
-                    widget_changed: false,
-                },
-            );
-        }
+        Found::Busy => return stay(host, "another update is still swapping files".into()),
         Found::Unreadable(e) => {
-            eprintln!("\u{1F916} {e}; starting over");
-            remove_journal(layout);
+            eprintln!("\u{1F916} {e}");
+            return stay(
+                host,
+                format!(
+                    "an earlier update left {} and I can't read it",
+                    layout.journal_path().display()
+                ),
+            );
         }
         Found::Swap(j, lock) => {
             let wall = host.wall_ms();
@@ -663,11 +667,23 @@ pub fn supervise(
                     eprintln!("\u{1F916} {e}");
                 }
             };
-            if settle(layout, &j, from, wall, &mut reload).is_none() {
-                eprintln!(
+            match settle(layout, &j, from, wall, &mut reload) {
+                // Their `.prev` copies are the only good ones: keep the journal and stop.
+                Some((_, not_restored)) if !not_restored.is_empty() => {
+                    drop(lock);
+                    return stay(
+                        host,
+                        format!(
+                            "an earlier update left files I couldn't put back ({})",
+                            not_restored.join(", ")
+                        ),
+                    );
+                }
+                Some(_) => {}
+                None => eprintln!(
                     "\u{1F916} found an interrupted update from {} to {}; starting over",
                     j.from, j.to
-                );
+                ),
             }
             remove_journal(layout);
             drop(lock);
@@ -706,6 +722,8 @@ pub fn supervise(
         }
     };
 
+    // Set when a rollback couldn't put every file back: their `.prev` is the only good copy.
+    let mut stranded = false;
     // `None` on success; otherwise what went wrong with the rollback, if anything.
     let swapped = swap(&mut items, host);
     let rollback: Option<Vec<String>> = match swapped {
@@ -730,6 +748,7 @@ pub fn supervise(
                     not_restored.join(", ")
                 );
                 problems.push(not_restored_problem(&not_restored));
+                stranded = true;
             }
             if items[UNIT].installed && unit_changed {
                 if let Err(e) = host.daemon_reload() {
@@ -773,7 +792,7 @@ pub fn supervise(
         message,
         widget_changed: ok && widget_changed,
     };
-    finish(layout, host, journal, result)
+    finish(layout, host, journal, stranded, result)
 }
 
 fn stayed_message(to: &str, from: &str, problems: &[String]) -> String {
@@ -785,18 +804,22 @@ fn stayed_message(to: &str, from: &str, problems: &[String]) -> String {
     }
 }
 
-/// Stamps and writes the result, drops the journal, and tells the daemon.
+/// Stamps and writes the result, removes the journal unless `keep_journal`, and tells the
+/// daemon.
 fn finish(
     layout: &Layout,
     host: &mut dyn Host,
     journal: Option<fs::File>,
+    keep_journal: bool,
     mut result: LastUpdate,
 ) -> LastUpdate {
     result.at_wall_ms = host.wall_ms();
     write_result(layout, &result);
     // Removed before the lock is released, so recovery never sees a finished swap.
     if let Some(lock) = journal {
-        remove_journal(layout);
+        if !keep_journal {
+            remove_journal(layout);
+        }
         drop(lock);
     }
     host.notify_finished();
@@ -1378,13 +1401,9 @@ mod tests {
             read(&l.share.join("plasmoid/contents/ui/main.qml")),
             "new-qml"
         );
-        // The old copies stay until olly has run a while.
-        assert_eq!(read(&l.bin.join("olly.prev")), "old-olly");
+        assert_eq!(all_leftovers(l), Vec::<String>::new());
         assert_eq!(saved(l), r);
         assert!(!l.journal_path().exists());
-        drop_backups(l);
-        assert_eq!(all_leftovers(l), Vec::<String>::new());
-        assert_eq!(read(&l.bin.join("olly")), "new-olly");
     }
 
     #[test]
@@ -1439,21 +1458,14 @@ mod tests {
     }
 
     #[test]
-    fn recover_reads_the_journal_it_locked() {
+    fn recover_leaves_an_unreadable_journal_alone() {
         let e = interrupted();
         let l = &e.layout;
-        // Garbage at the path is reported, not acted on, and the files stay put.
+        // Garbage is reported, not acted on, and the files stay put.
         write(&l.journal_path(), "not json");
         assert_eq!(recover(l, "0.1.0", 42, &mut || {}), None);
         assert_eq!(read(&l.bin.join("olly")), "new-olly");
         assert_eq!(read(&l.bin.join("olly.prev")), "old-olly");
-    }
-
-    #[test]
-    fn drop_backups_waits_for_the_journal() {
-        let e = interrupted();
-        drop_backups(&e.layout);
-        assert_eq!(read(&e.layout.bin.join("olly.prev")), "old-olly");
     }
 
     #[test]
@@ -1528,5 +1540,153 @@ mod tests {
         assert_old(l);
         assert_eq!(h.count("restart_olly"), 0);
         assert_eq!(h.count("reset_failed"), 0);
+    }
+
+    /// Makes `dir` read-only, so renames in it fail; `None` as root, where that doesn't hold.
+    fn lock_dir(dir: &Path) -> Option<()> {
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        Some(())
+    }
+
+    fn unlock_dir(dir: &Path) {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_journal_stops_the_update() {
+        let e = interrupted();
+        let l = &e.layout;
+        write(&l.journal_path(), "not json");
+        let mut h = FakeHost::new(&[Some("0.2.0")]);
+        let r = supervise(l, &e.staged, "0.1.0", "0.2.0", &mut h);
+        assert!(!r.ok);
+        assert!(
+            r.message
+                .ends_with("and I can't read it, so I stayed on 0.1.0."),
+            "{}",
+            r.message
+        );
+        assert!(l.journal_path().exists());
+        assert_eq!(read(&l.bin.join("olly.prev")), "old-olly");
+        assert_eq!(h.count("restart_olly"), 0);
+    }
+
+    #[test]
+    fn recover_keeps_the_journal_when_files_stay_stranded() {
+        let e = interrupted();
+        let l = &e.layout;
+        let Some(()) = lock_dir(&l.share) else { return };
+        let r = recover(l, "0.1.0", 42, &mut || {}).expect("a result");
+        unlock_dir(&l.share);
+        assert!(!r.ok);
+        assert!(
+            r.message.contains("some files couldn't be restored"),
+            "{}",
+            r.message
+        );
+        // The share copies are still only at `.prev`, so the journal stays for another try.
+        assert!(l.journal_path().exists());
+        assert_eq!(
+            read(&l.share.join("olly-notify.service.prev")),
+            "old-notify-unit"
+        );
+        assert_eq!(read(&l.bin.join("olly")), "old-olly");
+
+        // Next start, with the directory writable again, finishes the undo.
+        recover(l, "0.1.0", 43, &mut || {}).expect("a result");
+        assert_old(l);
+        assert!(!l.journal_path().exists());
+    }
+
+    #[test]
+    fn a_stranded_undo_stops_the_next_update_without_touching_backups() {
+        let e = interrupted();
+        let l = &e.layout;
+        let Some(()) = lock_dir(&l.share) else { return };
+        let mut h = FakeHost::new(&[Some("0.2.0")]);
+        let r = supervise(l, &e.staged, "0.1.0", "0.2.0", &mut h);
+        unlock_dir(&l.share);
+        assert!(!r.ok);
+        assert!(
+            r.message
+                .starts_with("an earlier update left files I couldn't put back"),
+            "{}",
+            r.message
+        );
+        assert!(
+            r.message.ends_with("so I stayed on 0.1.0."),
+            "{}",
+            r.message
+        );
+        assert!(l.journal_path().exists());
+        assert_eq!(
+            read(&l.share.join("olly-notify.service.prev")),
+            "old-notify-unit"
+        );
+        assert_eq!(
+            read(&l.share.join("plasmoid.prev/contents/ui/main.qml")),
+            "old-qml"
+        );
+        assert_eq!(h.count("restart_olly"), 0);
+    }
+
+    #[test]
+    fn a_stranded_rollback_keeps_the_journal() {
+        let e = env();
+        let l = &e.layout;
+        // The new olly never answers; by rollback time the share dir is read-only, so the
+        // old share files can't go back.
+        struct LockingHost(FakeHost, PathBuf);
+        impl Host for LockingHost {
+            fn daemon_reload(&mut self) -> Result<(), String> {
+                self.0.daemon_reload()
+            }
+            fn reset_failed(&mut self) -> Result<(), String> {
+                self.0.reset_failed()
+            }
+            fn restart_olly(&mut self) -> Result<(), String> {
+                if self.0.count("restart_olly") == 0 {
+                    lock_dir(&self.1);
+                }
+                self.0.restart_olly()
+            }
+            fn status_version(&mut self) -> Option<String> {
+                self.0.status_version()
+            }
+            fn notify_finished(&mut self) {
+                self.0.notify_finished()
+            }
+            fn sleep_ms(&mut self, ms: u64) {
+                self.0.sleep_ms(ms)
+            }
+            fn wall_ms(&mut self) -> u64 {
+                self.0.wall_ms()
+            }
+        }
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let mut h = LockingHost(FakeHost::new(&[Some("0.1.0")]), l.share.clone());
+        let r = supervise(l, &e.staged, "0.1.0", "0.2.0", &mut h);
+        unlock_dir(&l.share);
+        assert!(!r.ok);
+        assert!(
+            r.message.contains("some files couldn't be restored"),
+            "{}",
+            r.message
+        );
+        assert!(l.journal_path().exists());
+        assert_eq!(
+            read(&l.share.join("olly-notify.service.prev")),
+            "old-notify-unit"
+        );
+
+        // The daemon's next start finishes putting them back.
+        recover(l, "0.1.0", 43, &mut || {}).expect("a result");
+        assert_old(l);
+        assert!(!l.journal_path().exists());
     }
 }

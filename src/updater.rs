@@ -23,8 +23,6 @@ const FRESH_RESULT_MS: u64 = 10 * 60 * 1000;
 const WORKER_STACK: usize = 256 * 1024;
 /// An install with no result after this long (monotonic ms) is given up on.
 pub const INSTALL_TIMEOUT_MS: u64 = 600_000;
-/// How long olly runs before it drops the backups a recovered update kept.
-pub const KEEP_BACKUPS_MS: u64 = 600_000;
 const WORKER_LOST: &str = "update worker stopped unexpectedly";
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
@@ -69,8 +67,6 @@ pub struct Updater {
     installing_since: Option<u64>,
     /// The same moment, monotonic ms, for the install timeout.
     installing_mono: Option<u64>,
-    /// The backups a recovered update kept are gone (or there never were any to drop).
-    backups_dropped: bool,
     tx: mpsc::Sender<Done>,
     rx: mpsc::Receiver<Done>,
 }
@@ -128,7 +124,6 @@ impl Updater {
             emitted_at: None,
             installing_since: None,
             installing_mono: None,
-            backups_dropped: false,
             tx,
             rx,
         }
@@ -225,20 +220,6 @@ impl Updater {
                 supervise::recover(&layout, CURRENT, wall_ms, &mut reloader(live)).is_some(),
             )
         })
-    }
-
-    /// Once olly has run `KEEP_BACKUPS_MS` with no update going, drops the backups a
-    /// recovered update kept. Small file work; the caller only asks when things are calm.
-    pub fn drop_backups_when_settled(&mut self, now: u64) {
-        if self.backups_dropped
-            || now < KEEP_BACKUPS_MS
-            || self.state != UpdateState::Idle
-            || self.launching
-        {
-            return;
-        }
-        self.backups_dropped = true;
-        supervise::drop_backups(&self.layout);
     }
 
     /// The supervisor never reported back (killed, or the machine was busy): give up on the
