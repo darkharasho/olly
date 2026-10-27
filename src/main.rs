@@ -25,7 +25,16 @@ const USAGE: &str = "\u{1F916} here's what I can do:
 
 #[derive(Debug, PartialEq)]
 enum LocalCmd {
-    Daemon { config: PathBuf, root: PathBuf },
+    Daemon {
+        config: PathBuf,
+        root: PathBuf,
+    },
+    /// Hidden: run by the daemon in its own transient unit to swap in a staged release.
+    Supervise {
+        root: PathBuf,
+        from: String,
+        to: String,
+    },
     Help,
 }
 
@@ -163,6 +172,17 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             }
             Ok(Cli::Local(LocalCmd::Daemon { config, root }))
         }
+        "update-supervise" => match rest {
+            [root, from, to] => Ok(Cli::Local(LocalCmd::Supervise {
+                root: PathBuf::from(root),
+                from: from.clone(),
+                to: to.clone(),
+            })),
+            _ => Err(
+                "\u{1F916} `olly update-supervise` needs a staged folder, the old version and the new one."
+                    .to_string(),
+            ),
+        },
         other => Err(format!("\u{1F916} I don't know `{other}`.\n{USAGE}")),
     }
 }
@@ -404,6 +424,11 @@ fn main() {
             let (cfg, cfg_err) = olly::config::load(&config);
             olly::daemon::run(cfg, cfg_err, root)
         }
+        Ok(Cli::Local(LocalCmd::Supervise { root, from, to })) => {
+            use olly::supervise::{supervise, Layout, SystemHost};
+            let result = supervise(&Layout::system(), &root, &from, &to, &mut SystemHost);
+            std::process::exit(if result.ok { 0 } else { 1 })
+        }
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(2);
@@ -464,6 +489,20 @@ mod tests {
                 root: "/".into()
             }))
         );
+    }
+
+    #[test]
+    fn parses_hidden_update_supervise() {
+        assert_eq!(
+            p("update-supervise /x 0.1.0 0.2.0"),
+            Ok(Cli::Local(LocalCmd::Supervise {
+                root: "/x".into(),
+                from: "0.1.0".into(),
+                to: "0.2.0".into()
+            }))
+        );
+        assert!(p("update-supervise /x 0.1.0").is_err());
+        assert!(!USAGE.contains("supervise"));
     }
 
     #[test]

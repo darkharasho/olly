@@ -10,5 +10,6 @@ pub mod ipc;
 pub mod procfs;
 pub mod psi;
 pub mod sample;
+pub mod supervise;
 pub mod update;
 pub mod voice;
