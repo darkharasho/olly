@@ -10,6 +10,11 @@ if [ "$#" -ne 1 ]; then
 fi
 tag="$1"
 
+if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "🤖 tag $tag isn't a plain vX.Y.Z release tag, so I won't release it." >&2
+    exit 1
+fi
+
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)

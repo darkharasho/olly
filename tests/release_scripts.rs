@@ -103,6 +103,17 @@ fn check_passes_on_match() {
 }
 
 #[test]
+fn check_refuses_tags_that_are_not_plain_versions() {
+    let r = Repo::new("prerelease", "0.2.0-rc1");
+    r.commit("feat: x");
+    for tag in ["v0.2.0-rc1", "0.2.0-rc1", "v0.2", "v0.2.0.1"] {
+        let o = r.run("release-check.sh", &[tag]);
+        assert!(!o.status.success(), "{tag}");
+        assert!(stderr(&o).contains("vX.Y.Z"), "{tag}: {}", stderr(&o));
+    }
+}
+
+#[test]
 fn check_fails_when_widget_changed_without_bump() {
     let r = Repo::new("widget", "0.2.0");
     r.commit("feat: first");

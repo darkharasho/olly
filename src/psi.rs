@@ -32,7 +32,8 @@ impl PsiTrigger {
         if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut st) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        if st.f_type != libc::PROC_SUPER_MAGIC {
+        // f_type and the magic differ in type between glibc and musl.
+        if st.f_type as u64 != libc::PROC_SUPER_MAGIC as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{} is not a procfs pressure file", path.display()),
