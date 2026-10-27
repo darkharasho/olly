@@ -515,37 +515,45 @@ fn status_of(socket: &str) -> Option<StatusData> {
     serde_json::from_value(v["data"].clone()).ok()
 }
 
+/// Has olly look for a release now; exits on a refusal.
+fn check_now(socket: &str) -> Option<UpdateInfo> {
+    // The daemon waits up to 75 s for the fetch.
+    let v = match ask(socket, &Request::UpdateCheck, Duration::from_secs(80)) {
+        Ok(v) => v,
+        Err(AskErr::Unreachable) => unreachable(socket),
+        Err(AskErr::NoAnswer) => fail("olly didn't answer."),
+    };
+    if v["ok"] != true {
+        fail(v["error"].as_str().unwrap_or("olly said no."));
+    }
+    match serde_json::from_value::<Option<UpdateInfo>>(v["data"].clone()) {
+        Ok(info) => info,
+        Err(e) => fail(&format!("olly's answer wasn't what I expected: {e}")),
+    }
+}
+
+fn current_version(socket: &str) -> String {
+    status_of(socket)
+        .map(|st| st.version)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
 fn update_cmd(mode: UpdateMode) -> ! {
     let socket = socket_path();
     if mode == UpdateMode::Check {
-        // The daemon waits up to 75 s for the fetch.
-        let v = match ask(&socket, &Request::UpdateCheck, Duration::from_secs(80)) {
-            Ok(v) => v,
-            Err(AskErr::Unreachable) => unreachable(&socket),
-            Err(AskErr::NoAnswer) => fail("olly didn't answer."),
-        };
-        if v["ok"] != true {
-            fail(v["error"].as_str().unwrap_or("olly said no."));
-        }
-        let current = status_of(&socket)
-            .map(|st| st.version)
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-        let data = serde_json::from_value::<Option<UpdateInfo>>(v["data"].clone());
-        match data {
-            Ok(info) => {
-                println!("{}", render_check(info.as_ref(), &current));
-                std::process::exit(0)
-            }
-            Err(e) => {
-                eprintln!("\u{1F916} olly's answer wasn't what I expected: {e}");
-                std::process::exit(1)
-            }
-        }
+        let info = check_now(&socket);
+        println!("{}", render_check(info.as_ref(), &current_version(&socket)));
+        std::process::exit(0)
     }
     let Some(before) = status_of(&socket) else {
         unreachable(&socket)
     };
+    // olly only looks every few hours, so look now rather than say there's nothing.
+    if before.update.is_none() && check_now(&socket).is_none() {
+        println!("{}", render_check(None, &current_version(&socket)));
+        std::process::exit(0)
+    }
     let baseline = before.last_update.as_ref().map_or(0, |l| l.at_wall_ms);
     let asked_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
