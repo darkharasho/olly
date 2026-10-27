@@ -45,6 +45,7 @@ Rectangle {
             PlasmaComponents3.Label {
                 Layout.fillWidth: true
                 text: Logic.incidentSummary(row.incident)
+                textFormat: Text.PlainText
                 wrapMode: Text.Wrap
                 maximumLineCount: row.expanded ? 100 : 2
                 elide: Text.ElideRight
@@ -54,6 +55,7 @@ Rectangle {
                 Layout.fillWidth: true
                 visible: !row.expanded
                 text: Logic.incidentSub(row.incident)
+                textFormat: Text.PlainText
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                 color: Kirigami.Theme.disabledTextColor
                 elide: Text.ElideRight
@@ -66,6 +68,7 @@ Rectangle {
                     required property var modelData
                     Layout.fillWidth: true
                     text: Logic.actionLine(modelData)
+                    textFormat: Text.PlainText
                     font.pointSize: Kirigami.Theme.smallFont.pointSize
                     elide: Text.ElideRight
                 }
@@ -74,8 +77,10 @@ Rectangle {
             PlasmaComponents3.Label {
                 Layout.fillWidth: true
                 visible: row.expanded
-                text: row.incident.diagnosis ? "Claude: " + row.incident.diagnosis
-                                             : Logic.incidentSub(row.incident)
+                text: row.incident.diagnosis && String(row.incident.diagnosis).trim() !== ""
+                      ? "Claude: " + String(row.incident.diagnosis).trim()
+                      : Logic.incidentSub(row.incident)
+                textFormat: Text.PlainText
                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                 color: Kirigami.Theme.disabledTextColor
                 wrapMode: Text.Wrap

@@ -71,10 +71,20 @@ fn install_adds_the_tray_face_per_user_with_install_fallback() {
         .lines()
         .find(|l| l.contains("kpackagetool6 --type Plasma/Applet --upgrade plasmoid/package"))
         .unwrap_or_else(|| panic!("missing kpackagetool6 --upgrade: {install}"));
-    assert!(!line.contains("sudo"), "tray install must be per-user: {line}");
+    assert!(
+        !line.contains("sudo"),
+        "tray install must be per-user: {line}"
+    );
     assert!(
         line.contains("|| kpackagetool6 --type Plasma/Applet --install plasmoid/package"),
         "missing --install fallback: {line}"
+    );
+    assert!(
+        has_line(
+            &install,
+            "if command -v kpackagetool6 >/dev/null 2>&1; then"
+        ),
+        "the tray install must be skipped without kpackagetool6: {install}"
     );
     assert!(!install.contains("plasmashell --replace"), "{install}");
     assert!(!install.contains("kquitapp"), "{install}");
@@ -87,6 +97,6 @@ fn uninstall_removes_the_tray_face_without_failing() {
         .lines()
         .find(|l| l.contains("kpackagetool6 --type Plasma/Applet --remove org.olly.tray"))
         .unwrap_or_else(|| panic!("missing kpackagetool6 --remove: {un}"));
-    assert!(line.contains("|| true"), "{line}");
+    assert!(line.contains("2>/dev/null || true"), "{line}");
     assert!(!line.contains("sudo"), "{line}");
 }

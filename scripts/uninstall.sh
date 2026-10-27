@@ -27,7 +27,8 @@ if [ -e /etc/systemd/system/olly.service ]; then
 fi
 
 if command -v kpackagetool6 >/dev/null 2>&1; then
-    kpackagetool6 --type Plasma/Applet --remove org.olly.tray || true
+    kpackagetool6 --type Plasma/Applet --remove org.olly.tray 2>/dev/null || true
+    echo "🤖 tray face tidied away (if it was there)."
 fi
 
 rm -f "$HOME/.config/systemd/user/olly-notify.service"

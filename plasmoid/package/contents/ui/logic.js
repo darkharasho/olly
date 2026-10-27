@@ -111,9 +111,21 @@ function incidentSummary(inc) {
     return (inc && inc.summary) ? inc.summary : "Something happened";
 }
 
+// The first non-blank line of a diagnosis, trimmed, without a leading
+// markdown heading "#"s or "- " bullet. "" when every line is blank.
+function firstLine(text) {
+    var lines = String(text).split(/\r?\n/);
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim().replace(/^#+\s*/, "").replace(/^-\s+/, "").trim();
+        if (line !== "")
+            return line;
+    }
+    return "";
+}
+
 function incidentSub(inc) {
-    if (inc && inc.diagnosis) {
-        var line = String(inc.diagnosis).split("\n")[0];
+    var line = (inc && inc.diagnosis) ? firstLine(inc.diagnosis) : "";
+    if (line !== "") {
         var s = "Claude: " + line;
         return s.length > 70 ? s.slice(0, 69) + "…" : s;
     }
@@ -122,6 +134,7 @@ function incidentSub(inc) {
 
 function needsCards(status, now) {
     var info = (status && status.frozen_info) || [];
+    var dryRun = !!(status && status.dry_run);
     var i, out = [];
     if (info.length) {
         for (i = 0; i < info.length; i++) {
@@ -131,14 +144,16 @@ function needsCards(status, now) {
                 name: f.name,
                 size: gb(f.bytes),
                 rateText: f.rate > 0 ? "it was growing " + gb(f.rate * 60) + "/min" : "",
-                countdown: countdown(f.kill_at_wall_ms, now)
+                countdown: countdown(f.kill_at_wall_ms, now),
+                dryRun: dryRun
             });
         }
         return out;
     }
     var frozen = (status && status.frozen) || [];
     for (i = 0; i < frozen.length; i++)
-        out.push({ id: frozen[i].id, name: frozen[i].name, size: gb(frozen[i].bytes), rateText: "", countdown: "" });
+        out.push({ id: frozen[i].id, name: frozen[i].name, size: gb(frozen[i].bytes), rateText: "", countdown: "",
+                  dryRun: dryRun });
     return out;
 }
 
@@ -190,7 +205,17 @@ function esc(text) {
 }
 
 // The two lines of a needs-you card. `head` is StyledText with the name escaped.
+// In a dry run the app was never really frozen, so say what olly would have done.
 function needsText(card) {
+    var rate = card.rateText ? " (" + card.rateText + ")" : "";
+    if (card.dryRun)
+        return {
+            head: "I would have frozen <b>" + esc(card.name) + "</b> at " + card.size + rate
+                + ". Dry run, so it's still running.",
+            sub: card.countdown
+                ? "In a real run I'd close it in " + card.countdown + " if you didn't pick."
+                : "In a real run I'd close it if you didn't pick."
+        };
     return {
         head: "<b>" + esc(card.name) + "</b> is frozen at " + card.size
             + (card.rateText ? " (" + card.rateText + ")" : "") + ".",
@@ -204,26 +229,33 @@ function frac(part, total) {
     return total > 0 ? Math.max(0, Math.min(1, part / total)) : 0;
 }
 
-// The three stat bars: {label, frac (0..1), color, value}.
+// The stat bars: {label, frac (0..1), color, value}. RAM always; Swap and
+// Pressure only when the daemon reports them (an older one doesn't), so the
+// popup never shows made-up zeros.
 function statRows(status) {
     var s = status || {};
     var ram = frac(s.mem_available || 0, s.mem_total || 0);
-    var swap = frac(s.swap_used || 0, s.swap_total || 0);
-    var p = s.some_avg10 || 0;
-    return [
-        { label: "RAM free", frac: ram, color: barColor("ram", ram), value: gb(s.mem_available || 0) },
-        { label: "Swap used", frac: swap, color: barColor("swap", swap), value: gb(s.swap_used || 0) },
-        { label: "Pressure", frac: frac(p, 100), color: barColor("pressure", p),
-          value: (p < 10 ? p.toFixed(1) : Math.round(p)) + "%" }
-    ];
+    var rows = [{ label: "RAM free", frac: ram, color: barColor("ram", ram), value: gb(s.mem_available || 0) }];
+    if (s.swap_total != null) {
+        var swap = frac(s.swap_used || 0, s.swap_total);
+        rows.push({ label: "Swap used", frac: swap, color: barColor("swap", swap), value: gb(s.swap_used || 0) });
+    }
+    if (s.some_avg10 != null) {
+        var p = s.some_avg10;
+        rows.push({ label: "Pressure", frac: frac(p, 100), color: barColor("pressure", p),
+                    value: (p < 10 ? p.toFixed(1) : Math.round(p)) + "%" });
+    }
+    return rows;
 }
 
-// One incident action `[wall_ms, {Name: {target, ...}}, dry_run]` as "HH:MM  Name target".
+// One incident action `[wall_ms, {Name: {target, ...}}, dry_run]` as "HH:MM  Name target",
+// with " (would have)" when it was a dry run.
 function actionLine(action) {
     var d = new Date(action[0]);
     var obj = action[1] || {};
     var name = Object.keys(obj)[0] || "";
     var target = (obj[name] && obj[name].target && obj[name].target.name) || "";
     var hh = d.getHours(), mm = d.getMinutes();
-    return (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm + "  " + name + " " + target;
+    return (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm + "  " + name + " " + target
+        + (action[2] ? " (would have)" : "");
 }

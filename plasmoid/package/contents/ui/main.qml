@@ -15,11 +15,15 @@ PlasmoidItem {
 
     property var status: null           // StatusData, or null when offline
     property var incidents: []          // kept across offline spells
-    property var seenIncidentId: undefined
+    property var seenIncidentId: undefined // last_incident_id the list was fetched for
+    property var fetchingIncidentId: undefined // last_incident_id the fetch in flight is for
     property double now: Date.now()
     property bool repoll: false         // an action finished while a poll was in flight
     property string actionError: ""
-    property var actionErrorTarget: null // frozen id for card actions, null for the footer
+    property var actionErrorTarget: null // frozen id of the failed card action, null for the footer
+    property var commandTargets: ({})    // action command -> frozen id (or null), set when connecting
+    // Back off while offline so a stalled daemon doesn't collect abandoned connections.
+    property int pollInterval: 2000
 
     readonly property string mood: Logic.mood(status, now)
 
@@ -41,8 +45,11 @@ PlasmoidItem {
             repoll = true;
     }
 
-    function fetchIncidents() {
-        connectOnce(incidentsCmd);
+    // `forId` is the last_incident_id this fetch is for. It only becomes
+    // seenIncidentId when the fetch succeeds, so a failed one is retried.
+    function fetchIncidents(forId) {
+        if (connectOnce(incidentsCmd))
+            fetchingIncidentId = forId;
     }
 
     // verb: "kill" | "unfreeze" (with a frozen id from status) | "pause" | "resume".
@@ -50,7 +57,7 @@ PlasmoidItem {
         var cmd = Logic.command(verb, id);
         if (cmd === "")
             return;
-        actionErrorTarget = (verb === "kill" || verb === "unfreeze") ? id : null;
+        commandTargets[cmd] = (verb === "kill" || verb === "unfreeze") ? id : null;
         connectOnce(cmd);
     }
 
@@ -58,23 +65,27 @@ PlasmoidItem {
         if (source === statusCmd) {
             now = Date.now();
             status = Logic.parseStatus(code, stdout);
-            if (status && status.last_incident_id !== seenIncidentId) {
-                seenIncidentId = status.last_incident_id;
-                fetchIncidents();
-            }
+            pollInterval = status ? 2000 : 5000;
+            if (status && status.last_incident_id !== seenIncidentId)
+                fetchIncidents(status.last_incident_id);
             if (repoll) {
                 repoll = false;
                 connectOnce(statusCmd);
             }
         } else if (source === incidentsCmd) {
             var list = Logic.parseIncidents(code, stdout);
-            if (list)
+            if (list) {
                 incidents = list;
+                seenIncidentId = fetchingIncidentId;
+            }
         } else {
+            var target = commandTargets.hasOwnProperty(source) ? commandTargets[source] : null;
+            delete commandTargets[source];
             if (code === 0) {
                 actionError = "";
                 errorTimer.stop();
             } else {
+                actionErrorTarget = target;
                 actionError = Logic.stripBot(stderr || "") || "Hmm, that didn't work.";
                 errorTimer.restart();
             }
@@ -82,7 +93,7 @@ PlasmoidItem {
         }
     }
 
-    onExpandedChanged: if (expanded) fetchIncidents()
+    onExpandedChanged: if (expanded) fetchIncidents(status ? status.last_incident_id : seenIncidentId)
 
     Plasma5Support.DataSource {
         id: exec
@@ -95,7 +106,7 @@ PlasmoidItem {
     }
 
     Timer {
-        interval: 2000
+        interval: root.pollInterval
         repeat: true
         running: true
         triggeredOnStart: true

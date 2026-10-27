@@ -108,6 +108,15 @@ test("relTime", () => {
   assert.equal(L.relTime(old2, now), "Jan 21");
 });
 
+test("relTime boundaries at 48 h and 7 d", () => {
+  const now = new Date(2025, 9, 15, 12, 0, 0).getTime();
+  const H = 3600000, D = 24 * H;
+  assert.equal(L.relTime(now - (48 * H - 1), now), "yesterday");
+  assert.equal(L.relTime(now - 48 * H, now), "Mon");
+  assert.equal(L.relTime(now - (7 * D - 1), now), "Wed");
+  assert.equal(L.relTime(now - 7 * D, now), "Oct 8");
+});
+
 test("countdown", () => {
   assert.equal(L.countdown(NOW + 252000, NOW), "4:12");
   assert.equal(L.countdown(NOW + 5000, NOW), "0:05");
@@ -134,6 +143,15 @@ test("incident_dot_and_sub_line_edge_cases", () => {
   assert.equal(L.incidentSummary({}), "Something happened");
 });
 
+test("incidentSub uses the first non-blank diagnosis line", () => {
+  assert.equal(L.incidentSub({ peak_full: 3, diagnosis: "\n  \nReal cause.\nMore." }), "Claude: Real cause.");
+  assert.equal(L.incidentSub({ peak_full: 3, diagnosis: "First line.\r\nSecond." }), "Claude: First line.");
+  assert.equal(L.incidentSub({ peak_full: 3, diagnosis: "## Heading here\nbody" }), "Claude: Heading here");
+  assert.equal(L.incidentSub({ peak_full: 3, diagnosis: "- a bullet\nbody" }), "Claude: a bullet");
+  assert.equal(L.incidentSub({ peak_full: 29.6, diagnosis: "\n \r\n\t\n" }), "peak stall 30%");
+  assert.equal(L.incidentSub({ peak_full: 3, diagnosis: "  padded  " }), "Claude: padded");
+});
+
 test("needs_cards_follow_frozen_info", () => {
   const fi = [
     { id: 5, name: "game.exe", bytes: 21_000_000_000, rate: 20_000_000, kill_at_wall_ms: NOW + 252000 },
@@ -141,11 +159,18 @@ test("needs_cards_follow_frozen_info", () => {
   ];
   const cards = L.needsCards(base({ frozen_info: fi, frozen: [{ id: 5 }, { id: 3 }] }), NOW);
   assert.deepEqual(cards.map((c) => c.id), [5, 3]);
-  assert.deepEqual(cards[0], { id: 5, name: "game.exe", size: "21 GB", rateText: "it was growing 1.2 GB/min", countdown: "4:12" });
+  assert.deepEqual(cards[0], { id: 5, name: "game.exe", size: "21 GB", rateText: "it was growing 1.2 GB/min", countdown: "4:12", dryRun: false });
   assert.equal(cards[1].rateText, "");
   assert.deepEqual(L.needsCards(base({ frozen_info: [] }), NOW), []);
   const old = L.needsCards({ frozen: [{ id: 2, name: "g", bytes: 21_000_000_000 }] }, NOW);
-  assert.deepEqual(old, [{ id: 2, name: "g", size: "21 GB", rateText: "", countdown: "" }]);
+  assert.deepEqual(old, [{ id: 2, name: "g", size: "21 GB", rateText: "", countdown: "", dryRun: false }]);
+});
+
+test("needs_cards_carry_dry_run", () => {
+  const fi = [{ id: 5, name: "chrome", bytes: 7.4e9, rate: 35e6, kill_at_wall_ms: NOW + 252000 }];
+  assert.equal(L.needsCards(base({ frozen_info: fi, dry_run: true }), NOW)[0].dryRun, true);
+  assert.equal(L.needsCards(base({ frozen_info: fi, dry_run: false }), NOW)[0].dryRun, false);
+  assert.equal(L.needsCards({ frozen: [{ id: 2, name: "g", bytes: 1 }], dry_run: true }, NOW)[0].dryRun, true);
 });
 
 test("stripBot", () => {
@@ -199,6 +224,18 @@ test("needsText", () => {
   assert.equal(o.sub, "I'll close it if you don't pick, sooner if memory gets really tight.");
 });
 
+test("needsText in dry run says what olly would have done", () => {
+  const t = L.needsText({ name: "chr<o>me", size: "7.4 GB", rateText: "it was growing 2.1 GB/min", countdown: "4:12", dryRun: true });
+  assert.equal(t.head, "I would have frozen <b>chr&lt;o&gt;me</b> at 7.4 GB (it was growing 2.1 GB/min). Dry run, so it's still running.");
+  assert.equal(t.sub, "In a real run I'd close it in 4:12 if you didn't pick.");
+  const o = L.needsText({ name: "g", size: "21 GB", rateText: "", countdown: "", dryRun: true });
+  assert.equal(o.head, "I would have frozen <b>g</b> at 21 GB. Dry run, so it's still running.");
+  assert.equal(o.sub, "In a real run I'd close it if you didn't pick.");
+  // Not dry run: the real copy, even when dryRun is explicitly false.
+  const r = L.needsText({ name: "g", size: "21 GB", rateText: "", countdown: "4:12", dryRun: false });
+  assert.equal(r.head, "<b>g</b> is frozen at 21 GB.");
+});
+
 test("statRows", () => {
   const r = L.statRows({ mem_available: 13.1e9, mem_total: 32e9, swap_used: 1.9e9, swap_total: 16e9, some_avg10: 0.4 });
   assert.deepEqual(r.map((x) => x.label), ["RAM free", "Swap used", "Pressure"]);
@@ -208,15 +245,27 @@ test("statRows", () => {
   const hot = L.statRows({ mem_available: 1.9e9, mem_total: 32e9, swap_used: 11.4e9, swap_total: 16e9, some_avg10: 22 });
   assert.deepEqual(hot.map((x) => x.color), [C.onit, C.worried, C.worried]);
   assert.equal(hot[2].value, "22%");
-  // Older daemon: no swap or pressure fields, and no swap at all.
+  // No swap at all (swap_total 0) still shows the row.
+  const noSwap = L.statRows({ mem_available: 1e9, mem_total: 2e9, swap_used: 0, swap_total: 0, some_avg10: 0 });
+  assert.deepEqual(noSwap.map((x) => x.frac), [0.5, 0, 0]);
+  assert.deepEqual(noSwap.map((x) => x.value), ["1.0 GB", "0 MB", "0.0%"]);
+});
+
+test("statRows hides rows an older daemon doesn't report", () => {
   const old = L.statRows({ mem_available: 1e9, mem_total: 2e9 });
-  assert.deepEqual(old.map((x) => x.frac), [0.5, 0, 0]);
-  assert.deepEqual(old.map((x) => x.value), ["1.0 GB", "0 MB", "0.0%"]);
-  assert.deepEqual(L.statRows(null).map((x) => x.frac), [0, 0, 0]);
+  assert.deepEqual(old.map((x) => x.label), ["RAM free"]);
+  const nulls = L.statRows({ mem_available: 1e9, mem_total: 2e9, swap_used: null, swap_total: null, some_avg10: null });
+  assert.deepEqual(nulls.map((x) => x.label), ["RAM free"]);
+  const swapOnly = L.statRows({ mem_available: 1e9, mem_total: 2e9, swap_used: 1e9, swap_total: 4e9 });
+  assert.deepEqual(swapOnly.map((x) => x.label), ["RAM free", "Swap used"]);
+  const psiOnly = L.statRows({ mem_available: 1e9, mem_total: 2e9, some_avg10: 5 });
+  assert.deepEqual(psiOnly.map((x) => x.label), ["RAM free", "Pressure"]);
+  assert.deepEqual(L.statRows(null).map((x) => x.label), ["RAM free"]);
 });
 
 test("actionLine", () => {
   const t = new Date(2026, 9, 27, 9, 5).getTime();
   assert.equal(L.actionLine([t, { Kill: { target: { name: "memhog" }, reason: "emergency" } }, false]), "09:05  Kill memhog");
-  assert.equal(L.actionLine([t, { Freeze: { target: { name: "chrome" } } }, true]), "09:05  Freeze chrome");
+  assert.equal(L.actionLine([t, { Freeze: { target: { name: "chrome" } } }, true]), "09:05  Freeze chrome (would have)");
+  assert.equal(L.actionLine([t, { Freeze: { target: { name: "chrome" } } }]), "09:05  Freeze chrome");
 });

@@ -57,6 +57,7 @@ Rectangle {
             Layout.fillWidth: true
             visible: card.app.actionError !== "" && card.app.actionErrorTarget === card.info.id
             text: card.app.actionError
+            textFormat: Text.PlainText
             color: Kirigami.Theme.negativeTextColor
             wrapMode: Text.Wrap
         }

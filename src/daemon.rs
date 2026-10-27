@@ -1044,12 +1044,8 @@ mod tests {
         ));
     }
 
-    /// A real `Daemon` on fake proc files, driven to a freeze through the engine.
-    #[test]
-    fn status_fills_tray_fields() {
-        const GIB: u64 = 1 << 30;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
+    /// A real dry-run `Daemon` on fake proc files under `root`.
+    fn test_daemon(root: &std::path::Path) -> Daemon {
         fs::create_dir_all(root.join("proc/pressure")).unwrap();
         fs::write(
             root.join("proc/meminfo"),
@@ -1061,12 +1057,13 @@ mod tests {
             "some avg10=4.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
         )
         .unwrap();
+        let root = root.to_path_buf();
         let cfg = Config {
             dry_run: true,
             ..Config::default()
         };
         let (claude_tx, claude_rx) = mpsc::channel();
-        let mut d = Daemon {
+        Daemon {
             sampler: Sampler::new(root.clone(), cfg.desktop_uid),
             hist: History::new(&cfg.growth),
             leak: LeakWatch::new(&cfg.growth),
@@ -1092,7 +1089,33 @@ mod tests {
             leak_seen: HashMap::new(),
             start: Instant::now(),
             cfg,
-        };
+        }
+    }
+
+    #[test]
+    fn incident_end_updates_last_incident_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        assert_eq!(d.status().last_incident_id, None);
+        d.process(StepOutput {
+            actions: vec![],
+            events: vec![Event::IncidentStart { id: 7, t_ms: 0 }],
+        });
+        // Still open: nothing new for the tray to fetch yet.
+        assert_eq!(d.status().last_incident_id, None);
+        d.process(StepOutput {
+            actions: vec![],
+            events: vec![Event::IncidentEnd { id: 7, t_ms: 1000 }],
+        });
+        assert_eq!(d.status().last_incident_id, Some(7));
+    }
+
+    /// A real `Daemon` on fake proc files, driven to a freeze through the engine.
+    #[test]
+    fn status_fills_tray_fields() {
+        const GIB: u64 = 1 << 30;
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
         let leak = |t: u64| AppSample {
             key: AppKey {
                 cgroup: "/leaky".into(),

@@ -24,8 +24,13 @@ if command -v podman >/dev/null; then
     # Those warnings are expected: only error lines and syntax problems fail.
     # qmllint reports a syntax error as "Warning: file:line:col: ... [syntax]",
     # and prints source lines as context, so match the prefix and the tag only.
+    # qmllint exits non-zero on warnings, so its status can't gate the run. The
+    # marker is printed after it, and only if it really ran (126/127 mean the
+    # binary is missing or not executable), so a missing qmllint fails the gate.
     out=$(podman run --rm -v "$PWD/plasmoid/package/contents/ui:/ui:ro,Z" registry.fedoraproject.org/fedora:latest \
-        sh -c 'dnf -y -q install qt6-qtdeclarative-devel >/dev/null 2>&1 && echo "qmllint ran" && /usr/lib64/qt6/bin/qmllint /ui/*.qml' 2>&1) || true
+        sh -c 'dnf -y -q install qt6-qtdeclarative-devel >/dev/null 2>&1 || exit 1
+               /usr/lib64/qt6/bin/qmllint /ui/*.qml; rc=$?
+               if [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ]; then echo "qmllint ran"; fi' 2>&1) || true
     if grep -E '^Error|\[syntax\]' <<<"$out"; then
         echo "🤖 qmllint found errors" >&2
         exit 1

@@ -21,6 +21,14 @@ ColumnLayout {
     readonly property var stats: Logic.statRows(status)
     readonly property var shown: app.incidents.slice(0, showAll ? 20 : 3)
 
+    // A card action's error shows on its card while the card is up, else in the footer.
+    function hasCard(id) {
+        for (var i = 0; i < cards.length; i++)
+            if (cards[i].id === id)
+                return true;
+        return false;
+    }
+
     Layout.preferredWidth: Kirigami.Units.gridUnit * 22
     Layout.minimumWidth: Kirigami.Units.gridUnit * 22
     Layout.preferredHeight: implicitHeight
@@ -55,6 +63,7 @@ ColumnLayout {
             PlasmaComponents3.Label {
                 Layout.fillWidth: true
                 text: popup.app.toolTipSubText
+                textFormat: Text.PlainText
                 wrapMode: Text.Wrap
                 maximumLineCount: 2
                 elide: Text.ElideRight
@@ -150,6 +159,7 @@ ColumnLayout {
             PlasmaComponents3.Label {
                 Layout.fillWidth: true
                 text: popup.status && popup.status.top ? popup.status.top.name : ""
+                textFormat: Text.PlainText
                 elide: Text.ElideRight
             }
             PlasmaComponents3.Label {
@@ -226,8 +236,10 @@ ColumnLayout {
     PlasmaComponents3.Label {
         Layout.fillWidth: true
         Layout.leftMargin: Kirigami.Units.smallSpacing
-        visible: popup.app.actionError !== "" && popup.app.actionErrorTarget === null
+        visible: popup.app.actionError !== ""
+                 && (popup.app.actionErrorTarget === null || !popup.hasCard(popup.app.actionErrorTarget))
         text: popup.app.actionError
+        textFormat: Text.PlainText
         color: Kirigami.Theme.negativeTextColor
         wrapMode: Text.Wrap
     }
