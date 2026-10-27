@@ -121,6 +121,24 @@ pub fn hunch_about(app: Option<&str>, summary: &str) -> Message {
     }
 }
 
+/// Why a by-hand request to ask Claude was turned down or dropped.
+pub fn claude_limit_text(max_per_day: u32) -> String {
+    let times = match max_per_day {
+        1 => "once".to_string(),
+        2 => "twice".to_string(),
+        n => format!("{n} times"),
+    };
+    format!("I've asked Claude {times} today already. I'll be able to again tomorrow.")
+}
+
+/// A queued by-hand request dropped because today's budget ran out.
+pub fn claude_limit(max_per_day: u32) -> Message {
+    Message {
+        title: "olly can't ask Claude today".to_string(),
+        body: claude_limit_text(max_per_day),
+    }
+}
+
 /// Plain heads-up for an app that has slowly grown over the leak window.
 pub fn leak(app: &str, growth: u64, window_secs: u64) -> Message {
     Message {

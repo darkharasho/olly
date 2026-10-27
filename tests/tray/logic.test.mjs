@@ -446,13 +446,16 @@ test("pruneDismissed and dismissLeak", () => {
 });
 
 test("diagnoseButton", () => {
-  assert.equal(L.diagnoseButton(null, { id: 3 }), "ask");
+  // Offline, or an old daemon with no `diagnosing` in its status: it can't take the request.
+  assert.equal(L.diagnoseButton(null, { id: 3 }), "hidden");
+  assert.equal(L.diagnoseButton({}, { id: 3 }), "hidden");
+  assert.equal(L.diagnoseButton({ level: "calm" }, { id: 3, diagnosis: "  " }), "hidden");
   assert.equal(L.diagnoseButton({ diagnosing: null }, { id: 3 }), "ask");
   assert.equal(L.diagnoseButton({ diagnosing: 4 }, { id: 3 }), "ask");
   assert.equal(L.diagnoseButton({ diagnosing: 3 }, { id: 3 }), "looking");
-  assert.equal(L.diagnoseButton({}, { id: 3, diagnosis: "  " }), "ask");
+  assert.equal(L.diagnoseButton({ diagnosing: null }, { id: 3, diagnosis: "  " }), "ask");
   assert.equal(L.diagnoseButton({ diagnosing: 3 }, { id: 3, diagnosis: "a leak" }), "hidden");
-  assert.equal(L.diagnoseButton({}, null), "hidden");
+  assert.equal(L.diagnoseButton({ diagnosing: null }, null), "hidden");
 });
 
 test("diagnosisDone", () => {

@@ -253,11 +253,14 @@ function statRows(status) {
 }
 
 // The "Ask Claude why" button for an incident: "hidden" (already diagnosed, or the daemon
-// is too old to take the request), "ask", or "looking" while Claude has that incident.
+// is offline or too old to take the request: no `diagnosing` in its status), "ask", or
+// "looking" while Claude has that incident.
 function diagnoseButton(status, incident) {
     if (!incident || (incident.diagnosis && String(incident.diagnosis).trim() !== ""))
         return "hidden";
-    if (status && status.diagnosing === incident.id)
+    if (!status || status.diagnosing === undefined)
+        return "hidden";
+    if (status.diagnosing === incident.id)
         return "looking";
     return "ask";
 }

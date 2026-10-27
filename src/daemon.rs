@@ -443,6 +443,10 @@ impl Daemon {
         if self.claude_running || self.claude_queue.is_empty() {
             return;
         }
+        if let Some(runner) = self.claude.as_ref().filter(|r| r.limit_hit(wall_ms())) {
+            let n = runner.max_per_day();
+            self.drop_asked_diagnoses(n);
+        }
         let Some(sys) = self.last_sys else { return };
         let Some(runner) = self.claude.as_mut() else {
             self.claude_queue.clear();
@@ -469,6 +473,25 @@ impl Daemon {
             };
             runner.spawn(job, self.claude_tx.clone());
         }
+    }
+
+    /// Today's budget ran out: drop the queued Diagnose jobs asked for by hand, so the
+    /// widget stops saying Claude is looking, and say why. Automatic jobs stay queued.
+    fn drop_asked_diagnoses(&mut self, max_per_day: u32) {
+        let asked = &mut self.diagnose_asked;
+        let before = self.claude_queue.len();
+        self.claude_queue.retain(|j| match j {
+            Job::Diagnose(inc) => !asked.remove(&inc.id),
+            _ => true,
+        });
+        if self.claude_queue.len() == before {
+            return;
+        }
+        let ev = Event::Notice {
+            message: voice::claude_limit(max_per_day),
+            frozen_id: None,
+        };
+        self.subs.broadcast(&ipc::event_line(&ev, wall_ms()));
     }
 
     fn on_claude_result(&mut self, job: Job, result: Result<String, String>) {
@@ -531,10 +554,7 @@ impl Daemon {
             return Ok("Already on it.".to_string());
         }
         if runner.limit_hit(wall_ms()) {
-            return Err(format!(
-                "I've asked Claude {} times today already. I'll be able to again tomorrow.",
-                runner.max_per_day()
-            ));
+            return Err(voice::claude_limit_text(runner.max_per_day()));
         }
         enqueue(&mut self.claude_queue, Job::Diagnose(inc));
         self.diagnose_asked.insert(id);
@@ -1957,9 +1977,46 @@ mod tests {
         d.claude = Some(r);
         assert_eq!(
             ask(&mut d, 1)["error"],
-            "I've asked Claude 1 times today already. I'll be able to again tomorrow."
+            "I've asked Claude once today already. I'll be able to again tomorrow."
         );
         assert!(d.claude_queue.is_empty());
+    }
+
+    #[test]
+    fn daily_limit_drops_queued_hand_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = test_daemon(dir.path());
+        let cfg = ClaudeConfig {
+            max_per_day: 1,
+            ..d.cfg.claude.clone()
+        };
+        d.claude = Some(ClaudeRunner::with_user(cfg, 1000, false, "u", "/tmp"));
+        d.store.append(&sample_incident(1)).unwrap();
+        assert_eq!(ask(&mut d, 1)["data"], "I'll ask Claude once things are calm.");
+        enqueue(&mut d.claude_queue, Job::Diagnose(sample_incident(2)));
+        enqueue(
+            &mut d.claude_queue,
+            Job::Leak {
+                cgroup: "/x".into(),
+                growth: 1,
+            },
+        );
+        let (tx, rx) = mpsc::sync_channel(8);
+        d.subs.add(tx);
+        // The budget runs out after the request was queued.
+        assert!(d.claude.as_mut().unwrap().allowed(wall_ms()));
+        d.pump_claude();
+        assert_eq!(d.diagnosing(), Some(2));
+        assert!(d.diagnose_asked.is_empty());
+        assert_eq!(d.claude_queue.len(), 2, "automatic jobs stay queued");
+        let line = rx.try_recv().unwrap();
+        assert!(
+            line.contains("I've asked Claude once today already. I'll be able to again tomorrow."),
+            "{line}"
+        );
+        // Nothing more to drop: no second notice.
+        d.pump_claude();
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

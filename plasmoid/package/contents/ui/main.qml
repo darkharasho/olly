@@ -20,6 +20,7 @@ PlasmoidItem {
     property var fetchingIncidentId: undefined // last_incident_id the fetch in flight is for
     property double now: Date.now()
     property bool repoll: false         // an action finished while a poll was in flight
+    property bool refetchIncidents: false // a fetch was wanted while one was in flight
     property double updateDismissedAt: 0 // newest last_update/update_error at_wall_ms seen when the popup closed
     property bool checking: false       // an update check is in flight
     property double checkedAt: 0        // when the last update check finished
@@ -56,9 +57,14 @@ PlasmoidItem {
 
     // `forId` is the last_incident_id this fetch is for. It only becomes
     // seenIncidentId when the fetch succeeds, so a failed one is retried.
+    // One wanted while another is in flight (say, a finished diagnosis) runs
+    // when that one returns, or on the next poll.
     function fetchIncidents(forId) {
-        if (connectOnce(incidentsCmd))
+        if (connectOnce(incidentsCmd)) {
             fetchingIncidentId = forId;
+            refetchIncidents = false;
+        } else
+            refetchIncidents = true;
     }
 
     // verb: "kill" | "unfreeze" (with a frozen id from status) | "pause" | "resume" | "update".
@@ -96,12 +102,11 @@ PlasmoidItem {
             now = Date.now();
             var prev = status;
             status = Logic.parseStatus(code, stdout);
-            if (Logic.diagnosisDone(prev, status))
-                fetchIncidents(status.last_incident_id);
             dismissedLeaks = Logic.pruneDismissed(status, dismissedLeaks);
             pollInterval = status ? 2000 : 5000;
-            if (status && status.last_incident_id !== seenIncidentId)
-                fetchIncidents(status.last_incident_id);
+            if (Logic.diagnosisDone(prev, status) || refetchIncidents
+                    || (status && status.last_incident_id !== seenIncidentId))
+                fetchIncidents(status ? status.last_incident_id : seenIncidentId);
             if (repoll) {
                 repoll = false;
                 connectOnce(statusCmd);
@@ -112,6 +117,8 @@ PlasmoidItem {
                 incidents = list;
                 seenIncidentId = fetchingIncidentId;
             }
+            if (refetchIncidents)
+                fetchIncidents(status ? status.last_incident_id : seenIncidentId);
         } else if (diagnoseTargets.hasOwnProperty(source)) {
             var asked = diagnoseTargets[source];
             delete diagnoseTargets[source];

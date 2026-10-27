@@ -53,8 +53,9 @@ pub struct AppSample {
     pub names: Vec<String>,
     /// exe basename of every member (comm is cut at 15 chars), for allowlist matching.
     pub exe_names: Vec<String>,
-    /// A game: split from the Steam client by lineage, run by a wine/proton loader,
-    /// or running under gamescope. Game mode picks other apps first.
+    /// A game: split from the Steam client and launched by `reaper`, run by a
+    /// wine/proton loader, or running under gamescope with no Steam client in between
+    /// (else launched by `reaper`). Game mode picks other apps first.
     pub is_game: bool,
 }
 
@@ -69,20 +70,43 @@ fn is_gamescope(name: &str) -> bool {
     name.starts_with("gamescope")
 }
 
-/// True if some ancestor of `pid` (not `pid` itself) is gamescope. `lineage` maps every
-/// desktop-user pid to (ppid, comm, exe basename).
-fn under_gamescope(lineage: &HashMap<i32, (i32, String, Option<String>)>, pid: i32) -> bool {
+/// pid -> (ppid, comm, exe basename) for every desktop-user process.
+type Lineage = HashMap<i32, (i32, String, Option<String>)>;
+
+/// What the ancestors of a process (not the process itself) say about it being a game.
+#[derive(Debug, Default, PartialEq)]
+struct Ancestry {
+    /// Some ancestor is `reaper`: Steam launches every game via `reaper SteamLaunch`.
+    reaper: bool,
+    /// Some ancestor is gamescope.
+    gamescope: bool,
+    /// Some ancestor is gamescope, with no Steam client between it and the process (nor
+    /// the process being the client). In
+    /// the gamescope session, gamescope launches Steam, so everything Steam starts is
+    /// under it; that alone doesn't make a game.
+    gamescope_direct: bool,
+}
+
+fn ancestry(lineage: &Lineage, pid: i32) -> Ancestry {
+    let is =
+        |l: &(i32, String, Option<String>), want: &str| l.1 == want || l.2.as_deref() == Some(want);
+    let mut a = Ancestry::default();
+    // The Steam client itself counts as Steam in between.
+    let mut steam_seen = lineage.get(&pid).is_some_and(|l| is(l, "steam"));
     let mut cur = lineage.get(&pid).map(|l| l.0);
     for _ in 0..lineage.len() {
-        let Some(l) = cur.and_then(|c| lineage.get(&c)) else {
-            return false;
+        let Some(l) = cur.filter(|&c| c != pid).and_then(|c| lineage.get(&c)) else {
+            break;
         };
+        a.reaper |= is(l, "reaper");
+        steam_seen |= is(l, "steam");
         if is_gamescope(&l.1) || l.2.as_deref().is_some_and(is_gamescope) {
-            return true;
+            a.gamescope = true;
+            a.gamescope_direct |= !steam_seen;
         }
         cur = Some(l.0);
     }
-    false
+    a
 }
 
 pub struct Sampler {
@@ -231,9 +255,14 @@ impl Sampler {
                     && !single
                     && !members.iter().any(|p| is_steam(p))
                     && index.contains_key(&root.status.ppid);
-                let is_game = split_from_steam
+                // Steam's own helpers (steamwebhelper under srt-bwrap/pv-adverb) split
+                // off too; only what reaper launched is a game. Under gamescope with
+                // Steam in between, the reaper rule alone decides.
+                let up = ancestry(&lineage, root_pid);
+                let is_game = (split_from_steam && up.reaper)
                     || exe_names.iter().any(|n| GAME_LOADERS.contains(&n.as_str()))
-                    || under_gamescope(&lineage, root_pid);
+                    || up.gamescope_direct
+                    || (up.gamescope && up.reaper);
                 out.push(AppSample {
                     key,
                     name: root.status.name.clone(),
@@ -338,7 +367,7 @@ mod tests {
             .iter()
             .filter(|a| a.key.cgroup.contains("steam"))
             .collect();
-        assert_eq!(st.len(), 2);
+        assert_eq!(st.len(), 3);
         let client = st.iter().find(|a| a.key.root_pid == Some(100)).unwrap();
         let game = st.iter().find(|a| a.key.root_pid == Some(102)).unwrap();
         assert_eq!(
@@ -352,17 +381,23 @@ mod tests {
         assert_eq!(
             client.kind,
             TargetKind::Processes {
-                pids: vec![(100, 1100), (101, 1101)]
+                pids: vec![(100, 1100), (101, 1101), (104, 1104), (105, 1105)]
             }
         );
-        assert_eq!(client.bytes, (400 + 2) << 20);
-        assert_eq!(client.names, vec!["steam", "reaper"]);
+        assert_eq!(client.bytes, (400 + 2 + 4 + 2) << 20);
+        assert_eq!(
+            client.names,
+            vec!["steam", "reaper", "srt-bwrap", "pv-adverb"]
+        );
+        let helper = st.iter().find(|a| a.key.root_pid == Some(106)).unwrap();
+        assert_eq!(helper.name, "steamwebhelper");
+        assert_eq!(helper.bytes, GIB);
     }
 
     #[test]
     fn other_users_and_system_ignored() {
         let apps = sampler().apps();
-        assert_eq!(apps.len(), 3);
+        assert_eq!(apps.len(), 4);
         assert!(apps.iter().all(|a| !a.key.cgroup.contains("system.slice")));
         assert!(sampler_for(1001).apps().is_empty());
     }
@@ -453,7 +488,10 @@ mod tests {
         let game = apps.iter().find(|a| a.name == "game.exe").unwrap();
         assert_eq!(game.exe_names, vec!["wine64-preloader"]);
         let client = apps.iter().find(|a| a.name == "steam").unwrap();
-        assert_eq!(client.exe_names, vec!["steam", "reaper"]);
+        assert_eq!(
+            client.exe_names,
+            vec!["steam", "reaper", "srt-bwrap", "pv-adverb"]
+        );
     }
 
     #[test]
@@ -463,6 +501,39 @@ mod tests {
         assert!(game("game.exe"));
         assert!(!game("steam"));
         assert!(!game("firefox"));
+        // Split from the client like a game, but not launched by reaper.
+        assert!(!game("steamwebhelper"));
+    }
+
+    #[test]
+    fn gamescope_session_steam_helpers_are_not_games() {
+        // Bazzite's gamescope session: gamescope launches Steam, Steam launches the rest.
+        let lineage: Lineage = [
+            (10, (1, "gamescope-wl", Some("gamescope"))),
+            (11, (10, "steam", Some("steam"))),
+            (12, (11, "srt-bwrap", Some("srt-bwrap"))),
+            (13, (12, "steamwebhelper", Some("steamwebhelper"))),
+            (14, (11, "reaper", Some("reaper"))),
+            (15, (14, "game.exe", Some("wine64-preloader"))),
+            (16, (10, "firefox", Some("firefox"))),
+            (17, (14, "gamescope", Some("gamescope"))),
+            (18, (17, "nested", None)),
+        ]
+        .into_iter()
+        .map(|(pid, (ppid, comm, exe))| (pid, (ppid, comm.to_string(), exe.map(String::from))))
+        .collect();
+        let game = |pid| {
+            let a = ancestry(&lineage, pid);
+            a.gamescope_direct || (a.gamescope && a.reaper)
+        };
+        assert!(!game(11), "the Steam client");
+        assert!(
+            !game(13),
+            "steamwebhelper: Steam is between gamescope and it"
+        );
+        assert!(game(15), "launched by reaper");
+        assert!(game(16), "under gamescope with no Steam in between");
+        assert!(game(18), "a nested gamescope a game started");
     }
 
     #[test]
