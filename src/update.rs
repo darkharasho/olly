@@ -5,8 +5,9 @@ use crate::engine::Level;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub const RELEASE_KEY: &str = include_str!("update_key.pub");
 
@@ -74,7 +75,11 @@ pub fn verify_manifest(manifest: &[u8], minisig: &str, pubkey_file: &str) -> Res
         .map_err(|e| format!("signature check failed: {e}"))?;
     let m: Manifest =
         serde_json::from_slice(manifest).map_err(|e| format!("bad manifest: {e}"))?;
-    semver::Version::parse(&m.version).map_err(|e| format!("bad version in manifest: {e}"))?;
+    let v = semver::Version::parse(&m.version)
+        .map_err(|e| format!("bad version in manifest: {e}"))?;
+    if !v.pre.is_empty() {
+        return Err("manifest is for a pre-release".into());
+    }
     if m.tarball != format!("olly-{}-x86_64.tar.gz", m.version) {
         return Err("manifest names an unexpected tarball".into());
     }
@@ -131,16 +136,29 @@ fn curl_cmd(url: &str, max_bytes: u64, timeout_secs: u64) -> Command {
 
 impl Fetch for Curl {
     fn get(&self, url: &str, max_bytes: u64, timeout_secs: u64) -> Result<Vec<u8>, String> {
-        let out = curl_cmd(url, max_bytes, timeout_secs)
-            .output()
+        let mut child = curl_cmd(url, max_bytes, timeout_secs)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .map_err(|e| format!("couldn't run curl: {e}"))?;
-        if !out.status.success() {
-            return Err(format!("download failed ({})", out.status));
-        }
-        if out.stdout.len() as u64 > max_bytes {
+        let mut buf = Vec::new();
+        let read = child
+            .stdout
+            .take()
+            .ok_or("no curl output")?
+            .take(max_bytes + 1)
+            .read_to_end(&mut buf);
+        if buf.len() as u64 > max_bytes {
+            let _ = child.kill();
+            let _ = child.wait();
             return Err("download too large".into());
         }
-        Ok(out.stdout)
+        let status = child.wait().map_err(|e| format!("curl failed: {e}"))?;
+        read.map_err(|e| format!("download failed: {e}"))?;
+        if !status.success() {
+            return Err(format!("download failed ({status})"));
+        }
+        Ok(buf)
     }
 
     fn get_to_file(
@@ -155,11 +173,16 @@ impl Fetch for Curl {
             .arg(dest)
             .status()
             .map_err(|e| format!("couldn't run curl: {e}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("download failed ({status})"))
+        if !status.success() {
+            return Err(format!("download failed ({status})"));
         }
+        let len = fs::metadata(dest)
+            .map_err(|e| format!("couldn't read download: {e}"))?
+            .len();
+        if len > max_bytes {
+            return Err("download too large".into());
+        }
+        Ok(())
     }
 }
 
@@ -208,15 +231,15 @@ fn stage_into(fetch: &dyn Fetch, m: &Manifest, base: &Path) -> Result<PathBuf, S
     let bundle = base.join("bundle.tar.gz");
     fetch.get_to_file(&tarball_url(m), &bundle, TARBALL_MAX_BYTES, TARBALL_TIMEOUT_SECS)?;
 
-    let bytes = fs::read(&bundle).map_err(|e| format!("couldn't read download: {e}"))?;
-    let sum: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let mut file = fs::File::open(&bundle).map_err(|e| format!("couldn't read download: {e}"))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(|e| format!("couldn't read download: {e}"))?;
+    let sum: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
     if sum != m.sha256 {
         return Err("download doesn't match its checksum".into());
     }
 
+    check_listing(&bundle)?;
     let status = Command::new("tar")
         .arg("-xzf")
         .arg(&bundle)
@@ -229,16 +252,43 @@ fn stage_into(fetch: &dyn Fetch, m: &Manifest, base: &Path) -> Result<PathBuf, S
         return Err("couldn't unpack the download".into());
     }
 
+    for f in ["olly", "olly-notify", "VERSION"] {
+        let regular = fs::symlink_metadata(root.join(f))
+            .map(|md| md.file_type().is_file())
+            .unwrap_or(false);
+        if !regular {
+            return Err(format!("bundle's {f} isn't a regular file"));
+        }
+    }
     let version = fs::read_to_string(root.join("VERSION")).map_err(|_| "bundle has no VERSION")?;
     if version.trim() != m.version {
         return Err("bundle version doesn't match the manifest".into());
     }
-    for f in ["olly", "olly-notify"] {
-        if !root.join(f).is_file() {
-            return Err(format!("bundle is missing {f}"));
+    Ok(root)
+}
+
+/// Refuse archives with links, absolute paths or `..` components.
+fn check_listing(bundle: &Path) -> Result<(), String> {
+    let out = Command::new("tar")
+        .arg("-tzvf")
+        .arg(bundle)
+        .output()
+        .map_err(|e| format!("couldn't run tar: {e}"))?;
+    if !out.status.success() {
+        return Err("couldn't read the download".into());
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let kind = line.chars().next().unwrap_or('?');
+        if kind == 'l' || kind == 'h' {
+            return Err("bundle contains a link".into());
+        }
+        // verbose line: perms owner size date time name
+        let name = line.split_whitespace().skip(5).collect::<Vec<_>>().join(" ");
+        if name.starts_with('/') || name.split('/').any(|c| c == "..") {
+            return Err("bundle has an unsafe path".into());
         }
     }
-    Ok(root)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -288,6 +338,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_tampered_trusted_comment() {
+        let sig = fxs("good-manifest.json.minisig").replace("file:good", "file:gooe");
+        assert!(verify_manifest(&fx("good-manifest.json"), &sig, &fxs("test.pub")).is_err());
+    }
+
+    #[test]
+    fn rejects_prerelease() {
+        let e = verify_manifest(&fx("prerelease-manifest.json"), &fxs("prerelease-manifest.json.minisig"), &fxs("test.pub"))
+            .unwrap_err();
+        assert!(e.contains("pre-release"), "{e}");
+    }
+
+    #[test]
     fn release_key_parses() {
         let key = RELEASE_KEY.lines().nth(1).unwrap().trim();
         assert!(minisign_verify::PublicKey::from_base64(key).is_ok());
@@ -329,12 +392,15 @@ mod tests {
         assert_eq!(i.notes, m.notes);
     }
 
-    struct FakeFetch(HashMap<String, Vec<u8>>);
+    struct FakeFetch(HashMap<String, Vec<u8>>, std::cell::Cell<bool>);
     impl Fetch for FakeFetch {
         fn get(&self, url: &str, _: u64, _: u64) -> Result<Vec<u8>, String> {
             self.0.get(url).cloned().ok_or_else(|| format!("no {url}"))
         }
         fn get_to_file(&self, url: &str, dest: &Path, m: u64, t: u64) -> Result<(), String> {
+            // the work dir must exist by now, so cleanup on failure is real
+            assert!(dest.parent().unwrap().exists());
+            self.1.set(true);
             fs::write(dest, self.get(url, m, t)?).map_err(|e| e.to_string())
         }
     }
@@ -345,6 +411,7 @@ mod tests {
         version: &str,
         file_version: &str,
         sha_override: Option<&str>,
+        symlink_olly: bool,
     ) -> Option<(FakeFetch, String)> {
         if !Path::new(MINISIGN).exists() {
             eprintln!("skipping: no minisign at {MINISIGN}");
@@ -352,7 +419,11 @@ mod tests {
         }
         let src = tmp.join("src");
         fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("olly"), "bin").unwrap();
+        if symlink_olly {
+            std::os::unix::fs::symlink("/bin/sh", src.join("olly")).unwrap();
+        } else {
+            fs::write(src.join("olly"), "bin").unwrap();
+        }
         fs::write(src.join("olly-notify"), "bin").unwrap();
         fs::write(src.join("VERSION"), format!("{file_version}\n")).unwrap();
         let tarball = format!("olly-{version}-x86_64.tar.gz");
@@ -381,13 +452,13 @@ mod tests {
         map.insert(MANIFEST_URL.to_string(), fs::read(&mpath).unwrap());
         map.insert(manifest_sig_url(), fs::read(&spath).unwrap());
         map.insert(tarball_url(&m), bytes);
-        Some((FakeFetch(map), fxs("test.pub")))
+        Some((FakeFetch(map, Default::default()), fxs("test.pub")))
     }
 
     #[test]
     fn stage_good_bundle() {
         let tmp = tempfile::tempdir().unwrap();
-        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.9", None) else { return };
+        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.9", None, false) else { return };
         let work = tmp.path().join("work");
         let s = stage(&f, &key, "0.1.0", &work).unwrap();
         assert_eq!(s.manifest.version, "9.9.9");
@@ -398,34 +469,50 @@ mod tests {
     #[test]
     fn stage_sha_mismatch_cleans_up() {
         let tmp = tempfile::tempdir().unwrap();
-        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.9", Some(&"0".repeat(64))) else { return };
+        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.9", Some(&"0".repeat(64)), false) else { return };
         let work = tmp.path().join("work");
-        assert!(stage(&f, &key, "0.1.0", &work).is_err());
+        let e = stage(&f, &key, "0.1.0", &work).unwrap_err();
+        assert!(e.contains("checksum"), "{e}");
+        assert!(f.1.get(), "download dir should have existed");
         assert!(!work.join("9.9.9").exists());
     }
 
     #[test]
     fn stage_version_file_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.8", None) else { return };
+        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.8", None, false) else { return };
         let work = tmp.path().join("work");
-        assert!(stage(&f, &key, "0.1.0", &work).is_err());
+        let e = stage(&f, &key, "0.1.0", &work).unwrap_err();
+        assert!(e.contains("version doesn't match"), "{e}");
+        assert!(f.1.get());
+        assert!(!work.join("9.9.9").exists());
+    }
+
+    #[test]
+    fn stage_rejects_symlinked_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.9", None, true) else { return };
+        let work = tmp.path().join("work");
+        let e = stage(&f, &key, "0.1.0", &work).unwrap_err();
+        assert!(e.contains("link"), "{e}");
         assert!(!work.join("9.9.9").exists());
     }
 
     #[test]
     fn stage_requires_newer() {
         let tmp = tempfile::tempdir().unwrap();
-        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.9", None) else { return };
+        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.9", None, false) else { return };
         let work = tmp.path().join("work");
-        assert!(stage(&f, &key, "9.9.9", &work).is_err());
+        let e = stage(&f, &key, "9.9.9", &work).unwrap_err();
+        assert!(e.contains("isn't newer"), "{e}");
+        assert!(!f.1.get(), "must not download");
         assert!(!work.join("9.9.9").exists());
     }
 
     #[test]
     fn check_reports_only_newer() {
         let tmp = tempfile::tempdir().unwrap();
-        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.9", None) else { return };
+        let Some((f, key)) = release(tmp.path(), "9.9.9", "9.9.9", None, false) else { return };
         assert!(check(&f, &key, "0.1.0").unwrap().is_some());
         assert!(check(&f, &key, "9.9.9").unwrap().is_none());
     }
