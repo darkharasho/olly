@@ -10,3 +10,4 @@ pub mod incident;
 pub mod ipc;
 pub mod psi;
 pub mod daemon;
+pub mod claude;

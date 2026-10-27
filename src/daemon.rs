@@ -2,6 +2,7 @@
 
 use crate::actuator::{self, Actuator, DryRunActuator, SysActuator};
 use crate::allowlist::Allowlist;
+use crate::claude::{ClaudeRunner, Job};
 use crate::config::Config;
 use crate::engine::{Action, Command, Engine, Event, Level, StepOutput};
 use crate::history::{History, LeakWatch};
@@ -11,7 +12,7 @@ use crate::procfs::parse_status;
 use crate::psi::{self, PsiTrigger};
 use crate::sample::{Sampler, SystemSample};
 use crate::voice;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -26,6 +27,10 @@ const MAX_INCIDENTS: usize = 100;
 const LOG_REPEAT_MS: u64 = 60_000;
 /// The kernel fires a trigger at most once per 1 s window; more than this is a broken fd.
 const PSI_STORM: u32 = 20;
+/// At most this many Claude jobs wait; the oldest is dropped first.
+const CLAUDE_QUEUE: usize = 4;
+/// A leaking cgroup is handed to Claude at most once per day.
+const LEAK_COOLDOWN_MS: u64 = 24 * 60 * 60 * 1000;
 
 struct Paths {
     run_dir: PathBuf,
@@ -144,6 +149,28 @@ struct Daemon {
     last_sys: Option<SystemSample>,
     incident_open: bool,
     rlog: RateLog,
+    /// None when Claude is disabled or the desktop user can't be found.
+    claude: Option<ClaudeRunner>,
+    claude_queue: VecDeque<Job>,
+    claude_running: bool,
+    claude_tx: mpsc::Sender<(Job, Result<String, String>)>,
+    claude_rx: mpsc::Receiver<(Job, Result<String, String>)>,
+    /// cgroup -> monotonic ms when it was last handed to Claude.
+    leak_seen: HashMap<String, u64>,
+}
+
+/// Adds a job, dropping the oldest when the queue is full.
+fn enqueue(queue: &mut VecDeque<Job>, job: Job) {
+    if queue.len() >= CLAUDE_QUEUE {
+        queue.pop_front();
+    }
+    queue.push_back(job);
+}
+
+/// The notification line: the first paragraph, on one line.
+fn first_paragraph(text: &str) -> String {
+    let first = text.trim().split("\n\n").next().unwrap_or("");
+    first.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl Daemon {
@@ -182,11 +209,69 @@ impl Daemon {
     }
 
     /// Slow-leak suspects: (cgroup, growth in bytes over the leak window).
-    /// Task 10 hands these to Claude; for now they are only logged.
+    /// Each cgroup is handed to Claude at most once per 24h.
     fn on_suspects(&mut self, suspects: Vec<(String, u64)>) {
+        let now = self.now();
+        self.leak_seen.retain(|_, &mut t| now.saturating_sub(t) < LEAK_COOLDOWN_MS);
         for (cgroup, growth) in suspects {
             eprintln!("olly: event=leak_suspect target={cgroup} growth={}", voice::fmt_bytes(growth));
+            if self.claude.is_none() || self.leak_seen.contains_key(&cgroup) {
+                continue;
+            }
+            self.leak_seen.insert(cgroup.clone(), now);
+            enqueue(&mut self.claude_queue, Job::Leak { cgroup, growth });
         }
+    }
+
+    /// Never blocks: collects finished Claude answers, then starts the next queued job
+    /// if memory has recovered, no incident is open, and today's budget allows.
+    fn pump_claude(&mut self) {
+        while let Ok((job, result)) = self.claude_rx.try_recv() {
+            self.claude_running = false;
+            self.on_claude_result(job, result);
+        }
+        if self.claude_running || self.incident_open || self.claude_queue.is_empty() {
+            return;
+        }
+        let Some(sys) = self.last_sys else { return };
+        let Some(runner) = self.claude.as_mut() else {
+            self.claude_queue.clear();
+            return;
+        };
+        let avail_pct = if sys.mem.total == 0 {
+            0.0
+        } else {
+            sys.mem.available as f32 / sys.mem.total as f32 * 100.0
+        };
+        if avail_pct < runner.recovered_avail() || !runner.allowed(wall_ms()) {
+            return;
+        }
+        if let Some(job) = self.claude_queue.pop_front() {
+            self.claude_running = true;
+            runner.spawn(job, self.claude_tx.clone());
+        }
+    }
+
+    fn on_claude_result(&mut self, job: Job, result: Result<String, String>) {
+        let what = match &job {
+            Job::Diagnose(inc) => format!("incident {}", inc.id),
+            Job::Leak { cgroup, .. } => format!("leak in {cgroup}"),
+        };
+        let text = match result {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("olly: claude could not look at {what}: {e}");
+                return;
+            }
+        };
+        eprintln!("olly: claude looked at {what}");
+        if let Job::Diagnose(inc) = &job {
+            if let Err(e) = self.store.append_diagnosis(inc.id, &text) {
+                eprintln!("olly: cannot save the diagnosis for incident {}: {e}", inc.id);
+            }
+        }
+        let ev = Event::Notice { message: voice::hunch(&first_paragraph(&text)), frozen_id: None };
+        self.subs.broadcast(&ipc::event_line(&ev, wall_ms()));
     }
 
     /// Applies the actions, then logs, records and broadcasts the events. A failed
@@ -230,6 +315,9 @@ impl Daemon {
             if let Some(inc) = self.recorder.on_event(&ev, wall) {
                 if let Err(e) = self.store.append(&inc).and_then(|_| self.store.rotate_if_needed()) {
                     eprintln!("olly: cannot save incident {}: {e}", inc.id);
+                }
+                if self.claude.is_some() {
+                    enqueue(&mut self.claude_queue, Job::Diagnose(inc));
                 }
             }
             self.subs.broadcast(&ipc::event_line(&ev, wall));
@@ -459,6 +547,24 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
     let store = IncidentStore::new(paths.incidents.clone());
     let mut engine = Engine::new(cfg.clone());
     engine.set_next_incident_id(store.next_id());
+    let claude = if cfg.claude.enabled {
+        let as_root = unsafe { libc::geteuid() } == 0;
+        match ClaudeRunner::new(cfg.claude.clone(), cfg.desktop_uid, as_root) {
+            Ok(mut r) => {
+                if let Some(w) = &wake {
+                    r.set_wake(w.as_raw_fd());
+                }
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!("olly: claude diagnosis is off: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (claude_tx, claude_rx) = mpsc::channel();
     let mut d = Daemon {
         sampler: Sampler::new(root.clone(), cfg.desktop_uid),
         hist: History::new(&cfg.growth),
@@ -473,6 +579,12 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         last_sys: None,
         incident_open: false,
         rlog: RateLog::default(),
+        claude,
+        claude_queue: VecDeque::new(),
+        claude_running: false,
+        claude_tx,
+        claude_rx,
+        leak_seen: HashMap::new(),
         start: Instant::now(),
         cfg,
     };
@@ -529,6 +641,7 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         while let Ok(msg) = rx.try_recv() {
             d.handle(msg);
         }
+        d.pump_claude();
         if ready[0] {
             drain(fds[0].0, std::mem::size_of::<libc::signalfd_siginfo>());
             eprintln!("olly: stopping; undoing every freeze and throttle");
@@ -555,3 +668,28 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leak(n: u64) -> Job {
+        Job::Leak { cgroup: format!("/c{n}"), growth: n }
+    }
+
+    #[test]
+    fn queue_drops_oldest_when_full() {
+        let mut q = VecDeque::new();
+        for n in 0..6 {
+            enqueue(&mut q, leak(n));
+        }
+        let kept: Vec<u64> = q.iter().map(|j| if let Job::Leak { growth, .. } = j { *growth } else { 99 }).collect();
+        assert_eq!(kept, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn notification_line_is_first_paragraph() {
+        assert_eq!(first_paragraph("  It was the browser.\nTabs piled up.\n\nDetails here.\n"), "It was the browser. Tabs piled up.");
+        assert_eq!(first_paragraph(""), "");
+    }
+}
