@@ -66,8 +66,8 @@ The fields from `swap_total` on are newer; a reply from an older daemon may lack
 - `some_avg10`: memory "some" pressure over the last 10 s, in percent.
 - `top`: the biggest app by memory in the latest sample, an `Incident` `top_at_peak` entry (`name`, `key`, `bytes`, and `rate` in bytes/s), or `null` before the first sample.
 - `incident_active`: whether an incident is open.
-- `incident_acted`: whether olly has acted since the open incident began (false when none is open).
-- `last_action_wall_ms`: wall time (ms) of olly's latest action, or `null` if it has not acted since it started.
+- `incident_acted`: whether olly has made an intervention (throttle, freeze or kill) since the open incident began (false when none is open).
+- `last_action_wall_ms`: wall time (ms) of olly's latest intervention (a throttle, freeze or kill, including dry-run ones and a kill you commanded), or `null` if there has been none since it started. Undoing one (unthrottle, resume) does not count.
 - `last_incident_id`: the newest incident id on record, or `null` if there are none.
 - `frozen_info`: one entry per frozen app, in the same order as `frozen`. `bytes` is its memory, `rate` its growth in bytes/s when it was frozen, and `kill_at_wall_ms` is the wall time (ms) olly closes it if you do not answer:
 

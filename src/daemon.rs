@@ -10,7 +10,7 @@ use crate::incident::{IncidentRecorder, IncidentStore, TopApp};
 use crate::ipc::{self, err_line, ok_line, FrozenInfo, Request, StatusData, Subscribers, ToDaemon};
 use crate::procfs::parse_status;
 use crate::psi::{self, PsiTrigger};
-use crate::sample::{Sampler, SystemSample};
+use crate::sample::{AppSample, Sampler, SystemSample};
 use crate::voice;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -248,10 +248,28 @@ fn frozen_info(
         .collect()
 }
 
-/// Whether the open incident has had an action, after `ev`.
-fn acted_after(acted: bool, ev: &Event) -> bool {
+/// The biggest app in a sample, with its growth rate.
+fn top_app(apps: &[AppSample], hist: &History, now: u64) -> Option<TopApp> {
+    apps.iter().max_by_key(|a| a.bytes).map(|a| TopApp {
+        name: a.name.clone(),
+        key: a.key.clone(),
+        bytes: a.bytes,
+        rate: hist.rate(&a.key, now),
+    })
+}
+
+/// An intervention (throttle, freeze, kill), not the undoing of one.
+fn is_intervention(a: &Action) -> bool {
+    matches!(
+        a,
+        Action::Throttle { .. } | Action::Freeze { .. } | Action::Kill { .. }
+    )
+}
+
+/// Whether the open incident has had an intervention, after `ev`.
+fn acted_after(acted: bool, ev: &Event, incident_open: bool) -> bool {
     match ev {
-        Event::Acted { .. } => true,
+        Event::Acted { action, .. } => acted || (incident_open && is_intervention(action)),
         Event::IncidentStart { .. } | Event::IncidentEnd { .. } => false,
         _ => acted,
     }
@@ -287,12 +305,7 @@ impl Daemon {
         };
         let apps = self.sampler.apps();
         self.hist.record(now, &apps);
-        self.last_top = apps.iter().max_by_key(|a| a.bytes).map(|a| TopApp {
-            name: a.name.clone(),
-            key: a.key.clone(),
-            bytes: a.bytes,
-            rate: self.hist.rate(&a.key, now),
-        });
+        self.last_top = top_app(&apps, &self.hist, now);
         let out = self.engine.step(&sys, &apps, &self.hist, &self.allow);
         self.process(out);
         self.recorder.on_sample(&sys, &apps, &self.hist, wall_ms());
@@ -437,8 +450,9 @@ impl Daemon {
                 }
                 other => other,
             };
-            self.incident_acted = acted_after(self.incident_acted, &ev);
-            if matches!(ev, Event::Acted { .. }) {
+            self.incident_acted =
+                acted_after(self.incident_acted, &ev, self.engine.incident().is_some());
+            if matches!(&ev, Event::Acted { action, .. } if is_intervention(action)) {
                 self.last_action_wall_ms = Some(wall);
             }
             match &ev {
@@ -1002,10 +1016,137 @@ mod tests {
             message: voice::frozen("x", 30, false),
             dry_run: false,
         };
-        assert!(acted_after(false, &acted));
-        assert!(acted_after(true, &Event::Level { level: Level::Calm }));
-        assert!(!acted_after(true, &Event::IncidentStart { id: 2, t_ms: 0 }));
-        assert!(!acted_after(true, &Event::IncidentEnd { id: 2, t_ms: 0 }));
+        assert!(acted_after(false, &acted, true));
+        // No open incident: an action leaves it false.
+        assert!(!acted_after(false, &acted, false));
+        let restore = Event::Acted {
+            action: Action::Unthrottle {
+                target: view(1, 0).target,
+            },
+            message: voice::unthrottled("x"),
+            dry_run: false,
+        };
+        assert!(!acted_after(false, &restore, true));
+        assert!(acted_after(
+            true,
+            &Event::Level { level: Level::Calm },
+            true
+        ));
+        assert!(!acted_after(
+            true,
+            &Event::IncidentStart { id: 2, t_ms: 0 },
+            true
+        ));
+        assert!(!acted_after(
+            true,
+            &Event::IncidentEnd { id: 2, t_ms: 0 },
+            false
+        ));
+    }
+
+    /// A real `Daemon` on fake proc files, driven to a freeze through the engine.
+    #[test]
+    fn status_fills_tray_fields() {
+        const GIB: u64 = 1 << 30;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::create_dir_all(root.join("proc/pressure")).unwrap();
+        fs::write(
+            root.join("proc/meminfo"),
+            "MemTotal: 33554432 kB\nMemAvailable: 16777216 kB\nSwapTotal: 8388604 kB\nSwapFree: 8000000 kB\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("proc/pressure/memory"),
+            "some avg10=4.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            dry_run: true,
+            ..Config::default()
+        };
+        let (claude_tx, claude_rx) = mpsc::channel();
+        let mut d = Daemon {
+            sampler: Sampler::new(root.clone(), cfg.desktop_uid),
+            hist: History::new(&cfg.growth),
+            leak: LeakWatch::new(&cfg.growth),
+            allow: Allowlist::load(cfg.allowlist.clone(), root.join("allow.toml")),
+            engine: Engine::new(cfg.clone()),
+            act: Act::Dry(DryRunActuator::default()),
+            recorder: IncidentRecorder::new(),
+            store: IncidentStore::new(root.join("incidents.jsonl")),
+            subs: Subscribers::new(),
+            pending: Vec::new(),
+            last_sys: None,
+            incident_open: false,
+            last_top: None,
+            last_action_wall_ms: None,
+            incident_acted: false,
+            last_incident_id: None,
+            rlog: RateLog::default(),
+            claude: None,
+            claude_queue: VecDeque::new(),
+            claude_running: false,
+            claude_tx,
+            claude_rx,
+            leak_seen: HashMap::new(),
+            start: Instant::now(),
+            cfg,
+        };
+        let leak = |t: u64| AppSample {
+            key: AppKey {
+                cgroup: "/leaky".into(),
+                root_pid: None,
+            },
+            name: "leaky".into(),
+            exe: None,
+            kind: TargetKind::Cgroup,
+            bytes: 10 * GIB + t * (GIB / 10) / 1000,
+            ram: 10 * GIB + t * (GIB / 10) / 1000,
+            names: vec!["leaky".into()],
+            exe_names: vec![],
+        };
+        let step = |d: &mut Daemon, t: u64, full: f32| {
+            let mut sys = d.sampler.system(t).unwrap();
+            sys.psi.full_avg10 = full;
+            sys.full_now = Some(full);
+            d.hist.record(t, &[leak(t)]);
+            let out = d.engine.step(&sys, &[leak(t)], &d.hist, &d.allow);
+            d.process(out);
+            d.last_top = top_app(&[leak(t)], &d.hist, t);
+            d.last_sys = Some(sys);
+        };
+        for s in 0..=10 {
+            step(&mut d, s * 1000, 0.0);
+        }
+        assert!(!d.status().incident_active);
+        step(&mut d, 11_000, 30.0);
+        let wall = wall_ms();
+        let st = d.status();
+        assert_eq!(st.frozen_info.len(), 1);
+        let kill_at = st.frozen_info[0].kill_at_wall_ms;
+        let want = wall + d.cfg.timing.freeze_giveup_secs * 1000;
+        assert!(kill_at.abs_diff(want) < 2000, "{kill_at} vs {want}");
+        assert!(st.incident_active && st.incident_acted);
+        assert!(st.last_action_wall_ms.is_some());
+        let top = st.top.unwrap();
+        assert_eq!(top.name, "leaky");
+        assert!(top.rate > 0.0);
+        assert_eq!(st.swap_total, 8388604 * 1024);
+        assert_eq!(st.swap_used, (8388604 - 8000000) * 1024);
+        assert_eq!(st.some_avg10, 4.0);
+    }
+
+    #[test]
+    fn restores_are_not_interventions() {
+        let t = view(1, 0).target;
+        assert!(is_intervention(&Action::Throttle {
+            target: t.clone(),
+            high: 1
+        }));
+        assert!(is_intervention(&Action::Freeze { target: t.clone() }));
+        assert!(!is_intervention(&Action::Unthrottle { target: t.clone() }));
+        assert!(!is_intervention(&Action::Resume { target: t }));
     }
 
     #[test]
