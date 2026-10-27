@@ -83,6 +83,22 @@ run sudo rm -rf /usr/local/share/olly/plasmoid
 run sudo cp -r "$pkg/plasmoid/package" /usr/local/share/olly/plasmoid
 run sudo install -Dm644 "$pkg/dist/olly-notify.service" /usr/local/share/olly/olly-notify.service
 
+# The tray face installs per-user (no sudo), before olly-notify restarts: it would
+# otherwise see the old face and upgrade it at the same time. --upgrade fails when it isn't
+# installed yet, so fall back to --install. plasmashell is never restarted.
+if command -v kpackagetool6 >/dev/null 2>&1; then
+    if [ -n "$dry" ]; then
+        echo "+ kpackagetool6 --type Plasma/Applet --upgrade|--install $pkg/plasmoid/package"
+    elif kpackagetool6 --type Plasma/Applet --upgrade "$pkg/plasmoid/package" 2>/dev/null ||
+        kpackagetool6 --type Plasma/Applet --install "$pkg/plasmoid/package"; then
+        say "tray face installed! If you don't see it, log out and back in, then check System Tray Settings → Entries → olly → Always shown. If an upgraded face looks old or blank, restart Plasma: systemctl --user restart plasma-plasmashell"
+    else
+        echo "🤖 couldn't install the tray face, but olly itself is fine." >&2
+    fi
+else
+    say "no kpackagetool6 found, so I skipped the tray face."
+fi
+
 # enable, then restart: a re-run picks up the new binaries.
 run sudo systemctl daemon-reload
 run sudo systemctl enable olly
@@ -90,21 +106,6 @@ run sudo systemctl restart olly
 run systemctl --user daemon-reload
 run systemctl --user enable olly-notify
 run systemctl --user restart olly-notify
-
-# The tray face installs per-user (no sudo). --upgrade fails when it isn't
-# installed yet, so fall back to --install. plasmashell is never restarted.
-if command -v kpackagetool6 >/dev/null 2>&1; then
-    if [ -n "$dry" ]; then
-        echo "+ kpackagetool6 --type Plasma/Applet --upgrade|--install $pkg/plasmoid/package"
-    elif kpackagetool6 --type Plasma/Applet --upgrade "$pkg/plasmoid/package" 2>/dev/null ||
-        kpackagetool6 --type Plasma/Applet --install "$pkg/plasmoid/package"; then
-        say "tray face installed! If you don't see it, log out and back in, then check System Tray Settings → Entries → olly → Always shown."
-    else
-        echo "🤖 couldn't install the tray face, but olly itself is fine." >&2
-    fi
-else
-    say "no kpackagetool6 found, so I skipped the tray face."
-fi
 
 if [ -n "$dry" ]; then
     say "dry run: olly $version checked out fine, nothing was installed."

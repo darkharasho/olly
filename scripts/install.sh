@@ -28,6 +28,19 @@ sudo install -d /usr/local/share/olly
 sudo rm -rf /usr/local/share/olly/plasmoid && sudo cp -r plasmoid/package /usr/local/share/olly/plasmoid
 sudo install -Dm644 dist/olly-notify.service /usr/local/share/olly/olly-notify.service
 
+# The tray face installs per-user (no sudo), before olly-notify restarts: it would
+# otherwise see the old face and upgrade it at the same time. --upgrade fails when it isn't
+# installed yet, so fall back to --install. plasmashell is never restarted.
+if command -v kpackagetool6 >/dev/null 2>&1; then
+    if kpackagetool6 --type Plasma/Applet --upgrade plasmoid/package 2>/dev/null || kpackagetool6 --type Plasma/Applet --install plasmoid/package; then
+        echo "🤖 tray face installed! If you don't see it, log out and back in, then check System Tray Settings → Entries → olly → Always shown. If an upgraded face looks old or blank, restart Plasma: systemctl --user restart plasma-plasmashell"
+    else
+        echo "🤖 couldn't install the tray face, but olly itself is fine." >&2
+    fi
+else
+    echo "🤖 no kpackagetool6 found, so I skipped the tray face."
+fi
+
 # enable, then restart: a re-run after a rebuild picks up the new binaries.
 sudo systemctl daemon-reload
 sudo systemctl enable olly
@@ -35,18 +48,6 @@ sudo systemctl restart olly
 systemctl --user daemon-reload
 systemctl --user enable olly-notify
 systemctl --user restart olly-notify
-
-# The tray face installs per-user (no sudo). --upgrade fails when it isn't
-# installed yet, so fall back to --install. plasmashell is never restarted.
-if command -v kpackagetool6 >/dev/null 2>&1; then
-    if kpackagetool6 --type Plasma/Applet --upgrade plasmoid/package 2>/dev/null || kpackagetool6 --type Plasma/Applet --install plasmoid/package; then
-        echo "🤖 tray face installed! If you don't see it, log out and back in, then check System Tray Settings → Entries → olly → Always shown."
-    else
-        echo "🤖 couldn't install the tray face, but olly itself is fine." >&2
-    fi
-else
-    echo "🤖 no kpackagetool6 found, so I skipped the tray face."
-fi
 
 if grep -q '^dry_run = true' /etc/olly/config.toml; then
     echo "🤖 olly is up and watching, in dry-run mode: it will tell you what it would do, but won't act yet."
