@@ -119,9 +119,34 @@ fn widget_version(dir: &Path) -> Option<String> {
 }
 
 /// Brings the user's widget and user unit up to date with the shared copies.
-/// Each failure is logged once and skipped; nothing here retries.
+/// Each failure is logged once and skipped; nothing here retries. A changed unit only
+/// applies once olly-notify restarts, so the widget waits for that restart: its
+/// notification needs a process that stays up to answer it.
 fn sync_user_side(p: &UserPaths, run: &mut dyn Run) -> SyncOutcome {
     let mut out = SyncOutcome::default();
+
+    let shared_unit = p.share.join("olly-notify.service");
+    if let Ok(new) = std::fs::read(&shared_unit) {
+        if std::fs::read(&p.user_unit).ok().as_deref() != Some(new.as_slice()) {
+            let copied = p
+                .user_unit
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&p.user_unit, &new));
+            match copied {
+                Ok(()) => {
+                    out.unit_updated = true;
+                    if !run.run("systemctl", &["--user", "daemon-reload"]) {
+                        eprintln!("olly-notify: systemctl --user daemon-reload failed");
+                    }
+                }
+                Err(e) => eprintln!("olly-notify: cannot update the user unit: {e}"),
+            }
+        }
+    }
+    if out.unit_updated {
+        return out;
+    }
 
     let shared_widget = p.share.join("plasmoid");
     if p.plasmoid_installed.exists() {
@@ -144,26 +169,6 @@ fn sync_user_side(p: &UserPaths, run: &mut dyn Run) -> SyncOutcome {
             _ => eprintln!("olly-notify: cannot compare widget versions; leaving the widget"),
         }
     }
-
-    let shared_unit = p.share.join("olly-notify.service");
-    if let Ok(new) = std::fs::read(&shared_unit) {
-        if std::fs::read(&p.user_unit).ok().as_deref() != Some(new.as_slice()) {
-            let copied = p
-                .user_unit
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::write(&p.user_unit, &new));
-            match copied {
-                Ok(()) => {
-                    out.unit_updated = true;
-                    if !run.run("systemctl", &["--user", "daemon-reload"]) {
-                        eprintln!("olly-notify: systemctl --user daemon-reload failed");
-                    }
-                }
-                Err(e) => eprintln!("olly-notify: cannot update the user unit: {e}"),
-            }
-        }
-    }
     out
 }
 
@@ -173,10 +178,10 @@ fn should_restart(ev: &Event, own_version: &str) -> bool {
 }
 
 /// Runs the sync with the real home and runner.
-fn sync_now() {
+fn sync_now() -> SyncOutcome {
     let Some(home) = std::env::var_os("HOME") else {
         eprintln!("olly-notify: HOME is not set; skipping the user-side update");
-        return;
+        return SyncOutcome::default();
     };
     let o = sync_user_side(&UserPaths::from_home(Path::new(&home)), &mut RealRun);
     if o.widget_upgraded || o.unit_updated {
@@ -184,6 +189,53 @@ fn sync_now() {
             "olly-notify: updated the user side (widget: {}, unit: {})",
             o.widget_upgraded, o.unit_updated
         );
+    }
+    o
+}
+
+/// What restarting Plasma runs. Windows stay open: they belong to KWin, not plasmashell.
+const RESTART_PLASMA: [&str; 3] = ["--user", "restart", "plasma-plasmashell"];
+
+/// Plasma keeps running the widget it loaded, or drops it, until plasmashell restarts,
+/// so say so and offer to do it.
+fn show_widget_upgraded() {
+    let mut n = Notification::new();
+    n.appname("olly")
+        .icon("dialog-information")
+        .summary("olly's tray face was updated")
+        .body("Plasma shows the new one after it restarts. Your windows stay open.")
+        .action("restart_plasma", "Restart Plasma");
+    let handle = match n.show() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("olly-notify: cannot show a notification: {e}");
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("olly-notify-plasma".into())
+        .spawn(move || {
+            handle.wait_for_action(|action| {
+                if action == "restart_plasma" && !RealRun.run("systemctl", &RESTART_PLASMA) {
+                    eprintln!("olly-notify: couldn't restart Plasma");
+                }
+            });
+        });
+    if let Err(e) = spawned {
+        eprintln!("olly-notify: cannot start the action thread: {e}");
+    }
+}
+
+/// Syncs, and offers to restart Plasma when the widget changed. A changed unit exits so
+/// systemd restarts olly-notify under it (`Restart=always`).
+fn sync_and_tell() {
+    let o = sync_now();
+    if o.unit_updated {
+        eprintln!("olly-notify: my unit changed; restarting under it");
+        std::process::exit(0);
+    }
+    if o.widget_upgraded {
+        show_widget_upgraded();
     }
 }
 
@@ -292,11 +344,13 @@ fn run_once(shown: &Mutex<Shown>) -> std::io::Result<()> {
         match serde_json::from_str::<EventLine>(&line) {
             Ok(EventLine { event }) => {
                 if matches!(event, Event::Updated { ok: true, .. }) {
-                    sync_now();
+                    // The new binary syncs when it starts, and stays up to answer the
+                    // notification's button.
                     if should_restart(&event, env!("CARGO_PKG_VERSION")) {
                         eprintln!("olly-notify: olly updated; restarting on the new binary");
                         std::process::exit(0);
                     }
+                    sync_and_tell();
                 }
                 if let Some(note) = map_event(&event) {
                     show(&note, shown);
@@ -309,7 +363,7 @@ fn run_once(shown: &Mutex<Shown>) -> std::io::Result<()> {
 }
 
 fn main() {
-    sync_now();
+    sync_and_tell();
     let shown = Mutex::new(Shown::default());
     let mut quiet = false;
     loop {
@@ -532,6 +586,28 @@ mod tests {
         let mut r = Rec::default();
         assert!(!sync_user_side(&p, &mut r).unit_updated);
         assert!(r.0.is_empty());
+    }
+
+    #[test]
+    fn unit_goes_first_and_the_widget_waits() {
+        let t = tempfile::tempdir().unwrap();
+        let p = paths(t.path());
+        meta(&p.share.join("plasmoid"), "2");
+        meta(&p.plasmoid_installed, "1");
+        std::fs::write(p.share.join("olly-notify.service"), "new").unwrap();
+        let mut r = Rec::default();
+        let o = sync_user_side(&p, &mut r);
+        assert!(o.unit_updated && !o.widget_upgraded);
+        assert_eq!(r.0, vec!["systemctl --user daemon-reload".to_string()]);
+        // After the restart the unit matches, so the widget goes.
+        let mut r = Rec::default();
+        let o = sync_user_side(&p, &mut r);
+        assert!(!o.unit_updated && o.widget_upgraded);
+    }
+
+    #[test]
+    fn restart_plasma_targets_the_shell_unit() {
+        assert_eq!(RESTART_PLASMA, ["--user", "restart", "plasma-plasmashell"]);
     }
 
     fn updated(ok: bool, to: &str) -> Event {
