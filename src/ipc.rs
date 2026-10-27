@@ -40,14 +40,24 @@ pub enum Request {
         #[serde(default)]
         offset: usize,
     },
-    Incident { id: u64 },
+    Incident {
+        id: u64,
+    },
     Subscribe,
-    Pause { secs: u64 },
+    Pause {
+        secs: u64,
+    },
     Resume,
-    AllowlistAdd { name: String },
+    AllowlistAdd {
+        name: String,
+    },
     AllowlistList,
-    FrozenKill { id: u64 },
-    FrozenResume { id: u64 },
+    FrozenKill {
+        id: u64,
+    },
+    FrozenResume {
+        id: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -86,7 +96,11 @@ pub fn err_line(msg: &str) -> String {
         ok: bool,
         error: &'a str,
     }
-    serde_json::to_string(&Err { ok: false, error: msg }).expect("string serializes")
+    serde_json::to_string(&Err {
+        ok: false,
+        error: msg,
+    })
+    .expect("string serializes")
 }
 
 /// `{"event":<Event>,"wall_ms":<u64>}`
@@ -104,7 +118,9 @@ pub fn event_line(ev: &Event, wall_ms: u64) -> String {
 pub fn handle_line(line: &str) -> Result<Request, String> {
     let req: Request = serde_json::from_str(line).map_err(|e| format!("bad request: {e}"))?;
     match &req {
-        Request::Pause { secs: 0 } => Err("pause needs a duration of at least 1 second".to_string()),
+        Request::Pause { secs: 0 } => {
+            Err("pause needs a duration of at least 1 second".to_string())
+        }
         Request::AllowlistAdd { name } if name.trim().is_empty() => {
             Err("allowlist name must not be empty".to_string())
         }
@@ -133,17 +149,18 @@ impl Subscribers {
 
     /// `try_send` to everyone. Dropped on `Disconnected`, or on `Full` 3 times in a row.
     pub fn broadcast(&mut self, line: &str) {
-        self.subs.retain_mut(|(tx, full)| match tx.try_send(line.to_string()) {
-            Ok(()) => {
-                *full = 0;
-                true
-            }
-            Err(mpsc::TrySendError::Full(_)) => {
-                *full += 1;
-                *full < SUB_FULL_LIMIT
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => false,
-        });
+        self.subs
+            .retain_mut(|(tx, full)| match tx.try_send(line.to_string()) {
+                Ok(()) => {
+                    *full = 0;
+                    true
+                }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    *full += 1;
+                    *full < SUB_FULL_LIMIT
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            });
     }
 
     pub fn len(&self) -> usize {
@@ -183,7 +200,11 @@ impl Drop for ConnSlot {
 }
 
 fn peer_uid(s: &UnixStream) -> Option<u32> {
-    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     let rc = unsafe {
         libc::getsockopt(
@@ -212,7 +233,12 @@ pub fn serve(
     tx: mpsc::Sender<ToDaemon>,
     wake: RawFd,
 ) -> JoinHandle<()> {
-    let shared = Arc::new(Shared { allowed: allowed_uids, tx, wake, conns: AtomicUsize::new(0) });
+    let shared = Arc::new(Shared {
+        allowed: allowed_uids,
+        tx,
+        wake,
+        conns: AtomicUsize::new(0),
+    });
     thread::Builder::new()
         .name("olly-ipc".into())
         .stack_size(64 * 1024)
@@ -228,7 +254,8 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
                 // Listener shut down or closed.
                 Some(libc::EINVAL) | Some(libc::EBADF) => return,
                 // EMFILE and friends: back off instead of spinning.
-                Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOMEM) | Some(libc::ENOBUFS) => {
+                Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOMEM)
+                | Some(libc::ENOBUFS) => {
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
@@ -269,7 +296,10 @@ enum ReadLine {
 
 fn read_request_line<R: BufRead>(r: &mut R) -> io::Result<ReadLine> {
     let mut buf = Vec::new();
-    let n = r.by_ref().take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf)?;
+    let n = r
+        .by_ref()
+        .take(MAX_LINE as u64 + 1)
+        .read_until(b'\n', &mut buf)?;
     if n == 0 {
         return Ok(ReadLine::Eof);
     }
@@ -299,7 +329,9 @@ fn drain(stream: &UnixStream) {
 fn connection(stream: UnixStream, shared: &Shared) {
     // An idle client must not hold a slot forever; a timeout ends the read with an error.
     let _ = stream.set_read_timeout(Some(IDLE_READ_TIMEOUT));
-    let Ok(read_half) = stream.try_clone() else { return };
+    let Ok(read_half) = stream.try_clone() else {
+        return;
+    };
     let mut reader = BufReader::new(read_half);
     loop {
         let line = match read_request_line(&mut reader) {
@@ -404,7 +436,14 @@ mod tests {
             assert!(wake >= 0);
             let (tx, rx) = mpsc::channel();
             let handle = serve(listener, allowed, tx, wake);
-            Harness { _dir: dir, path, rx, wake, shut, handle: Some(handle) }
+            Harness {
+                _dir: dir,
+                path,
+                rx,
+                wake,
+                shut,
+                handle: Some(handle),
+            }
         }
         fn me() -> Self {
             Self::new([unsafe { libc::getuid() }, 0])
@@ -445,16 +484,40 @@ mod tests {
     fn parse_all_requests() {
         let cases: Vec<(&str, Request)> = vec![
             (r#"{"cmd":"status"}"#, Request::Status),
-            (r#"{"cmd":"incidents"}"#, Request::Incidents { limit: 10, offset: 0 }),
-            (r#"{"cmd":"incidents","limit":3,"offset":2}"#, Request::Incidents { limit: 3, offset: 2 }),
+            (
+                r#"{"cmd":"incidents"}"#,
+                Request::Incidents {
+                    limit: 10,
+                    offset: 0,
+                },
+            ),
+            (
+                r#"{"cmd":"incidents","limit":3,"offset":2}"#,
+                Request::Incidents {
+                    limit: 3,
+                    offset: 2,
+                },
+            ),
             (r#"{"cmd":"incident","id":7}"#, Request::Incident { id: 7 }),
             (r#"{"cmd":"subscribe"}"#, Request::Subscribe),
-            (r#"{"cmd":"pause","secs":600}"#, Request::Pause { secs: 600 }),
+            (
+                r#"{"cmd":"pause","secs":600}"#,
+                Request::Pause { secs: 600 },
+            ),
             (r#"{"cmd":"resume"}"#, Request::Resume),
-            (r#"{"cmd":"allowlist_add","name":"obs"}"#, Request::AllowlistAdd { name: "obs".into() }),
+            (
+                r#"{"cmd":"allowlist_add","name":"obs"}"#,
+                Request::AllowlistAdd { name: "obs".into() },
+            ),
             (r#"{"cmd":"allowlist_list"}"#, Request::AllowlistList),
-            (r#"{"cmd":"frozen_kill","id":2}"#, Request::FrozenKill { id: 2 }),
-            (r#"{"cmd":"frozen_resume","id":2}"#, Request::FrozenResume { id: 2 }),
+            (
+                r#"{"cmd":"frozen_kill","id":2}"#,
+                Request::FrozenKill { id: 2 },
+            ),
+            (
+                r#"{"cmd":"frozen_resume","id":2}"#,
+                Request::FrozenResume { id: 2 },
+            ),
         ];
         for (line, want) in cases {
             assert_eq!(handle_line(line), Ok(want), "{line}");
@@ -463,7 +526,13 @@ mod tests {
 
     #[test]
     fn invalid_requests_rejected() {
-        for line in ["", "garbage", r#"{"cmd":"nope"}"#, r#"{"cmd":"pause"}"#, r#"{"cmd":"incident","id":-1}"#] {
+        for line in [
+            "",
+            "garbage",
+            r#"{"cmd":"nope"}"#,
+            r#"{"cmd":"pause"}"#,
+            r#"{"cmd":"incident","id":-1}"#,
+        ] {
             let e = handle_line(line).unwrap_err();
             assert!(e.starts_with("bad request: "), "{line}: {e}");
         }
@@ -478,8 +547,17 @@ mod tests {
     #[test]
     fn response_lines() {
         assert_eq!(ok_line(&vec![1, 2]), r#"{"ok":true,"data":[1,2]}"#);
-        assert_eq!(err_line("no \"way\""), r#"{"ok":false,"error":"no \"way\""}"#);
-        let ev = Event::Notice { message: Message { title: "t".into(), body: "b".into() }, frozen_id: None };
+        assert_eq!(
+            err_line("no \"way\""),
+            r#"{"ok":false,"error":"no \"way\""}"#
+        );
+        let ev = Event::Notice {
+            message: Message {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            frozen_id: None,
+        };
         let v: serde_json::Value = serde_json::from_str(&event_line(&ev, 99)).unwrap();
         assert_eq!(v["wall_ms"], 99);
         assert_eq!(v["event"]["Notice"]["message"]["title"], "t");
@@ -536,7 +614,11 @@ mod tests {
         assert_eq!(v["ok"], false);
         assert!(v["error"].as_str().unwrap().contains("too long"));
         let mut rest = Vec::new();
-        assert_eq!(r.read_to_end(&mut rest).unwrap(), 0, "connection should be closed");
+        assert_eq!(
+            r.read_to_end(&mut rest).unwrap(),
+            0,
+            "connection should be closed"
+        );
         assert!(h.rx.try_recv().is_err());
     }
 
@@ -627,7 +709,9 @@ mod tests {
             subs.push(c);
         }
         // Keep the daemon-side senders alive and silent.
-        let _senders: Vec<_> = (0..MAX_CONNS).map(|_| h.rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
+        let _senders: Vec<_> = (0..MAX_CONNS)
+            .map(|_| h.rx.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
         drop(subs);
         std::thread::sleep(PROBE_INTERVAL * 4);
         let c = h.connect();

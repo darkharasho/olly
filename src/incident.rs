@@ -46,8 +46,16 @@ impl IncidentRecorder {
     }
 
     /// Call once per sample, after the engine step. Ignored outside an incident.
-    pub fn on_sample(&mut self, sys: &SystemSample, apps: &[AppSample], hist: &History, _wall_ms: u64) {
-        let Some(inc) = self.current.as_mut() else { return };
+    pub fn on_sample(
+        &mut self,
+        sys: &SystemSample,
+        apps: &[AppSample],
+        hist: &History,
+        _wall_ms: u64,
+    ) {
+        let Some(inc) = self.current.as_mut() else {
+            return;
+        };
         inc.min_avail = inc.min_avail.min(sys.mem.available);
         // peak_full starts below zero so the first sample always records the top apps.
         if sys.psi.full_avg10 > inc.peak_full {
@@ -70,7 +78,11 @@ impl IncidentRecorder {
     /// Closes the open incident at `wall_ms` because olly is stopping before it ended.
     pub fn finish_now(&mut self, wall_ms: u64) -> Option<Incident> {
         let mut inc = self.take_closed(wall_ms)?;
-        inc.summary = format!("{} {}", lead(&inc), voice::stopped_mid_incident(duration_secs(&inc)));
+        inc.summary = format!(
+            "{} {}",
+            lead(&inc),
+            voice::stopped_mid_incident(duration_secs(&inc))
+        );
         Some(inc)
     }
 
@@ -101,7 +113,9 @@ impl IncidentRecorder {
                 });
                 None
             }
-            Event::Acted { action, dry_run, .. } => {
+            Event::Acted {
+                action, dry_run, ..
+            } => {
                 if let Some(inc) = self.current.as_mut() {
                     inc.actions.push((wall_ms, action.clone(), *dry_run));
                 }
@@ -132,7 +146,10 @@ fn summarize(inc: &Incident) -> String {
 /// What was done during the incident, as one sentence.
 fn lead(inc: &Incident) -> String {
     let pick = |f: fn(&Action) -> Option<&Target>| {
-        inc.actions.iter().rev().find_map(|(_, a, dry)| f(a).map(|t| (t, *dry)))
+        inc.actions
+            .iter()
+            .rev()
+            .find_map(|(_, a, dry)| f(a).map(|t| (t, *dry)))
     };
     let kill = pick(|a| match a {
         Action::Kill { target, .. } => Some(target),
@@ -192,7 +209,10 @@ impl IncidentStore {
     fn write_line(&self, line: &Line) -> io::Result<()> {
         let mut buf = serde_json::to_vec(line).map_err(io::Error::other)?;
         buf.push(b'\n');
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         f.write_all(&buf)
     }
 
@@ -201,12 +221,17 @@ impl IncidentStore {
     }
 
     pub fn append_diagnosis(&self, id: u64, text: &str) -> io::Result<()> {
-        self.write_line(&Line::Diagnosis { id, text: text.to_string() })
+        self.write_line(&Line::Diagnosis {
+            id,
+            text: text.to_string(),
+        })
     }
 
     /// All parseable lines in file order; unreadable or corrupt lines are skipped.
     fn read_lines(&self) -> Vec<Line> {
-        let Ok(f) = File::open(&self.path) else { return Vec::new() };
+        let Ok(f) = File::open(&self.path) else {
+            return Vec::new();
+        };
         BufReader::new(f)
             .split(b'\n')
             .map_while(Result::ok)
@@ -236,7 +261,12 @@ impl IncidentStore {
 
     /// Newest first.
     pub fn list(&self, limit: usize, offset: usize) -> Vec<Incident> {
-        self.merged().into_iter().rev().skip(offset).take(limit).collect()
+        self.merged()
+            .into_iter()
+            .rev()
+            .skip(offset)
+            .take(limit)
+            .collect()
     }
 
     pub fn get(&self, id: u64) -> Option<Incident> {
@@ -252,7 +282,10 @@ impl IncidentStore {
             Err(e) => return Err(e),
         }
         let lines = self.read_lines();
-        let count = lines.iter().filter(|l| matches!(l, Line::Incident(_))).count();
+        let count = lines
+            .iter()
+            .filter(|l| matches!(l, Line::Incident(_)))
+            .count();
         let mut skip = count.saturating_sub(KEEP_INCIDENTS);
         let kept_ids: HashSet<u64> = lines
             .iter()
@@ -312,15 +345,24 @@ mod tests {
     fn sys(t: u64, full: f32, avail: u64) -> SystemSample {
         SystemSample {
             t_ms: t,
-            psi: Psi { some_avg10: full, full_avg10: full },
-            mem: MemInfo { total: 32 * GB, available: avail },
+            psi: Psi {
+                some_avg10: full,
+                full_avg10: full,
+            },
+            mem: MemInfo {
+                total: 32 * GB,
+                available: avail,
+            },
             zram_used: 0,
         }
     }
 
     fn app(i: u32, bytes: u64) -> AppSample {
         AppSample {
-            key: AppKey { cgroup: format!("/app{i}"), root_pid: None },
+            key: AppKey {
+                cgroup: format!("/app{i}"),
+                root_pid: None,
+            },
             name: format!("app{i}"),
             exe: None,
             kind: TargetKind::Cgroup,
@@ -332,7 +374,10 @@ mod tests {
     fn target(i: u32, bytes: u64) -> Target {
         Target {
             id: i as u64,
-            key: AppKey { cgroup: format!("/app{i}"), root_pid: None },
+            key: AppKey {
+                cgroup: format!("/app{i}"),
+                root_pid: None,
+            },
             name: format!("app{i}"),
             kind: TargetKind::Cgroup,
             bytes,
@@ -366,7 +411,10 @@ mod tests {
         let mut rec = IncidentRecorder::new();
         // Samples before an incident are ignored.
         rec.on_sample(&sys(0, 99.0, GB), &[app(0, GB)], &hist, 1_000_000);
-        assert_eq!(rec.on_event(&Event::IncidentStart { id: 7, t_ms: 1000 }, 1_001_000), None);
+        assert_eq!(
+            rec.on_event(&Event::IncidentStart { id: 7, t_ms: 1000 }, 1_001_000),
+            None
+        );
 
         let big: Vec<AppSample> = (0..12).map(|i| app(i, (i as u64 + 1) * GB)).collect();
         hist.record(1000, &big);
@@ -395,7 +443,9 @@ mod tests {
         let mut rec = IncidentRecorder::new();
         rec.on_event(&Event::IncidentStart { id: 8, t_ms: 0 }, 0);
         rec.on_sample(&sys(1000, 20.0, 5 * GB), &big, &hist, 1000);
-        let done = rec.on_event(&Event::IncidentEnd { id: 8, t_ms: 2000 }, 2000).unwrap();
+        let done = rec
+            .on_event(&Event::IncidentEnd { id: 8, t_ms: 2000 }, 2000)
+            .unwrap();
         assert_eq!(done.top_at_peak.len(), 10);
         assert_eq!(done.top_at_peak[0].name, "app11");
         assert_eq!(done.top_at_peak[9].name, "app2");
@@ -414,18 +464,45 @@ mod tests {
         hist.record(60_000, &[g.clone()]);
         rec.on_sample(&sys(60_000, 30.0, GB), &[g.clone()], &hist, 160_000);
         let t = target(1, 21 * GB);
-        let action = Action::Kill { target: t, reason: KillReason::Emergency };
+        let action = Action::Kill {
+            target: t,
+            reason: KillReason::Emergency,
+        };
         let msg = voice::killed("app1", 21 * GB, KillReason::Emergency, false);
         rec.on_event(
-            &Event::Acted { action: action.clone(), message: msg, dry_run: false },
+            &Event::Acted {
+                action: action.clone(),
+                message: msg,
+                dry_run: false,
+            },
             161_000,
         );
         rec.on_event(&Event::Level { level: Level::Calm }, 162_000);
-        let done = rec.on_event(&Event::IncidentEnd { id: 1, t_ms: 114_000 }, 114_000).unwrap();
+        let done = rec
+            .on_event(
+                &Event::IncidentEnd {
+                    id: 1,
+                    t_ms: 114_000,
+                },
+                114_000,
+            )
+            .unwrap();
         assert_eq!(done.actions, vec![(161_000, action, false)]);
-        assert!(done.summary.starts_with("Closed app1 (21 GB"), "{}", done.summary);
-        assert!(done.summary.ends_with("Recovered in 14s."), "{}", done.summary);
-        assert!(done.summary.contains("growing 600 MB/min"), "{}", done.summary);
+        assert!(
+            done.summary.starts_with("Closed app1 (21 GB"),
+            "{}",
+            done.summary
+        );
+        assert!(
+            done.summary.ends_with("Recovered in 14s."),
+            "{}",
+            done.summary
+        );
+        assert!(
+            done.summary.contains("growing 600 MB/min"),
+            "{}",
+            done.summary
+        );
         assert!(!done.summary.contains("olly"), "{}", done.summary);
     }
 
@@ -433,8 +510,13 @@ mod tests {
     fn mismatched_incident_end_keeps_current() {
         let mut rec = IncidentRecorder::new();
         rec.on_event(&Event::IncidentStart { id: 5, t_ms: 0 }, 0);
-        assert_eq!(rec.on_event(&Event::IncidentEnd { id: 4, t_ms: 1 }, 1000), None);
-        let done = rec.on_event(&Event::IncidentEnd { id: 5, t_ms: 2 }, 2000).unwrap();
+        assert_eq!(
+            rec.on_event(&Event::IncidentEnd { id: 4, t_ms: 1 }, 1000),
+            None
+        );
+        let done = rec
+            .on_event(&Event::IncidentEnd { id: 5, t_ms: 2 }, 2000)
+            .unwrap();
         assert_eq!(done.id, 5);
     }
 
@@ -442,8 +524,20 @@ mod tests {
     fn summary_without_actions() {
         let mut rec = IncidentRecorder::new();
         rec.on_event(&Event::IncidentStart { id: 1, t_ms: 0 }, 0);
-        let done = rec.on_event(&Event::IncidentEnd { id: 1, t_ms: 30_000 }, 30_000).unwrap();
-        assert!(done.summary.ends_with("Recovered in 30s."), "{}", done.summary);
+        let done = rec
+            .on_event(
+                &Event::IncidentEnd {
+                    id: 1,
+                    t_ms: 30_000,
+                },
+                30_000,
+            )
+            .unwrap();
+        assert!(
+            done.summary.ends_with("Recovered in 30s."),
+            "{}",
+            done.summary
+        );
         assert_eq!(done.min_avail, 0);
         assert_eq!(done.peak_full, 0.0);
     }
@@ -510,7 +604,9 @@ mod tests {
         assert_eq!(all[199].id, 101);
         assert_eq!(s.get(250).unwrap().diagnosis.as_deref(), Some("kept"));
         assert_eq!(s.get(5), None);
-        assert!(!std::fs::read_to_string(&s.path).unwrap().contains("dropped"));
+        assert!(!std::fs::read_to_string(&s.path)
+            .unwrap()
+            .contains("dropped"));
         assert_eq!(s.next_id(), 301);
         // Under the limit: untouched.
         let before = std::fs::read(&s.path).unwrap();
@@ -534,7 +630,12 @@ mod tests {
         let mut rec = IncidentRecorder::new();
         assert_eq!(rec.finish_now(5000), None);
         rec.on_event(&Event::IncidentStart { id: 3, t_ms: 0 }, 10_000);
-        rec.on_sample(&sys(1000, 20.0, 3 * GB), &[app(1, 9 * GB)], &History::new(&Config::default().growth), 11_000);
+        rec.on_sample(
+            &sys(1000, 20.0, 3 * GB),
+            &[app(1, 9 * GB)],
+            &History::new(&Config::default().growth),
+            11_000,
+        );
         let done = rec.finish_now(52_000).expect("open incident is flushed");
         assert_eq!(done.id, 3);
         assert_eq!(done.end_ms_wall, 52_000);

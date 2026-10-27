@@ -47,12 +47,27 @@ pub enum Action {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Event {
-    Level { level: Level },
-    IncidentStart { id: u64, t_ms: u64 },
-    IncidentEnd { id: u64, t_ms: u64 },
-    Acted { action: Action, message: Message, dry_run: bool },
+    Level {
+        level: Level,
+    },
+    IncidentStart {
+        id: u64,
+        t_ms: u64,
+    },
+    IncidentEnd {
+        id: u64,
+        t_ms: u64,
+    },
+    Acted {
+        action: Action,
+        message: Message,
+        dry_run: bool,
+    },
     /// Reminders, all-clear, hunches. `frozen_id` => offer Kill/Resume.
-    Notice { message: Message, frozen_id: Option<u64> },
+    Notice {
+        message: Message,
+        frozen_id: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -66,7 +81,9 @@ pub enum Command {
     KillFrozen(u64),
     ResumeFrozen(u64),
     /// Absolute time on the same monotonic clock as `SystemSample.t_ms`.
-    Pause { until_ms: u64 },
+    Pause {
+        until_ms: u64,
+    },
     Unpause,
 }
 
@@ -176,11 +193,16 @@ impl Engine {
 
         // 2. Frozen targets.
         let tm = &self.cfg.timing;
-        let (grace, remind, giveup) =
-            (tm.freeze_grace_secs * 1000, tm.freeze_remind_secs * 1000, tm.freeze_giveup_secs * 1000);
+        let (grace, remind, giveup) = (
+            tm.freeze_grace_secs * 1000,
+            tm.freeze_remind_secs * 1000,
+            tm.freeze_giveup_secs * 1000,
+        );
         let mut frozen = std::mem::take(&mut self.frozen);
         frozen.retain_mut(|f| {
-            let Some(a) = find(&f.target.key) else { return false };
+            let Some(a) = find(&f.target.key) else {
+                return false;
+            };
             f.target.bytes = a.bytes;
             let elapsed = now.saturating_sub(f.at_ms);
             let mut reason = None;
@@ -222,7 +244,12 @@ impl Engine {
             })
             .map(|a| {
                 let gentle = !self.resumed.contains(&a.key);
-                (a, hist.rate(&a.key, now), hist.recently_growing(&a.key, now), gentle)
+                (
+                    a,
+                    hist.rate(&a.key, now),
+                    hist.recently_growing(&a.key, now),
+                    gentle,
+                )
             })
             .collect();
         cands.sort_by(|x, y| y.1.total_cmp(&x.1).then(y.0.bytes.cmp(&x.0.bytes)));
@@ -239,7 +266,11 @@ impl Engine {
         match level {
             Level::Warning if !paused => {
                 for &(a, rate, growing, gentle) in &cands {
-                    if !growing || !gentle || a.kind != TargetKind::Cgroup || self.is_throttled(&a.key) {
+                    if !growing
+                        || !gentle
+                        || a.kind != TargetKind::Cgroup
+                        || self.is_throttled(&a.key)
+                    {
                         continue;
                     }
                     let target = self.target_for(a);
@@ -267,7 +298,11 @@ impl Engine {
             Level::Emergency if cooled => {
                 let pick = match top_growing {
                     Some(a) => Some((a, KillReason::Emergency)),
-                    None => cands.iter().map(|c| c.0).max_by_key(|a| a.bytes).map(|a| (a, KillReason::LastResort)),
+                    None => cands
+                        .iter()
+                        .map(|c| c.0)
+                        .max_by_key(|a| a.bytes)
+                        .map(|a| (a, KillReason::LastResort)),
                 };
                 if let Some((a, reason)) = pick {
                     let target = self.target_for(a);
@@ -289,7 +324,10 @@ impl Engine {
             self.dry_killed.clear();
             if let Some(id) = self.incident.take() {
                 out.events.push(Event::IncidentEnd { id, t_ms: now });
-                out.events.push(Event::Notice { message: voice::all_clear(), frozen_id: None });
+                out.events.push(Event::Notice {
+                    message: voice::all_clear(),
+                    frozen_id: None,
+                });
             }
         }
 
@@ -352,7 +390,13 @@ impl Engine {
                 self.next_target_id - 1
             }
         };
-        Target { id, key: a.key.clone(), name: a.name.clone(), kind: a.kind.clone(), bytes: a.bytes }
+        Target {
+            id,
+            key: a.key.clone(),
+            name: a.name.clone(),
+            kind: a.kind.clone(),
+            bytes: a.bytes,
+        }
     }
 
     fn take_frozen(&mut self, id: u64) -> Result<Target, String> {
@@ -377,7 +421,11 @@ impl Engine {
     }
 
     fn act(&self, out: &mut StepOutput, action: Action, message: Message) {
-        out.events.push(Event::Acted { action: action.clone(), message, dry_run: self.cfg.dry_run });
+        out.events.push(Event::Acted {
+            action: action.clone(),
+            message,
+            dry_run: self.cfg.dry_run,
+        });
         out.actions.push(action);
     }
 }
@@ -396,8 +444,14 @@ mod tests {
     fn sys(t: u64, some: f32, full: f32, avail_pct: f32) -> SystemSample {
         SystemSample {
             t_ms: t,
-            psi: Psi { some_avg10: some, full_avg10: full },
-            mem: MemInfo { total: TOTAL, available: (TOTAL as f64 * avail_pct as f64 / 100.0) as u64 },
+            psi: Psi {
+                some_avg10: some,
+                full_avg10: full,
+            },
+            mem: MemInfo {
+                total: TOTAL,
+                available: (TOTAL as f64 * avail_pct as f64 / 100.0) as u64,
+            },
             zram_used: 0,
         }
     }
@@ -417,7 +471,10 @@ mod tests {
 
     fn app(name: &str, key: &str, kind: TargetKind, bytes: u64) -> AppSample {
         AppSample {
-            key: AppKey { cgroup: key.into(), root_pid: None },
+            key: AppKey {
+                cgroup: key.into(),
+                root_pid: None,
+            },
             name: name.into(),
             exe: None,
             kind,
@@ -427,12 +484,19 @@ mod tests {
     }
 
     fn procs() -> TargetKind {
-        TargetKind::Processes { pids: vec![(500, 1500)] }
+        TargetKind::Processes {
+            pids: vec![(500, 1500)],
+        }
     }
 
     /// Cgroup app growing 1 GiB per 10s, starting at 10 GiB.
     fn leak(t_ms: u64) -> AppSample {
-        app("leaky", "/leaky", TargetKind::Cgroup, 10 * GIB + t_ms * (GIB / 10) / 1000)
+        app(
+            "leaky",
+            "/leaky",
+            TargetKind::Cgroup,
+            10 * GIB + t_ms * (GIB / 10) / 1000,
+        )
     }
 
     struct Sim {
@@ -445,8 +509,15 @@ mod tests {
         fn new() -> Self {
             let cfg = Config::default();
             let hist = History::new(&cfg.growth);
-            let allow = Allowlist::load(cfg.allowlist.clone(), PathBuf::from("/nonexistent/olly/a.toml"));
-            Sim { eng: Engine::new(cfg), hist, allow }
+            let allow = Allowlist::load(
+                cfg.allowlist.clone(),
+                PathBuf::from("/nonexistent/olly/a.toml"),
+            );
+            Sim {
+                eng: Engine::new(cfg),
+                hist,
+                allow,
+            }
         }
 
         fn step(&mut self, s: SystemSample, apps: &[AppSample]) -> StepOutput {
@@ -531,7 +602,10 @@ mod tests {
             [Action::Freeze { target }] => target.id,
             a => panic!("expected freeze, got {a:?}"),
         };
-        assert_eq!(sim.eng.frozen().iter().map(|t| t.id).collect::<Vec<_>>(), vec![id]);
+        assert_eq!(
+            sim.eng.frozen().iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![id]
+        );
 
         for s in 13..22 {
             let out = sim.step(critical(s * 1000), &[leak(s * 1000)]);
@@ -539,7 +613,10 @@ mod tests {
         }
         let out = sim.step(critical(22_000), &[leak(22_000)]);
         match &out.actions[..] {
-            [Action::Kill { target, reason: KillReason::GraceExpired }] => assert_eq!(target.id, id),
+            [Action::Kill {
+                target,
+                reason: KillReason::GraceExpired,
+            }] => assert_eq!(target.id, id),
             a => panic!("expected grace kill, got {a:?}"),
         }
         assert!(sim.eng.frozen().is_empty());
@@ -571,7 +648,10 @@ mod tests {
         assert_eq!(sim.eng.frozen().len(), 1);
 
         let out = sim.step(sys(311_000, 0.0, 20.0, 50.0), &[leak(311_000)]);
-        assert_eq!(kills(&out), vec![("leaky".to_string(), KillReason::NoAnswer)]);
+        assert_eq!(
+            kills(&out),
+            vec![("leaky".to_string(), KillReason::NoAnswer)]
+        );
         assert!(sim.eng.frozen().is_empty());
     }
 
@@ -586,7 +666,10 @@ mod tests {
         };
         let out = sim.step(emergency(12_000), &[leak(12_000)]);
         match &out.actions[..] {
-            [Action::Kill { target, reason: KillReason::Emergency }] => {
+            [Action::Kill {
+                target,
+                reason: KillReason::Emergency,
+            }] => {
                 assert_eq!(target.id, id);
                 assert_eq!(target.bytes, leak(12_000).bytes);
             }
@@ -597,8 +680,11 @@ mod tests {
 
     #[test]
     fn steam_game_frozen_not_steam() {
-        let base = Sampler::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"), 1000)
-            .apps();
+        let base = Sampler::new(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"),
+            1000,
+        )
+        .apps();
         let apps_at = |t_ms: u64| {
             let mut v = base.clone();
             for a in &mut v {
@@ -629,7 +715,14 @@ mod tests {
     #[test]
     fn process_target_not_throttled_at_warning() {
         let mut sim = Sim::new();
-        let grow = |t: u64| vec![app("proc", "/proc", procs(), 10 * GIB + t * (GIB / 10) / 1000)];
+        let grow = |t: u64| {
+            vec![app(
+                "proc",
+                "/proc",
+                procs(),
+                10 * GIB + t * (GIB / 10) / 1000,
+            )]
+        };
         sim.warm(10, grow);
         for s in 11..=40 {
             let out = sim.step(warning(s * 1000), &grow(s * 1000));
@@ -642,7 +735,12 @@ mod tests {
     fn allowlisted_grower_skipped_next_chosen() {
         let mut sim = Sim::new();
         let apps = |t: u64| {
-            let mut kwin = app("kwin_wayland", "/kwin", TargetKind::Cgroup, 4 * GIB + t * (GIB / 5) / 1000);
+            let mut kwin = app(
+                "kwin_wayland",
+                "/kwin",
+                TargetKind::Cgroup,
+                4 * GIB + t * (GIB / 5) / 1000,
+            );
             kwin.names.push("kwin_wayland_wrapper".into());
             vec![kwin, leak(t)]
         };
@@ -666,20 +764,32 @@ mod tests {
         };
         sim.warm(10, apps);
         let out = sim.step(emergency(11_000), &apps(11_000));
-        assert_eq!(kills(&out), vec![("big".to_string(), KillReason::LastResort)]);
+        assert_eq!(
+            kills(&out),
+            vec![("big".to_string(), KillReason::LastResort)]
+        );
         assert_eq!(out.actions.len(), 1);
-        let Event::Acted { message, dry_run, .. } = out.events.last().unwrap() else {
+        let Event::Acted {
+            message, dry_run, ..
+        } = out.events.last().unwrap()
+        else {
             panic!("expected acted event last")
         };
         assert!(!dry_run);
-        assert_eq!(*message, voice::killed("big", 12 * GIB, KillReason::LastResort, false));
+        assert_eq!(
+            *message,
+            voice::killed("big", 12 * GIB, KillReason::LastResort, false)
+        );
     }
 
     #[test]
     fn pause_blocks_freeze_not_emergency() {
         let mut sim = Sim::new();
         sim.warm(10, |t| vec![leak(t)]);
-        let out = sim.eng.command(Command::Pause { until_ms: 100_000 }, 10_500).unwrap();
+        let out = sim
+            .eng
+            .command(Command::Pause { until_ms: 100_000 }, 10_500)
+            .unwrap();
         assert_eq!(out, StepOutput::default());
         assert_eq!(sim.eng.paused_until(), Some(100_000));
         for s in 11..=20 {
@@ -689,13 +799,18 @@ mod tests {
             assert!(out.actions.is_empty(), "t {t}: {:?}", out.actions);
         }
         let out = sim.step(emergency(21_000), &[leak(21_000)]);
-        assert_eq!(kills(&out), vec![("leaky".to_string(), KillReason::Emergency)]);
+        assert_eq!(
+            kills(&out),
+            vec![("leaky".to_string(), KillReason::Emergency)]
+        );
         assert_eq!(sim.eng.paused_until(), Some(100_000));
 
         sim.step(calm(100_000), &[]);
         assert_eq!(sim.eng.paused_until(), None);
 
-        sim.eng.command(Command::Pause { until_ms: 500_000 }, 101_000).unwrap();
+        sim.eng
+            .command(Command::Pause { until_ms: 500_000 }, 101_000)
+            .unwrap();
         sim.eng.command(Command::Unpause, 102_000).unwrap();
         assert_eq!(sim.eng.paused_until(), None);
     }
@@ -703,7 +818,14 @@ mod tests {
     #[test]
     fn cooldown_spaces_kills() {
         let mut sim = Sim::new();
-        let other = |t: u64| app("other", "/other", TargetKind::Cgroup, 8 * GIB + t * (GIB / 20) / 1000);
+        let other = |t: u64| {
+            app(
+                "other",
+                "/other",
+                TargetKind::Cgroup,
+                8 * GIB + t * (GIB / 20) / 1000,
+            )
+        };
         let mut alive = vec![true, true];
         let apps = |t: u64, alive: &[bool]| {
             let mut v = Vec::new();
@@ -737,8 +859,19 @@ mod tests {
         let mut sim = Sim::new();
         sim.warm(10, |t| vec![leak(t)]);
         let out = sim.step(warning(11_000), &[leak(11_000)]);
-        assert_eq!(out.events[0], Event::Level { level: Level::Warning });
-        assert_eq!(out.events[1], Event::IncidentStart { id: 1, t_ms: 11_000 });
+        assert_eq!(
+            out.events[0],
+            Event::Level {
+                level: Level::Warning
+            }
+        );
+        assert_eq!(
+            out.events[1],
+            Event::IncidentStart {
+                id: 1,
+                t_ms: 11_000
+            }
+        );
         let tid = match &out.actions[..] {
             [Action::Throttle { target, .. }] => target.id,
             a => panic!("expected throttle, got {a:?}"),
@@ -749,7 +882,10 @@ mod tests {
         for s in 12..72 {
             let out = sim.step(calm(s * 1000), std::slice::from_ref(&stable));
             assert!(out.actions.is_empty(), "step {s}: {:?}", out.actions);
-            assert!(!out.events.iter().any(|e| matches!(e, Event::IncidentEnd { .. })));
+            assert!(!out
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::IncidentEnd { .. })));
         }
         let out = sim.step(calm(72_000), std::slice::from_ref(&stable));
         match &out.actions[..] {
@@ -761,13 +897,28 @@ mod tests {
             &out.events[0],
             Event::Acted { action: Action::Unthrottle { .. }, message, .. } if *message == voice::unthrottled("leaky")
         ));
-        assert_eq!(out.events[1], Event::IncidentEnd { id: 1, t_ms: 72_000 });
-        assert_eq!(out.events[2], Event::Notice { message: voice::all_clear(), frozen_id: None });
+        assert_eq!(
+            out.events[1],
+            Event::IncidentEnd {
+                id: 1,
+                t_ms: 72_000
+            }
+        );
+        assert_eq!(
+            out.events[2],
+            Event::Notice {
+                message: voice::all_clear(),
+                frozen_id: None
+            }
+        );
         assert!(sim.eng.throttled().is_empty());
 
         // A new incident gets the next id.
         let out = sim.step(warning(80_000), &[stable]);
-        assert!(out.events.contains(&Event::IncidentStart { id: 2, t_ms: 80_000 }));
+        assert!(out.events.contains(&Event::IncidentStart {
+            id: 2,
+            t_ms: 80_000
+        }));
     }
 
     #[test]
@@ -775,13 +926,22 @@ mod tests {
         let mut sim = Sim::new();
         sim.eng.set_next_incident_id(42);
         let out = sim.step(critical(1000), &[]);
-        assert!(out.events.contains(&Event::IncidentStart { id: 42, t_ms: 1000 }));
+        assert!(out
+            .events
+            .contains(&Event::IncidentStart { id: 42, t_ms: 1000 }));
     }
 
     #[test]
     fn command_kill_and_resume_frozen() {
         let mut sim = Sim::new();
-        let other = |t: u64| app("other", "/other", TargetKind::Cgroup, 8 * GIB + t * (GIB / 20) / 1000);
+        let other = |t: u64| {
+            app(
+                "other",
+                "/other",
+                TargetKind::Cgroup,
+                8 * GIB + t * (GIB / 20) / 1000,
+            )
+        };
         let apps = |t: u64| vec![leak(t), other(t)];
         sim.warm(10, apps);
         let mut ids = Vec::new();
@@ -798,12 +958,21 @@ mod tests {
         assert_eq!(ids[0].1, "leaky");
         assert_eq!(ids[1].1, "other");
 
-        let out = sim.eng.command(Command::KillFrozen(ids[0].0), 17_000).unwrap();
+        let out = sim
+            .eng
+            .command(Command::KillFrozen(ids[0].0), 17_000)
+            .unwrap();
         match &out.actions[..] {
-            [Action::Kill { target, reason: KillReason::User }] => assert_eq!(target.id, ids[0].0),
+            [Action::Kill {
+                target,
+                reason: KillReason::User,
+            }] => assert_eq!(target.id, ids[0].0),
             a => panic!("expected user kill, got {a:?}"),
         }
-        let out = sim.eng.command(Command::ResumeFrozen(ids[1].0), 17_000).unwrap();
+        let out = sim
+            .eng
+            .command(Command::ResumeFrozen(ids[1].0), 17_000)
+            .unwrap();
         match &out.actions[..] {
             [Action::Resume { target }] => assert_eq!(target.id, ids[1].0),
             a => panic!("expected resume, got {a:?}"),
@@ -817,7 +986,10 @@ mod tests {
             sim.eng.command(Command::KillFrozen(99), 17_000),
             Err("no frozen target with id 99".to_string())
         );
-        assert!(sim.eng.command(Command::ResumeFrozen(ids[0].0), 17_000).is_err());
+        assert!(sim
+            .eng
+            .command(Command::ResumeFrozen(ids[0].0), 17_000)
+            .is_err());
     }
 
     #[test]
@@ -850,7 +1022,10 @@ mod tests {
             assert!(out.actions.is_empty(), "t {t}: {:?}", out.actions);
         }
         let out = sim.step(emergency(32_000), &[leak(32_000)]);
-        assert_eq!(kills(&out), vec![("leaky".to_string(), KillReason::Emergency)]);
+        assert_eq!(
+            kills(&out),
+            vec![("leaky".to_string(), KillReason::Emergency)]
+        );
     }
 
     #[test]
@@ -862,7 +1037,10 @@ mod tests {
         let mut ended = false;
         for s in 12..=72 {
             let out = sim.step(calm(s * 1000), &[leak(s * 1000)]);
-            ended |= out.events.iter().any(|e| matches!(e, Event::IncidentEnd { .. }));
+            ended |= out
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::IncidentEnd { .. }));
         }
         assert!(ended);
         let out = sim.step(critical(80_000), &[leak(80_000)]);
@@ -892,7 +1070,13 @@ mod tests {
         }
         assert_eq!(actions.len(), 2, "{actions:?}");
         assert!(matches!(actions[0], Action::Freeze { .. }));
-        assert!(matches!(actions[1], Action::Kill { reason: KillReason::GraceExpired, .. }));
+        assert!(matches!(
+            actions[1],
+            Action::Kill {
+                reason: KillReason::GraceExpired,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -914,7 +1098,10 @@ mod tests {
         sim.warm(10, |t| vec![leak(t)]);
         freeze_id(&sim.step(critical(11_000), &[leak(11_000)]));
         let out = sim.step(critical(81_000), &[leak(81_000)]);
-        assert_eq!(kills(&out), vec![("leaky".to_string(), KillReason::GraceExpired)]);
+        assert_eq!(
+            kills(&out),
+            vec![("leaky".to_string(), KillReason::GraceExpired)]
+        );
         assert_eq!(out.actions.len(), 1);
         assert!(notices(&out).is_empty(), "{:?}", out.events);
     }
@@ -930,11 +1117,17 @@ mod tests {
         for s in 22..=150 {
             let out = sim.step(calm(s * 1000), &[leak(s * 1000)]);
             assert!(out.actions.is_empty(), "step {s}: {:?}", out.actions);
-            assert!(!out.events.iter().any(|e| matches!(e, Event::IncidentEnd { .. })));
+            assert!(!out
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::IncidentEnd { .. })));
         }
         assert_eq!(sim.eng.frozen().len(), 1);
         sim.eng.command(Command::ResumeFrozen(id), 150_500).unwrap();
         let out = sim.step(calm(151_000), &[leak(151_000)]);
-        assert!(out.events.iter().any(|e| matches!(e, Event::IncidentEnd { id: 1, .. })));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::IncidentEnd { id: 1, .. })));
     }
 }

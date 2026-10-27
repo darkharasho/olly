@@ -41,7 +41,13 @@ impl PsiTrigger {
         let mut buf = spec.as_bytes().to_vec();
         buf.push(0);
         // SAFETY: buf is valid for buf.len() bytes.
-        let n = unsafe { libc::write(fd.as_raw_fd(), buf.as_ptr() as *const libc::c_void, buf.len()) };
+        let n = unsafe {
+            libc::write(
+                fd.as_raw_fd(),
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+            )
+        };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -56,8 +62,14 @@ impl PsiTrigger {
 /// poll(2) on `fds`; returns which ones have any revents (including errors).
 /// `timeout_ms < 0` waits forever. EINTR counts as "nothing ready".
 pub fn wait(fds: &[(RawFd, i16)], timeout_ms: i32) -> io::Result<Vec<bool>> {
-    let mut pfds: Vec<libc::pollfd> =
-        fds.iter().map(|&(fd, events)| libc::pollfd { fd, events, revents: 0 }).collect();
+    let mut pfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&(fd, events)| libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        })
+        .collect();
     // SAFETY: pfds is a valid array of pfds.len() pollfd structs.
     let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
     if rc < 0 {

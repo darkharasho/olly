@@ -33,7 +33,11 @@ pub fn throttled(app: &str, rate_bytes_per_min: u64, dry: bool) -> Message {
     } else {
         format!("It's gobbling memory fast (+{rate}/min), so I've slowed it down a bit. Everything else should stay smooth.")
     };
-    msg(dry, format!("olly is keeping an eye on {app} \u{1F916}"), body)
+    msg(
+        dry,
+        format!("olly is keeping an eye on {app} \u{1F916}"),
+        body,
+    )
 }
 
 pub fn frozen(app: &str, grace_secs: u64, dry: bool) -> Message {
@@ -88,15 +92,29 @@ pub fn unthrottled(app: &str) -> Message {
 pub fn all_clear() -> Message {
     Message {
         title: "All clear! \u{2728}".to_string(),
-        body: "Memory's back to comfy. I've saved notes on what happened: olly incidents".to_string(),
+        body: "Memory's back to comfy. I've saved notes on what happened: olly incidents"
+            .to_string(),
     }
 }
 
 pub fn hunch(summary: &str) -> Message {
     Message {
         title: "olly has a hunch \u{1F50D}".to_string(),
-        body: summary.chars().take(200).collect(),
+        body: clip(summary, 200),
     }
+}
+
+/// At most `max` chars, cut at a word boundary with an ellipsis when it had to be shortened.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max - 1).collect();
+    let cut = head
+        .rfind(char::is_whitespace)
+        .filter(|&i| i > 0)
+        .map_or(head.as_str(), |i| &head[..i]);
+    format!("{}\u{2026}", cut.trim_end())
 }
 
 /// An action the actuator could not carry out (the target is usually already gone).
@@ -110,7 +128,10 @@ pub fn act_failed(action: &Action) -> Message {
     };
     Message {
         title: format!("olly couldn't {verb} {}", t.name),
-        body: format!("olly tried to {verb} {} but couldn't \u{2014} it may have already closed.", t.name),
+        body: format!(
+            "olly tried to {verb} {} but couldn't \u{2014} it may have already closed.",
+            t.name
+        ),
     }
 }
 
@@ -131,7 +152,9 @@ pub fn stopped_mid_incident(secs: u64) -> String {
 pub fn status_line(level: Level, avail_bytes: u64, paused_remaining_ms: Option<u64>) -> String {
     let avail = fmt_bytes(avail_bytes);
     let mut s = match level {
-        Level::Calm => format!("\u{1F916} olly is watching. All calm \u{2014} {avail} free, nothing suspicious."),
+        Level::Calm => format!(
+            "\u{1F916} olly is watching. All calm \u{2014} {avail} free, nothing suspicious."
+        ),
         _ => {
             let name = format!("{level:?}").to_lowercase();
             format!("\u{1F916} olly is on alert ({name}) \u{2014} {avail} free.")
@@ -219,7 +242,9 @@ mod tests {
             k.body,
             "I would have closed it (it's using 2.0 GB) — dry run, so it's still running."
         );
-        assert!(!throttled("Firefox", 1, false).title.starts_with("[dry run]"));
+        assert!(!throttled("Firefox", 1, false)
+            .title
+            .starts_with("[dry run]"));
     }
 
     #[test]
@@ -256,7 +281,10 @@ mod tests {
         assert_eq!(resumed("X").body, "I'll keep a close eye on it.");
         assert_eq!(all_clear().title, "All clear! ✨");
         assert_eq!(unthrottled("X").title, "olly eased off X");
-        assert_eq!(unthrottled("X").body, "Memory's calm again, so X is back to full speed.");
+        assert_eq!(
+            unthrottled("X").body,
+            "Memory's calm again, so X is back to full speed."
+        );
         let u = killed("X", 3_000_000_000, KillReason::User, false);
         assert_eq!(u.title, "Closed X");
         assert_eq!(u.body, "Done — freed up 3.0 GB.");
@@ -270,6 +298,12 @@ mod tests {
     fn hunch_truncates() {
         let long = "a".repeat(300);
         assert_eq!(hunch(&long).body.chars().count(), 200);
+        let words = "word ".repeat(60);
+        let b = hunch(&words).body;
+        assert!(
+            b.chars().count() <= 200 && b.ends_with("word\u{2026}"),
+            "{b}"
+        );
         assert_eq!(hunch("short").body, "short");
         assert_eq!(hunch("short").title, "olly has a hunch 🔍");
     }
@@ -294,17 +328,28 @@ mod tests {
     fn act_failed_copy() {
         let t = crate::engine::Target {
             id: 1,
-            key: crate::sample::AppKey { cgroup: "/c".into(), root_pid: None },
+            key: crate::sample::AppKey {
+                cgroup: "/c".into(),
+                root_pid: None,
+            },
             name: "Firefox".into(),
             kind: crate::sample::TargetKind::Cgroup,
             bytes: 1,
         };
         let m = act_failed(&Action::Freeze { target: t.clone() });
-        assert_eq!(m.body, "olly tried to pause Firefox but couldn't \u{2014} it may have already closed.");
+        assert_eq!(
+            m.body,
+            "olly tried to pause Firefox but couldn't \u{2014} it may have already closed."
+        );
         assert_eq!(m.title, "olly couldn't pause Firefox");
-        let k = act_failed(&Action::Kill { target: t.clone(), reason: KillReason::Emergency });
+        let k = act_failed(&Action::Kill {
+            target: t.clone(),
+            reason: KillReason::Emergency,
+        });
         assert!(k.body.starts_with("olly tried to close Firefox"));
-        assert!(act_failed(&Action::Throttle { target: t, high: 1 }).body.contains("slow down"));
+        assert!(act_failed(&Action::Throttle { target: t, high: 1 })
+            .body
+            .contains("slow down"));
     }
 
     #[test]

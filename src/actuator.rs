@@ -72,7 +72,9 @@ fn signal_pids(proc_root: &Path, pids: &[(i32, u64)], sig: i32) -> usize {
             continue;
         }
         let stat = proc_root.join("proc").join(pid.to_string()).join("stat");
-        let Ok(txt) = fs::read_to_string(stat) else { continue };
+        let Ok(txt) = fs::read_to_string(stat) else {
+            continue;
+        };
         if parse_start_time(&txt) != Some(start) {
             continue;
         }
@@ -94,15 +96,24 @@ fn signal_target(proc_root: &Path, pids: &[(i32, u64)], sig: i32) -> Result<(), 
 
 impl SysActuator {
     pub fn new(cgroup_root: PathBuf, proc_root: PathBuf, active_path: PathBuf) -> Self {
-        Self { cgroup_root, proc_root, active_path, active: ActiveState::default() }
+        Self {
+            cgroup_root,
+            proc_root,
+            active_path,
+            active: ActiveState::default(),
+        }
     }
 
     /// Takes over whatever `recover` left in the active-state file (entries it could not
     /// undo whose targets still exist), so the next persist keeps them and
     /// `restore_throttles` / `undo_all` retry them. Returns how many were adopted.
     pub fn adopt_leftovers(&mut self) -> usize {
-        let Ok(txt) = fs::read_to_string(&self.active_path) else { return 0 };
-        let Ok(left) = serde_json::from_str::<ActiveState>(&txt) else { return 0 };
+        let Ok(txt) = fs::read_to_string(&self.active_path) else {
+            return 0;
+        };
+        let Ok(left) = serde_json::from_str::<ActiveState>(&txt) else {
+            return 0;
+        };
         let n = left.frozen.len() + left.throttled.len();
         for t in left.frozen {
             if !self.active.frozen.iter().any(|f| f.key == t.key) {
@@ -144,7 +155,11 @@ impl SysActuator {
         if !matches!(t.kind, TargetKind::Cgroup) {
             return Err("cannot throttle processes".to_string());
         }
-        let existing = self.active.throttled.iter().position(|(f, _)| f.key == t.key);
+        let existing = self
+            .active
+            .throttled
+            .iter()
+            .position(|(f, _)| f.key == t.key);
         let prev = match existing {
             Some(i) => self.active.throttled[i].1.clone(),
             None => {
@@ -170,7 +185,12 @@ impl SysActuator {
     }
 
     fn unthrottle(&mut self, t: &Target) -> Result<(), String> {
-        let Some(i) = self.active.throttled.iter().position(|(f, _)| f.key == t.key) else {
+        let Some(i) = self
+            .active
+            .throttled
+            .iter()
+            .position(|(f, _)| f.key == t.key)
+        else {
             return Ok(());
         };
         let (stored, prev) = self.active.throttled[i].clone();
@@ -269,8 +289,12 @@ impl Actuator for SysActuator {
 /// returned lines, never raised. Entries that failed and still exist are written back to the
 /// file; it is deleted only when nothing is left.
 pub fn recover(cgroup_root: &Path, proc_root: &Path, active_path: &Path) -> Vec<String> {
-    let Ok(txt) = fs::read_to_string(active_path) else { return Vec::new() };
-    let Ok(state) = serde_json::from_str::<ActiveState>(&txt) else { return Vec::new() };
+    let Ok(txt) = fs::read_to_string(active_path) else {
+        return Vec::new();
+    };
+    let Ok(state) = serde_json::from_str::<ActiveState>(&txt) else {
+        return Vec::new();
+    };
     let mut log = Vec::new();
     let mut left = ActiveState::default();
     for t in state.frozen {
@@ -353,7 +377,10 @@ mod tests {
     fn cg_target(cg: &str) -> Target {
         Target {
             id: 1,
-            key: AppKey { cgroup: cg.into(), root_pid: None },
+            key: AppKey {
+                cgroup: cg.into(),
+                root_pid: None,
+            },
             name: "x".into(),
             kind: TargetKind::Cgroup,
             bytes: 1,
@@ -364,7 +391,11 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("cg").join(cg.trim_start_matches('/'));
         fs::create_dir_all(&dir).unwrap();
-        let act = SysActuator::new(d.path().join("cg"), "/".into(), d.path().join("state/active.json"));
+        let act = SysActuator::new(
+            d.path().join("cg"),
+            "/".into(),
+            d.path().join("state/active.json"),
+        );
         (d, act, dir)
     }
 
@@ -375,9 +406,14 @@ mod tests {
     fn proc_target(c: &Child, st: u64) -> Target {
         Target {
             id: 2,
-            key: AppKey { cgroup: "/p".into(), root_pid: Some(c.id() as i32) },
+            key: AppKey {
+                cgroup: "/p".into(),
+                root_pid: Some(c.id() as i32),
+            },
             name: "sleep".into(),
-            kind: TargetKind::Processes { pids: vec![(c.id() as i32, st)] },
+            kind: TargetKind::Processes {
+                pids: vec![(c.id() as i32, st)],
+            },
             bytes: 1,
         }
     }
@@ -406,13 +442,22 @@ mod tests {
         let (_d, mut act, dir) = setup("/a");
         fs::write(dir.join("memory.high"), "max\n").unwrap();
         let t = cg_target("/a");
-        act.apply(&Action::Throttle { target: t.clone(), high: 1000 }).unwrap();
+        act.apply(&Action::Throttle {
+            target: t.clone(),
+            high: 1000,
+        })
+        .unwrap();
         assert_eq!(fs::read_to_string(dir.join("memory.high")).unwrap(), "1000");
         // re-throttle keeps the original previous value
-        act.apply(&Action::Throttle { target: t.clone(), high: 500 }).unwrap();
+        act.apply(&Action::Throttle {
+            target: t.clone(),
+            high: 500,
+        })
+        .unwrap();
         assert_eq!(fs::read_to_string(dir.join("memory.high")).unwrap(), "500");
         assert_eq!(act.active.throttled[0].1, "max");
-        act.apply(&Action::Unthrottle { target: t.clone() }).unwrap();
+        act.apply(&Action::Unthrottle { target: t.clone() })
+            .unwrap();
         assert_eq!(fs::read_to_string(dir.join("memory.high")).unwrap(), "max");
         assert!(act.active.throttled.is_empty());
         assert_eq!(act.apply(&Action::Unthrottle { target: t }), Ok(()));
@@ -423,7 +468,11 @@ mod tests {
         let (_d, mut act, dir) = setup("/a");
         let t = cg_target("/a");
         act.apply(&Action::Freeze { target: t.clone() }).unwrap();
-        act.apply(&Action::Kill { target: t, reason: crate::engine::KillReason::User }).unwrap();
+        act.apply(&Action::Kill {
+            target: t,
+            reason: crate::engine::KillReason::User,
+        })
+        .unwrap();
         assert_eq!(fs::read_to_string(dir.join("cgroup.kill")).unwrap(), "1");
         assert_eq!(act.active, ActiveState::default());
     }
@@ -434,7 +483,10 @@ mod tests {
         let mut c = spawn_sleep();
         let st = start_time(&c);
         let bad = proc_target(&c, st + 1);
-        let kill = |t: Target| Action::Kill { target: t, reason: crate::engine::KillReason::User };
+        let kill = |t: Target| Action::Kill {
+            target: t,
+            reason: crate::engine::KillReason::User,
+        };
         assert_eq!(act.apply(&kill(bad)), Err("target gone".to_string()));
         assert!(c.try_wait().unwrap().is_none());
         act.apply(&kill(proc_target(&c, st))).unwrap();
@@ -475,7 +527,11 @@ mod tests {
         fs::write(dir.join("memory.high"), "max").unwrap();
         let t = cg_target("/a");
         act.apply(&Action::Freeze { target: t.clone() }).unwrap();
-        act.apply(&Action::Throttle { target: t.clone(), high: 9 }).unwrap();
+        act.apply(&Action::Throttle {
+            target: t.clone(),
+            high: 9,
+        })
+        .unwrap();
         let path = d.path().join("state/active.json");
         let st: ActiveState = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(st.frozen.len(), 1);
@@ -493,7 +549,10 @@ mod tests {
         fs::write(dir.join("cgroup.freeze"), "1").unwrap();
         fs::write(dir.join("memory.high"), "1000").unwrap();
         let t = cg_target("/a");
-        let st = ActiveState { frozen: vec![t.clone()], throttled: vec![(t, "max".into())] };
+        let st = ActiveState {
+            frozen: vec![t.clone()],
+            throttled: vec![(t, "max".into())],
+        };
         let path = d.path().join("active.json");
         fs::write(&path, serde_json::to_string(&st).unwrap()).unwrap();
         let lines = recover(&d.path().join("cg"), Path::new("/"), &path);
@@ -519,7 +578,10 @@ mod tests {
         let t = proc_target(&c, start_time(&c));
         unsafe { libc::kill(c.id() as i32, libc::SIGSTOP) };
         let path = d.path().join("active.json");
-        let st = ActiveState { frozen: vec![t], throttled: vec![] };
+        let st = ActiveState {
+            frozen: vec![t],
+            throttled: vec![],
+        };
         fs::write(&path, serde_json::to_string(&st).unwrap()).unwrap();
         recover(d.path(), Path::new("/"), &path);
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -551,7 +613,10 @@ mod tests {
         assert_eq!(act.active.frozen.len(), 1);
         // kill with a missing cgroup.kill file while the cgroup exists also keeps it
         fs::create_dir(dir.join("cgroup.kill")).unwrap();
-        let k = Action::Kill { target: t, reason: crate::engine::KillReason::User };
+        let k = Action::Kill {
+            target: t,
+            reason: crate::engine::KillReason::User,
+        };
         assert!(act.apply(&k).is_err());
         assert_eq!(act.active.frozen.len(), 1);
     }
@@ -567,7 +632,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         act.apply(&Action::Freeze { target: t.clone() }).unwrap();
         fs::remove_dir_all(&dir).unwrap();
-        let k = Action::Kill { target: t, reason: crate::engine::KillReason::User };
+        let k = Action::Kill {
+            target: t,
+            reason: crate::engine::KillReason::User,
+        };
         assert!(act.apply(&k).is_err());
         assert_eq!(act.active, ActiveState::default());
     }
@@ -577,10 +645,16 @@ mod tests {
         let (_d, mut act, dir) = setup("/a");
         fs::write(dir.join("memory.high"), "max").unwrap();
         let t = cg_target("/a");
-        act.apply(&Action::Throttle { target: t.clone(), high: 7 }).unwrap();
+        act.apply(&Action::Throttle {
+            target: t.clone(),
+            high: 7,
+        })
+        .unwrap();
         fs::remove_file(dir.join("memory.high")).unwrap();
         fs::create_dir(dir.join("memory.high")).unwrap();
-        assert!(act.apply(&Action::Unthrottle { target: t.clone() }).is_err());
+        assert!(act
+            .apply(&Action::Unthrottle { target: t.clone() })
+            .is_err());
         assert_eq!(act.active.throttled.len(), 1);
         assert!(!act.restore_throttles().is_empty());
         assert_eq!(act.active.throttled.len(), 1);
@@ -606,7 +680,13 @@ mod tests {
         fs::write(&path, serde_json::to_string(&st).unwrap()).unwrap();
         recover(&root, Path::new("/"), &path);
         let left: ActiveState = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(left, ActiveState { frozen: vec![tb], throttled: vec![] });
+        assert_eq!(
+            left,
+            ActiveState {
+                frozen: vec![tb],
+                throttled: vec![]
+            }
+        );
         assert_eq!(fs::read_to_string(ok.join("memory.high")).unwrap(), "max");
     }
 
@@ -617,7 +697,10 @@ mod tests {
         // memory.high is a directory, so recover's restore fails and the entry stays.
         fs::create_dir(dir.join("memory.high")).unwrap();
         let path = d.path().join("state/active.json");
-        let left = ActiveState { frozen: vec![], throttled: vec![(cg_target("/a"), "max".into())] };
+        let left = ActiveState {
+            frozen: vec![],
+            throttled: vec![(cg_target("/a"), "max".into())],
+        };
         write_state(&path, &left).unwrap();
         recover(&d.path().join("cg"), Path::new("/"), &path);
 
@@ -625,7 +708,10 @@ mod tests {
         assert_eq!(act.adopt_leftovers(), 1);
         assert_eq!(act.active, left);
         // The next persist keeps the leftover alongside the new entry.
-        act.apply(&Action::Freeze { target: cg_target("/b") }).unwrap();
+        act.apply(&Action::Freeze {
+            target: cg_target("/b"),
+        })
+        .unwrap();
         let st: ActiveState = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(st.throttled, left.throttled);
         assert_eq!(st.frozen.len(), 1);
@@ -635,7 +721,8 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("memory.high")).unwrap(), "max");
         assert!(act.active.throttled.is_empty());
         // Nothing to adopt from a missing file.
-        let mut fresh = SysActuator::new(d.path().join("cg"), "/".into(), d.path().join("none.json"));
+        let mut fresh =
+            SysActuator::new(d.path().join("cg"), "/".into(), d.path().join("none.json"));
         assert_eq!(fresh.adopt_leftovers(), 0);
     }
 }

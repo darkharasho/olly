@@ -21,15 +21,22 @@ impl Allowlist {
             .and_then(|t| toml::from_str::<State>(&t).ok())
             .map(|s| s.added)
             .unwrap_or_default();
-        Allowlist { base, added, path: state_path }
+        Allowlist {
+            base,
+            added,
+            path: state_path,
+        }
     }
 
     /// Exact match, or glob with a trailing '*' only. Case-sensitive.
     pub fn matches(&self, name: &str) -> bool {
-        self.base.iter().chain(&self.added).any(|pat| match pat.strip_suffix('*') {
-            Some(prefix) => name.starts_with(prefix),
-            None => pat == name,
-        })
+        self.base
+            .iter()
+            .chain(&self.added)
+            .any(|pat| match pat.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => pat == name,
+            })
     }
 
     /// True if ANY member name matches, i.e. the app is protected.
@@ -43,8 +50,10 @@ impl Allowlist {
         }
         let mut added = self.added.clone();
         added.push(name.to_string());
-        let text = toml::to_string(&State { added: added.clone() })
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let text = toml::to_string(&State {
+            added: added.clone(),
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let mut tmp = self.path.clone().into_os_string();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
@@ -90,7 +99,10 @@ mod tests {
     fn allows_app_if_any_member_protected() {
         let (a, _d) = al();
         let app = AppSample {
-            key: AppKey { cgroup: "/c".into(), root_pid: None },
+            key: AppKey {
+                cgroup: "/c".into(),
+                root_pid: None,
+            },
             name: "session".into(),
             exe: None,
             kind: TargetKind::Cgroup,

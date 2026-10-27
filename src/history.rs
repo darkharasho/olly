@@ -40,7 +40,11 @@ impl History {
     /// (oldest, newest) points within `window_ms` of `now_ms`.
     fn span(&self, key: &AppKey, now_ms: u64, window_ms: u64) -> Option<((u64, u64), (u64, u64))> {
         let start = now_ms.saturating_sub(window_ms);
-        let mut it = self.points.get(key)?.iter().filter(|&&(t, _)| t >= start && t <= now_ms);
+        let mut it = self
+            .points
+            .get(key)?
+            .iter()
+            .filter(|&&(t, _)| t >= start && t <= now_ms);
         let first = *it.next()?;
         let last = it.last().copied()?;
         Some((first, last))
@@ -60,7 +64,8 @@ impl History {
         match self.span(key, now_ms, self.recent_ms) {
             Some(((t0, b0), (t1, b1))) if t1 > t0 => {
                 let growth = b1.saturating_sub(b0);
-                growth > 0 && (growth >= self.min_bytes || growth as f64 >= self.min_ratio * b0 as f64)
+                growth > 0
+                    && (growth >= self.min_bytes || growth as f64 >= self.min_ratio * b0 as f64)
             }
             _ => false,
         }
@@ -84,7 +89,8 @@ impl LeakWatch {
 
     pub fn record(&mut self, t_ms: u64, totals: &[(String, u64)]) {
         let cutoff = t_ms.saturating_sub(self.window_ms);
-        self.points.retain(|k, _| totals.iter().any(|(n, _)| n == k));
+        self.points
+            .retain(|k, _| totals.iter().any(|(n, _)| n == k));
         for (name, bytes) in totals {
             let ring = self.points.entry(name.clone()).or_default();
             ring.push_back((t_ms, *bytes));
@@ -99,7 +105,9 @@ impl LeakWatch {
         let quarter_start = now_ms.saturating_sub(self.window_ms / 4);
         let mut out = Vec::new();
         for (name, ring) in &self.points {
-            let (Some(&(t0, b0)), Some(&(_, b1))) = (ring.front(), ring.back()) else { continue };
+            let (Some(&(t0, b0)), Some(&(_, b1))) = (ring.front(), ring.back()) else {
+                continue;
+            };
             if now_ms.saturating_sub(t0) < self.window_ms {
                 continue;
             }
@@ -130,7 +138,10 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     fn key() -> AppKey {
-        AppKey { cgroup: "/app.slice/x".into(), root_pid: Some(42) }
+        AppKey {
+            cgroup: "/app.slice/x".into(),
+            root_pid: Some(42),
+        }
     }
 
     fn app(bytes: u64) -> AppSample {

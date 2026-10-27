@@ -34,12 +34,21 @@ struct Note {
 /// `frozen_id` doubles as the replace key: one notification per frozen target.
 fn map_event(ev: &Event) -> Option<Note> {
     match ev {
-        Event::Acted { action, message, dry_run } => {
+        Event::Acted {
+            action,
+            message,
+            dry_run,
+        } => {
+            // Dry-run freezes are tracked by the engine too, so they keep Kill/Resume.
             let frozen_id = match action {
-                Action::Freeze { target } if !*dry_run => Some(target.id),
+                Action::Freeze { target } => Some(target.id),
                 _ => None,
             };
-            let urgent = !*dry_run && matches!(action, Action::Kill { .. } | Action::Freeze { .. });
+            let urgent = match action {
+                Action::Freeze { .. } => true,
+                Action::Kill { .. } => !*dry_run,
+                _ => false,
+            };
             Some(Note {
                 summary: message.title.clone(),
                 body: message.body.clone(),
@@ -50,7 +59,11 @@ fn map_event(ev: &Event) -> Option<Note> {
         Event::Notice { message, frozen_id } => Some(Note {
             summary: message.title.clone(),
             body: message.body.clone(),
-            urgency: if frozen_id.is_some() { Urg::Critical } else { Urg::Normal },
+            urgency: if frozen_id.is_some() {
+                Urg::Critical
+            } else {
+                Urg::Normal
+            },
             frozen_id: *frozen_id,
         }),
         _ => None,
@@ -63,7 +76,8 @@ struct EventLine {
 }
 
 fn socket_path() -> PathBuf {
-    std::env::var_os("OLLY_SOCKET").map_or_else(|| PathBuf::from("/run/olly/olly.sock"), PathBuf::from)
+    std::env::var_os("OLLY_SOCKET")
+        .map_or_else(|| PathBuf::from("/run/olly/olly.sock"), PathBuf::from)
 }
 
 /// Sends a command over a fresh connection and logs the answer.
@@ -92,7 +106,10 @@ struct Shown {
 
 fn show(note: &Note, shown: &Mutex<Shown>) {
     let mut n = Notification::new();
-    n.appname("olly").icon("dialog-information").summary(&note.summary).body(&note.body);
+    n.appname("olly")
+        .icon("dialog-information")
+        .summary(&note.summary)
+        .body(&note.body);
     n.urgency(match note.urgency {
         Urg::Normal => Urgency::Normal,
         Urg::Critical => Urgency::Critical,
@@ -114,22 +131,26 @@ fn show(note: &Note, shown: &Mutex<Shown>) {
             return;
         }
     };
-    let (Some(fid), Some((mine, g))) = (note.frozen_id, generation) else { return };
+    let (Some(fid), Some((mine, g))) = (note.frozen_id, generation) else {
+        return;
+    };
     shown.lock().unwrap().ids.insert(fid, handle.id());
     // Waiting for a click blocks, so it gets its own thread. A newer notification for the
     // same target replaces this one; its clicks win and this thread's are ignored.
-    let spawned = std::thread::Builder::new().name("olly-notify-action".into()).spawn(move || {
-        handle.wait_for_action(|action| {
-            if g.load(Ordering::SeqCst) != mine {
-                return;
-            }
-            match action {
-                "kill" => send_command("frozen_kill", fid),
-                "resume" => send_command("frozen_resume", fid),
-                _ => {}
-            }
+    let spawned = std::thread::Builder::new()
+        .name("olly-notify-action".into())
+        .spawn(move || {
+            handle.wait_for_action(|action| {
+                if g.load(Ordering::SeqCst) != mine {
+                    return;
+                }
+                match action {
+                    "kill" => send_command("frozen_kill", fid),
+                    "resume" => send_command("frozen_resume", fid),
+                    _ => {}
+                }
+            });
         });
-    });
     if let Err(e) = spawned {
         eprintln!("olly-notify: cannot start the action thread: {e}");
     }
@@ -140,7 +161,15 @@ fn run_once(shown: &Mutex<Shown>) -> std::io::Result<()> {
     let mut s = UnixStream::connect(socket_path())?;
     s.write_all(b"{\"cmd\":\"subscribe\"}\n")?;
     let mut lines = BufReader::new(s).lines();
-    lines.next().transpose()?; // the ack
+    match lines.next().transpose()? {
+        Some(ack) if ack.contains("\"ok\":true") => {}
+        Some(ack) => {
+            return Err(std::io::Error::other(format!(
+                "olly refused the subscription: {ack}"
+            )))
+        }
+        None => return Err(std::io::Error::other("olly closed the connection")),
+    }
     for line in lines {
         let line = line?;
         match serde_json::from_str::<EventLine>(&line) {
@@ -160,11 +189,23 @@ fn main() {
     let mut quiet = false;
     loop {
         match run_once(&shown) {
-            Ok(()) => eprintln!("olly-notify: olly went away; retrying every {}s", RETRY.as_secs()),
-            Err(e) if !quiet => eprintln!("olly-notify: cannot reach olly ({e}); retrying every {}s", RETRY.as_secs()),
-            Err(_) => {}
+            Ok(()) => {
+                eprintln!(
+                    "olly-notify: olly went away; retrying every {}s",
+                    RETRY.as_secs()
+                );
+                quiet = false;
+            }
+            Err(e) => {
+                if !quiet {
+                    eprintln!(
+                        "olly-notify: cannot reach olly ({e}); retrying every {}s",
+                        RETRY.as_secs()
+                    );
+                }
+                quiet = true;
+            }
         }
-        quiet = true;
         std::thread::sleep(RETRY);
     }
 }
@@ -179,7 +220,10 @@ mod tests {
     fn target(id: u64) -> Target {
         Target {
             id,
-            key: AppKey { cgroup: "/app".into(), root_pid: None },
+            key: AppKey {
+                cgroup: "/app".into(),
+                root_pid: None,
+            },
             name: "game.exe".into(),
             kind: TargetKind::Cgroup,
             bytes: 1,
@@ -187,12 +231,19 @@ mod tests {
     }
 
     fn msg() -> Message {
-        Message { title: "t".into(), body: "b".into() }
+        Message {
+            title: "t".into(),
+            body: "b".into(),
+        }
     }
 
     #[test]
     fn freeze_gets_actions_and_critical() {
-        let ev = Event::Acted { action: Action::Freeze { target: target(2) }, message: msg(), dry_run: false };
+        let ev = Event::Acted {
+            action: Action::Freeze { target: target(2) },
+            message: msg(),
+            dry_run: false,
+        };
         let n = map_event(&ev).unwrap();
         assert_eq!((n.summary.as_str(), n.body.as_str()), ("t", "b"));
         assert_eq!(n.urgency, Urg::Critical);
@@ -200,17 +251,24 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_freeze_has_no_actions() {
-        let ev = Event::Acted { action: Action::Freeze { target: target(2) }, message: msg(), dry_run: true };
+    fn dry_run_freeze_keeps_actions() {
+        let ev = Event::Acted {
+            action: Action::Freeze { target: target(2) },
+            message: msg(),
+            dry_run: true,
+        };
         let n = map_event(&ev).unwrap();
-        assert_eq!(n.frozen_id, None);
-        assert_eq!(n.urgency, Urg::Normal);
+        assert_eq!(n.frozen_id, Some(2));
+        assert_eq!(n.urgency, Urg::Critical);
     }
 
     #[test]
     fn kill_is_critical_without_actions() {
         let ev = Event::Acted {
-            action: Action::Kill { target: target(3), reason: KillReason::Emergency },
+            action: Action::Kill {
+                target: target(3),
+                reason: KillReason::Emergency,
+            },
             message: msg(),
             dry_run: false,
         };
@@ -220,17 +278,33 @@ mod tests {
 
     #[test]
     fn notices_and_ignored_events() {
-        let n = map_event(&Event::Notice { message: msg(), frozen_id: Some(5) }).unwrap();
+        let n = map_event(&Event::Notice {
+            message: msg(),
+            frozen_id: Some(5),
+        })
+        .unwrap();
         assert_eq!((n.urgency, n.frozen_id), (Urg::Critical, Some(5)));
-        let n = map_event(&Event::Notice { message: msg(), frozen_id: None }).unwrap();
+        let n = map_event(&Event::Notice {
+            message: msg(),
+            frozen_id: None,
+        })
+        .unwrap();
         assert_eq!((n.urgency, n.frozen_id), (Urg::Normal, None));
         assert_eq!(map_event(&Event::IncidentStart { id: 1, t_ms: 0 }), None);
-        assert_eq!(map_event(&Event::Level { level: olly::engine::Level::Calm }), None);
+        assert_eq!(
+            map_event(&Event::Level {
+                level: olly::engine::Level::Calm
+            }),
+            None
+        );
     }
 
     #[test]
     fn parses_stream_line() {
-        let ev = Event::Notice { message: msg(), frozen_id: Some(2) };
+        let ev = Event::Notice {
+            message: msg(),
+            frozen_id: Some(2),
+        };
         let line = olly::ipc::event_line(&ev, 5);
         let parsed: EventLine = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed.event, ev);

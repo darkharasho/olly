@@ -47,7 +47,11 @@ impl Paths {
     fn from_env() -> Self {
         let (run_dir, state_dir, overridden) = match std::env::var_os("OLLY_RUN_DIR") {
             Some(d) => (PathBuf::from(&d), PathBuf::from(d), true),
-            None => (PathBuf::from("/run/olly"), PathBuf::from("/var/lib/olly"), false),
+            None => (
+                PathBuf::from("/run/olly"),
+                PathBuf::from("/var/lib/olly"),
+                false,
+            ),
         };
         Paths {
             sock: run_dir.join("olly.sock"),
@@ -62,7 +66,9 @@ impl Paths {
 }
 
 fn wall_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 fn level_name(l: Level) -> String {
@@ -70,7 +76,10 @@ fn level_name(l: Level) -> String {
 }
 
 fn self_rss() -> u64 {
-    fs::read_to_string("/proc/self/status").ok().and_then(|s| parse_status(&s)).map_or(0, |s| s.rss)
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| parse_status(&s))
+        .map_or(0, |s| s.rss)
 }
 
 /// Logs a given repeated error at most once per `LOG_REPEAT_MS`.
@@ -81,7 +90,11 @@ struct RateLog {
 
 impl RateLog {
     fn log(&mut self, key: &'static str, now: u64, msg: &str) {
-        if self.last.get(key).is_none_or(|&t| now.saturating_sub(t) >= LOG_REPEAT_MS) {
+        if self
+            .last
+            .get(key)
+            .is_none_or(|&t| now.saturating_sub(t) >= LOG_REPEAT_MS)
+        {
             self.last.insert(key, now);
             eprintln!("olly: {msg}");
         }
@@ -167,6 +180,20 @@ fn enqueue(queue: &mut VecDeque<Job>, job: Job) {
     queue.push_back(job);
 }
 
+/// A queued Claude job may start once memory has recovered and no incident is open.
+fn may_start(incident_open: bool, avail_pct: f64, recovered_avail: f64) -> bool {
+    !incident_open && avail_pct >= recovered_avail
+}
+
+fn prune_cooldown(seen: &mut HashMap<String, u64>, now: u64) {
+    seen.retain(|_, &mut t| now.saturating_sub(t) < LEAK_COOLDOWN_MS);
+}
+
+fn in_cooldown(seen: &HashMap<String, u64>, cgroup: &str, now: u64) -> bool {
+    seen.get(cgroup)
+        .is_some_and(|&t| now.saturating_sub(t) < LEAK_COOLDOWN_MS)
+}
+
 /// The notification line: the first paragraph, on one line.
 fn first_paragraph(text: &str) -> String {
     let first = text.trim().split("\n\n").next().unwrap_or("");
@@ -188,7 +215,11 @@ impl Daemon {
 
     fn tick(&mut self, now: u64) {
         let Some(sys) = self.sampler.system(now) else {
-            self.rlog.log("system", now, "cannot read /proc/pressure/memory or /proc/meminfo; skipping this sample");
+            self.rlog.log(
+                "system",
+                now,
+                "cannot read /proc/pressure/memory or /proc/meminfo; skipping this sample",
+            );
             return;
         };
         let apps = self.sampler.apps();
@@ -212,10 +243,13 @@ impl Daemon {
     /// Each cgroup is handed to Claude at most once per 24h.
     fn on_suspects(&mut self, suspects: Vec<(String, u64)>) {
         let now = self.now();
-        self.leak_seen.retain(|_, &mut t| now.saturating_sub(t) < LEAK_COOLDOWN_MS);
+        prune_cooldown(&mut self.leak_seen, now);
         for (cgroup, growth) in suspects {
-            eprintln!("olly: event=leak_suspect target={cgroup} growth={}", voice::fmt_bytes(growth));
-            if self.claude.is_none() || self.leak_seen.contains_key(&cgroup) {
+            eprintln!(
+                "olly: event=leak_suspect target={cgroup} growth={}",
+                voice::fmt_bytes(growth)
+            );
+            if self.claude.is_none() || in_cooldown(&self.leak_seen, &cgroup, now) {
                 continue;
             }
             self.leak_seen.insert(cgroup.clone(), now);
@@ -230,7 +264,7 @@ impl Daemon {
             self.claude_running = false;
             self.on_claude_result(job, result);
         }
-        if self.claude_running || self.incident_open || self.claude_queue.is_empty() {
+        if self.claude_running || self.claude_queue.is_empty() {
             return;
         }
         let Some(sys) = self.last_sys else { return };
@@ -241,9 +275,14 @@ impl Daemon {
         let avail_pct = if sys.mem.total == 0 {
             0.0
         } else {
-            sys.mem.available as f32 / sys.mem.total as f32 * 100.0
+            sys.mem.available as f64 / sys.mem.total as f64 * 100.0
         };
-        if avail_pct < runner.recovered_avail() || !runner.allowed(wall_ms()) {
+        if !may_start(
+            self.incident_open,
+            avail_pct,
+            runner.recovered_avail() as f64,
+        ) || !runner.allowed(wall_ms())
+        {
             return;
         }
         if let Some(job) = self.claude_queue.pop_front() {
@@ -267,42 +306,69 @@ impl Daemon {
         eprintln!("olly: claude looked at {what}");
         if let Job::Diagnose(inc) = &job {
             if let Err(e) = self.store.append_diagnosis(inc.id, &text) {
-                eprintln!("olly: cannot save the diagnosis for incident {}: {e}", inc.id);
+                eprintln!(
+                    "olly: cannot save the diagnosis for incident {}: {e}",
+                    inc.id
+                );
             }
         }
-        let ev = Event::Notice { message: voice::hunch(&first_paragraph(&text)), frozen_id: None };
+        let ev = Event::Notice {
+            message: voice::hunch(&first_paragraph(&text)),
+            frozen_id: None,
+        };
         self.subs.broadcast(&ipc::event_line(&ev, wall_ms()));
     }
 
     /// Applies the actions, then logs, records and broadcasts the events. A failed
     /// action's `Acted` event becomes a `Notice` saying olly couldn't act.
     fn process(&mut self, out: StepOutput) {
-        let results: Vec<Result<(), String>> = out.actions.iter().map(|a| self.act.apply(a)).collect();
+        let results: Vec<Result<(), String>> =
+            out.actions.iter().map(|a| self.act.apply(a)).collect();
         // The engine pushes one Acted event per action, in the same order.
         let mut results = results.into_iter();
         let wall = wall_ms();
         let level = level_name(self.engine.level());
         for ev in out.events {
             let ev = match ev {
-                Event::Acted { action, message, dry_run } => {
+                Event::Acted {
+                    action,
+                    message,
+                    dry_run,
+                } => {
                     let (verb, name) = action_parts(&action);
                     match results.next().unwrap_or(Ok(())) {
                         Ok(()) => {
-                            eprintln!("olly: level={level} action={verb} target={name} dry_run={dry_run}");
-                            Event::Acted { action, message, dry_run }
+                            eprintln!(
+                                "olly: level={level} action={verb} target={name} dry_run={dry_run}"
+                            );
+                            Event::Acted {
+                                action,
+                                message,
+                                dry_run,
+                            }
                         }
                         Err(e) => {
-                            eprintln!("olly: level={level} action={verb} target={name} failed: {e}");
-                            Event::Notice { message: voice::act_failed(&action), frozen_id: None }
+                            eprintln!(
+                                "olly: level={level} action={verb} target={name} failed: {e}"
+                            );
+                            Event::Notice {
+                                message: voice::act_failed(&action),
+                                frozen_id: None,
+                            }
                         }
                     }
                 }
                 other => other,
             };
             match &ev {
-                Event::Level { level } => eprintln!("olly: level={} event=level_change", level_name(*level)),
+                Event::Level { level } => {
+                    eprintln!("olly: level={} event=level_change", level_name(*level))
+                }
                 Event::IncidentStart { id, .. } => {
                     self.incident_open = true;
+                    if let (true, Some(r)) = (self.claude_running, &self.claude) {
+                        r.cancel();
+                    }
                     eprintln!("olly: level={level} event=incident_start id={id}");
                 }
                 Event::IncidentEnd { id, .. } => {
@@ -313,7 +379,11 @@ impl Daemon {
                 _ => {}
             }
             if let Some(inc) = self.recorder.on_event(&ev, wall) {
-                if let Err(e) = self.store.append(&inc).and_then(|_| self.store.rotate_if_needed()) {
+                if let Err(e) = self
+                    .store
+                    .append(&inc)
+                    .and_then(|_| self.store.rotate_if_needed())
+                {
                     eprintln!("olly: cannot save incident {}: {e}", inc.id);
                 }
                 if self.claude.is_some() {
@@ -362,16 +432,19 @@ impl Daemon {
         };
         match req {
             Request::Status => ok_line(&self.status()),
-            Request::Incidents { limit, offset } => ok_line(&self.store.list(limit.min(MAX_INCIDENTS), offset)),
+            Request::Incidents { limit, offset } => {
+                ok_line(&self.store.list(limit.min(MAX_INCIDENTS), offset))
+            }
             Request::Incident { id } => match self.store.get(id) {
                 Some(i) => ok_line(&i),
                 None => err_line(&format!("no incident with id {id}")),
             },
             // The connection thread handles subscribe itself; it never reaches here.
             Request::Subscribe => err_line("subscribe is not a request"),
-            Request::Pause { secs } if secs > self.cfg.max_pause_secs => {
-                err_line(&format!("pause can be at most {} seconds", self.cfg.max_pause_secs))
-            }
+            Request::Pause { secs } if secs > self.cfg.max_pause_secs => err_line(&format!(
+                "pause can be at most {} minutes",
+                self.cfg.max_pause_secs / 60
+            )),
             Request::Pause { secs } => {
                 let until_ms = self.now().saturating_add(secs.saturating_mul(1000));
                 match self.command(Command::Pause { until_ms }) {
@@ -383,9 +456,11 @@ impl Daemon {
                 Ok(()) => ok_line(&self.status()),
                 Err(e) => err_line(&e),
             },
-            Request::AllowlistAdd { name } => {
-                done(self.allow.add(&name).map_err(|e| format!("could not save the allowlist: {e}")))
-            }
+            Request::AllowlistAdd { name } => done(
+                self.allow
+                    .add(&name)
+                    .map_err(|e| format!("could not save the allowlist: {e}")),
+            ),
             Request::AllowlistList => ok_line(&self.allow.list()),
             Request::FrozenKill { id } => done(self.command(Command::KillFrozen(id))),
             Request::FrozenResume { id } => done(self.command(Command::ResumeFrozen(id))),
@@ -394,8 +469,14 @@ impl Daemon {
 
     fn status(&self) -> StatusData {
         let now = self.now();
-        let remaining = self.engine.paused_until().filter(|&u| u > now).map(|u| u - now);
-        let (avail, total) = self.last_sys.map_or((0, 0), |s| (s.mem.available, s.mem.total));
+        let remaining = self
+            .engine
+            .paused_until()
+            .filter(|&u| u > now)
+            .map(|u| u - now);
+        let (avail, total) = self
+            .last_sys
+            .map_or((0, 0), |s| (s.mem.available, s.mem.total));
         let level = self.engine.level();
         StatusData {
             level,
@@ -455,7 +536,10 @@ fn signal_fd() -> Option<OwnedFd> {
 fn event_fd() -> Option<OwnedFd> {
     let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     if fd < 0 {
-        eprintln!("olly: eventfd failed, IPC disabled: {}", std::io::Error::last_os_error());
+        eprintln!(
+            "olly: eventfd failed, IPC disabled: {}",
+            std::io::Error::last_os_error()
+        );
         return None;
     }
     Some(unsafe { OwnedFd::from_raw_fd(fd) })
@@ -463,14 +547,23 @@ fn event_fd() -> Option<OwnedFd> {
 
 fn drain(fd: RawFd, len: usize) {
     let mut buf = [0u8; 128];
-    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, len.min(buf.len())) };
+    unsafe {
+        libc::read(
+            fd,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            len.min(buf.len()),
+        )
+    };
 }
 
 /// Binds the socket (0600, owned by `uid` when running as root). Never fatal: olly
 /// keeps protecting the system without IPC.
 fn bind_socket(p: &Paths, uid: u32) -> Option<UnixListener> {
     if let Err(e) = fs::create_dir_all(&p.run_dir) {
-        eprintln!("olly: cannot create {}, IPC disabled: {e}", p.run_dir.display());
+        eprintln!(
+            "olly: cannot create {}, IPC disabled: {e}",
+            p.run_dir.display()
+        );
         return None;
     }
     if !p.overridden {
@@ -490,7 +583,10 @@ fn bind_socket(p: &Paths, uid: u32) -> Option<UnixListener> {
         eprintln!("olly: cannot chmod {}: {e}", p.sock.display());
     }
     if unsafe { libc::geteuid() } != 0 {
-        eprintln!("olly: not root; {} stays owned by the current user", p.sock.display());
+        eprintln!(
+            "olly: not root; {} stays owned by the current user",
+            p.sock.display()
+        );
     } else if let Err(e) = std::os::unix::fs::chown(&p.sock, Some(uid), None) {
         eprintln!("olly: cannot chown {} to uid {uid}: {e}", p.sock.display());
     }
@@ -551,6 +647,16 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         let as_root = unsafe { libc::geteuid() } == 0;
         match ClaudeRunner::new(cfg.claude.clone(), cfg.desktop_uid, as_root) {
             Ok(mut r) => {
+                let dir = paths.state_dir.join("claude-cwd");
+                match fs::create_dir_all(&dir)
+                    .and_then(|_| fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)))
+                {
+                    Ok(()) => r.set_cwd(dir),
+                    Err(e) => eprintln!(
+                        "olly: cannot prepare {}, claude runs from /: {e}",
+                        dir.display()
+                    ),
+                }
                 if let Some(w) = &wake {
                     r.set_wake(w.as_raw_fd());
                 }
@@ -589,7 +695,10 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         cfg,
     };
     if cfg_err.is_some() {
-        let ev = Event::Notice { message: voice::config_fallback(), frozen_id: None };
+        let ev = Event::Notice {
+            message: voice::config_fallback(),
+            frozen_id: None,
+        };
         let line = ipc::event_line(&ev, wall_ms());
         d.subs.broadcast(&line);
         d.pending.push(line);
@@ -598,7 +707,11 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         "olly: started dry_run={} root={} ipc={}",
         d.cfg.dry_run,
         root.display(),
-        if served { paths.sock.display().to_string() } else { "off".into() }
+        if served {
+            paths.sock.display().to_string()
+        } else {
+            "off".into()
+        }
     );
 
     let active_ms = d.cfg.timing.active_sample_ms.max(1);
@@ -625,7 +738,10 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         ] {
             fds.push((fd.unwrap_or(-1), ev)); // poll ignores negative fds
         }
-        let timeout = next_tick.min(next_slow).saturating_sub(d.now()).min(i32::MAX as u64) as i32;
+        let timeout = next_tick
+            .min(next_slow)
+            .saturating_sub(d.now())
+            .min(i32::MAX as u64) as i32;
         let ready = match psi::wait(&fds, timeout) {
             Ok(r) => r,
             Err(e) => {
@@ -668,13 +784,15 @@ pub fn run(cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn leak(n: u64) -> Job {
-        Job::Leak { cgroup: format!("/c{n}"), growth: n }
+        Job::Leak {
+            cgroup: format!("/c{n}"),
+            growth: n,
+        }
     }
 
     #[test]
@@ -683,13 +801,45 @@ mod tests {
         for n in 0..6 {
             enqueue(&mut q, leak(n));
         }
-        let kept: Vec<u64> = q.iter().map(|j| if let Job::Leak { growth, .. } = j { *growth } else { 99 }).collect();
+        let kept: Vec<u64> = q
+            .iter()
+            .map(|j| {
+                if let Job::Leak { growth, .. } = j {
+                    *growth
+                } else {
+                    99
+                }
+            })
+            .collect();
         assert_eq!(kept, vec![2, 3, 4, 5]);
     }
 
     #[test]
+    fn may_start_needs_calm_and_recovered_memory() {
+        assert!(may_start(false, 30.0, 25.0));
+        assert!(may_start(false, 25.0, 25.0));
+        assert!(!may_start(false, 24.9, 25.0));
+        assert!(!may_start(true, 90.0, 25.0));
+    }
+
+    #[test]
+    fn leak_cooldown_prunes_and_blocks() {
+        let mut seen = HashMap::new();
+        seen.insert("/a".to_string(), 1_000);
+        seen.insert("/b".to_string(), LEAK_COOLDOWN_MS);
+        assert!(in_cooldown(&seen, "/a", LEAK_COOLDOWN_MS));
+        assert!(!in_cooldown(&seen, "/a", 1_000 + LEAK_COOLDOWN_MS));
+        assert!(!in_cooldown(&seen, "/c", 5));
+        prune_cooldown(&mut seen, 1_000 + LEAK_COOLDOWN_MS);
+        assert!(!seen.contains_key("/a") && seen.contains_key("/b"));
+    }
+
+    #[test]
     fn notification_line_is_first_paragraph() {
-        assert_eq!(first_paragraph("  It was the browser.\nTabs piled up.\n\nDetails here.\n"), "It was the browser. Tabs piled up.");
+        assert_eq!(
+            first_paragraph("  It was the browser.\nTabs piled up.\n\nDetails here.\n"),
+            "It was the browser. Tabs piled up."
+        );
         assert_eq!(first_paragraph(""), "");
     }
 }

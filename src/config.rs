@@ -212,7 +212,10 @@ mod tests {
 
     #[test]
     fn missing_file_is_defaults_without_error() {
-        assert_eq!(load(Path::new("/nonexistent/olly.toml")), (Config::default(), None));
+        assert_eq!(
+            load(Path::new("/nonexistent/olly.toml")),
+            (Config::default(), None)
+        );
     }
 
     #[test]

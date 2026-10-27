@@ -45,9 +45,15 @@ fn connect(sock: &Path, d: &mut Daemon, log: &Path) -> UnixStream {
         }
         if let Some(st) = d.0.as_mut().unwrap().try_wait().unwrap() {
             d.0 = None;
-            panic!("daemon exited early ({st}): {}", std::fs::read_to_string(log).unwrap_or_default());
+            panic!(
+                "daemon exited early ({st}): {}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "socket never appeared");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "socket never appeared"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -79,7 +85,10 @@ fn copy_tree(from: &Path, to: &Path) {
 /// Runs the daemon on a private copy of the fixture, so it can never write a checked-in file.
 fn spawn(tmp: &Path, config: &str) -> (Daemon, PathBuf, PathBuf) {
     let root = tmp.join("root");
-    copy_tree(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"), &root);
+    copy_tree(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"),
+        &root,
+    );
     spawn_on(tmp, &root, config)
 }
 
@@ -103,7 +112,9 @@ fn spawn_on(tmp: &Path, root: &Path, config: &str) -> (Daemon, PathBuf, PathBuf)
 
 fn stop(mut d: Daemon, log: &Path) -> String {
     assert_eq!(unsafe { libc::kill(d.pid(), libc::SIGTERM) }, 0);
-    let status = d.wait_exit(Duration::from_secs(10)).expect("daemon did not exit after SIGTERM");
+    let status = d
+        .wait_exit(Duration::from_secs(10))
+        .expect("daemon did not exit after SIGTERM");
     let stderr = std::fs::read_to_string(log).unwrap();
     assert!(status.success(), "exit {status}: {stderr}");
     stderr
@@ -113,7 +124,10 @@ fn stop(mut d: Daemon, log: &Path) -> String {
 fn daemon_smoke() {
     let tmp = tempfile::tempdir().unwrap();
     let uid = unsafe { libc::getuid() };
-    let (mut d, sock, log) = spawn(tmp.path(), &format!("dry_run = true\ndesktop_uid = {uid}\n"));
+    let (mut d, sock, log) = spawn(
+        tmp.path(),
+        &format!("dry_run = true\ndesktop_uid = {uid}\n"),
+    );
 
     let s = connect(&sock, &mut d, &log);
     let v = request(&s, r#"{"cmd":"status"}"#);
@@ -121,7 +135,10 @@ fn daemon_smoke() {
     assert_eq!(v["data"]["dry_run"], true, "{v}");
     assert_eq!(v["data"]["level"], "calm", "{v}");
     assert_eq!(v["data"]["mem_total"], 31953848u64 * 1024, "{v}");
-    assert!(v["data"]["message"].as_str().unwrap().contains("olly"), "{v}");
+    assert!(
+        v["data"]["message"].as_str().unwrap().contains("olly"),
+        "{v}"
+    );
 
     let v = request(&s, r#"{"cmd":"pause","secs":999999}"#);
     assert_eq!(v["ok"], false, "{v}");
@@ -129,7 +146,11 @@ fn daemon_smoke() {
     assert_eq!(v["ok"], true, "{v}");
     assert!(v["data"]["paused_until_wall_ms"].as_u64().is_some(), "{v}");
     let v = request(&s, r#"{"cmd":"resume"}"#);
-    assert_eq!(v["data"]["paused_until_wall_ms"], serde_json::Value::Null, "{v}");
+    assert_eq!(
+        v["data"]["paused_until_wall_ms"],
+        serde_json::Value::Null,
+        "{v}"
+    );
     let v = request(&s, r#"{"cmd":"incidents"}"#);
     assert_eq!(v["data"], serde_json::json!([]), "{v}");
     let v = request(&s, r#"{"cmd":"frozen_kill","id":5}"#);
@@ -165,13 +186,18 @@ fn config_error_notice_reaches_subscriber() {
     line.clear();
     r.read_line(&mut line).unwrap();
     let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-    let body = v["event"]["Notice"]["message"]["body"].as_str().unwrap_or_else(|| panic!("{v}"));
+    let body = v["event"]["Notice"]["message"]["body"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{v}"));
     assert!(body.contains("not a dry run"), "{v}");
     drop(r);
     drop(s);
     let stderr = stop(d, &log);
     assert!(stderr.contains("ERROR"), "{stderr}");
-    assert!(!stderr.contains("action="), "the live daemon acted on the fixture: {stderr}");
+    assert!(
+        !stderr.contains("action="),
+        "the live daemon acted on the fixture: {stderr}"
+    );
 }
 
 /// SIGTERM during an open incident saves it, marked as cut short.
@@ -182,17 +208,30 @@ fn sigterm_flushes_open_incident() {
     let (mut d, sock, log) = {
         // Pre-create the copy with 8% available (warning level), then spawn on it.
         let root = tmp.path().join("root");
-        copy_tree(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"), &root);
+        copy_tree(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"),
+            &root,
+        );
         let mi = root.join("proc/meminfo");
         let text = std::fs::read_to_string(&mi).unwrap();
         let low: String = text
             .lines()
-            .map(|l| if l.starts_with("MemAvailable:") { "MemAvailable:    2556307 kB" } else { l })
+            .map(|l| {
+                if l.starts_with("MemAvailable:") {
+                    "MemAvailable:    2556307 kB"
+                } else {
+                    l
+                }
+            })
             .map(|l| format!("{l}\n"))
             .collect();
         std::fs::remove_file(&mi).unwrap();
         std::fs::write(&mi, low).unwrap();
-        spawn_on(tmp.path(), &root, &format!("dry_run = true\ndesktop_uid = {uid}\n"))
+        spawn_on(
+            tmp.path(),
+            &root,
+            &format!("dry_run = true\ndesktop_uid = {uid}\n"),
+        )
     };
     let s = connect(&sock, &mut d, &log);
     let v = request(&s, r#"{"cmd":"status"}"#);
@@ -202,5 +241,11 @@ fn sigterm_flushes_open_incident() {
     let text = std::fs::read_to_string(tmp.path().join("incidents.jsonl")).unwrap();
     let inc: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
     assert_eq!(inc["type"], "incident", "{inc}");
-    assert!(inc["summary"].as_str().unwrap().contains("olly was stopped"), "{inc}");
+    assert!(
+        inc["summary"]
+            .as_str()
+            .unwrap()
+            .contains("olly was stopped"),
+        "{inc}"
+    );
 }

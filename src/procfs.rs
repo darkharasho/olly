@@ -27,7 +27,10 @@ pub fn parse_psi(s: &str) -> Option<Psi> {
             full = avg10(line);
         }
     }
-    Some(Psi { some_avg10: some?, full_avg10: full? })
+    Some(Psi {
+        some_avg10: some?,
+        full_avg10: full?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +40,10 @@ pub struct MemInfo {
 }
 
 fn kb_field(s: &str, key: &str) -> Option<u64> {
-    let rest = s.lines().find_map(|l| l.strip_prefix(key))?.strip_prefix(':')?;
+    let rest = s
+        .lines()
+        .find_map(|l| l.strip_prefix(key))?
+        .strip_prefix(':')?;
     let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
     kb.checked_mul(1024)
 }
@@ -68,7 +74,11 @@ pub struct ProcStatus {
 }
 
 pub fn parse_status(s: &str) -> Option<ProcStatus> {
-    let name = s.lines().find_map(|l| l.strip_prefix("Name:"))?.trim().to_string();
+    let name = s
+        .lines()
+        .find_map(|l| l.strip_prefix("Name:"))?
+        .trim()
+        .to_string();
     let ppid = s
         .lines()
         .find_map(|l| l.strip_prefix("PPid:"))?
@@ -134,7 +144,14 @@ pub fn read_proc(root: &Path, pid: i32) -> Option<Proc> {
     let start_time = parse_start_time(&fs::read_to_string(dir.join("stat")).ok()?)?;
     let cgroup = parse_cgroup_path(&fs::read_to_string(dir.join("cgroup")).ok()?)?;
     let exe = fs::read_link(dir.join("exe")).ok();
-    Some(Proc { pid, uid: status.uid, status, start_time, exe, cgroup })
+    Some(Proc {
+        pid,
+        uid: status.uid,
+        status,
+        start_time,
+        exe,
+        cgroup,
+    })
 }
 
 pub fn list_pids(root: &Path) -> Vec<i32> {
@@ -162,7 +179,10 @@ mod tests {
 
     #[test]
     fn meminfo_in_bytes() {
-        let m = parse_meminfo("MemTotal:       31876543 kB\nMemFree: 1 kB\nMemAvailable:   20000000 kB\n").unwrap();
+        let m = parse_meminfo(
+            "MemTotal:       31876543 kB\nMemFree: 1 kB\nMemAvailable:   20000000 kB\n",
+        )
+        .unwrap();
         assert_eq!(m.total, 31876543 * 1024);
         assert_eq!(m.available, 20000000 * 1024);
     }
@@ -170,7 +190,9 @@ mod tests {
     #[test]
     fn zram_used_third_field() {
         assert_eq!(
-            parse_zram_used("3930337280 953574207 976715776 0 5300969472 26220 451314 36771 155291"),
+            parse_zram_used(
+                "3930337280 953574207 976715776 0 5300969472 26220 451314 36771 155291"
+            ),
             976715776
         );
     }
@@ -201,7 +223,8 @@ mod tests {
 
     #[test]
     fn cgroup_v2_line() {
-        let p = "/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam@autostart.service";
+        let p =
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-steam@autostart.service";
         assert_eq!(parse_cgroup_path(&format!("0::{p}\n")).as_deref(), Some(p));
     }
 
@@ -236,6 +259,8 @@ mod tests {
         let f = fixture();
         assert!(parse_psi(&fs::read_to_string(f.join("proc/pressure/memory")).unwrap()).is_some());
         assert!(parse_meminfo(&fs::read_to_string(f.join("proc/meminfo")).unwrap()).is_some());
-        assert!(parse_zram_used(&fs::read_to_string(f.join("sys/block/zram0/mm_stat")).unwrap()) > 0);
+        assert!(
+            parse_zram_used(&fs::read_to_string(f.join("sys/block/zram0/mm_stat")).unwrap()) > 0
+        );
     }
 }

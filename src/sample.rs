@@ -30,7 +30,9 @@ pub struct AppKey {
 pub enum TargetKind {
     Cgroup,
     /// (pid, start_time)
-    Processes { pids: Vec<(i32, u64)> },
+    Processes {
+        pids: Vec<(i32, u64)>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,7 +89,12 @@ impl Sampler {
         let zram_used = fs::read_to_string(self.root.join("sys/block/zram0/mm_stat"))
             .map(|s| parse_zram_used(&s))
             .unwrap_or(0);
-        Some(SystemSample { t_ms, psi, mem, zram_used })
+        Some(SystemSample {
+            t_ms,
+            psi,
+            mem,
+            zram_used,
+        })
     }
 
     fn user_service(&self) -> String {
@@ -121,10 +128,20 @@ impl Sampler {
                     let dir = rel(&self.root, &format!("sys/fs/cgroup{cgroup}"));
                     let bytes = read_u64_file(&dir.join("memory.current"))
                         + read_u64_file(&dir.join("memory.swap.current"));
-                    (AppKey { cgroup: cgroup.clone(), root_pid: None }, TargetKind::Cgroup, bytes)
+                    (
+                        AppKey {
+                            cgroup: cgroup.clone(),
+                            root_pid: None,
+                        },
+                        TargetKind::Cgroup,
+                        bytes,
+                    )
                 } else {
                     (
-                        AppKey { cgroup: cgroup.clone(), root_pid: Some(root_pid) },
+                        AppKey {
+                            cgroup: cgroup.clone(),
+                            root_pid: Some(root_pid),
+                        },
                         TargetKind::Processes {
                             pids: members.iter().map(|p| (p.pid, p.start_time)).collect(),
                         },
@@ -141,9 +158,7 @@ impl Sampler {
                 });
             }
         }
-        out.sort_by(|a, b| {
-            (&a.key.cgroup, a.key.root_pid).cmp(&(&b.key.cgroup, b.key.root_pid))
-        });
+        out.sort_by(|a, b| (&a.key.cgroup, a.key.root_pid).cmp(&(&b.key.cgroup, b.key.root_pid)));
         out
     }
 
@@ -187,13 +202,19 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     fn sampler() -> Sampler {
-        Sampler::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"), 1000)
+        Sampler::new(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"),
+            1000,
+        )
     }
 
     #[test]
     fn firefox_is_one_cgroup_target() {
         let apps = sampler().apps();
-        let ff: Vec<_> = apps.iter().filter(|a| a.key.cgroup.contains("firefox")).collect();
+        let ff: Vec<_> = apps
+            .iter()
+            .filter(|a| a.key.cgroup.contains("firefox"))
+            .collect();
         assert_eq!(ff.len(), 1);
         assert_eq!(ff[0].kind, TargetKind::Cgroup);
         assert_eq!(ff[0].key.root_pid, None);
@@ -205,19 +226,26 @@ mod tests {
     #[test]
     fn steam_game_split_from_client() {
         let apps = sampler().apps();
-        let st: Vec<_> = apps.iter().filter(|a| a.key.cgroup.contains("steam")).collect();
+        let st: Vec<_> = apps
+            .iter()
+            .filter(|a| a.key.cgroup.contains("steam"))
+            .collect();
         assert_eq!(st.len(), 2);
         let client = st.iter().find(|a| a.key.root_pid == Some(100)).unwrap();
         let game = st.iter().find(|a| a.key.root_pid == Some(102)).unwrap();
         assert_eq!(
             game.kind,
-            TargetKind::Processes { pids: vec![(102, 1102), (103, 1103)] }
+            TargetKind::Processes {
+                pids: vec![(102, 1102), (103, 1103)]
+            }
         );
         assert_eq!(game.bytes, 9 * GIB);
         assert_eq!(game.name, "game.exe");
         assert_eq!(
             client.kind,
-            TargetKind::Processes { pids: vec![(100, 1100), (101, 1101)] }
+            TargetKind::Processes {
+                pids: vec![(100, 1100), (101, 1101)]
+            }
         );
         assert_eq!(client.bytes, (400 + 2) << 20);
         assert_eq!(client.names, vec!["steam", "reaper"]);
@@ -232,7 +260,10 @@ mod tests {
     }
 
     fn sampler_for(uid: u32) -> Sampler {
-        Sampler::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"), uid)
+        Sampler::new(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/steam"),
+            uid,
+        )
     }
 
     #[test]
@@ -254,8 +285,14 @@ mod tests {
         assert_eq!(
             t,
             vec![
-                (format!("{base}/app-org.mozilla.firefox-1.scope"), 2_000_000_100),
-                (format!("{base}/app-steam@autostart.service"), 10_000_000_500),
+                (
+                    format!("{base}/app-org.mozilla.firefox-1.scope"),
+                    2_000_000_100
+                ),
+                (
+                    format!("{base}/app-steam@autostart.service"),
+                    10_000_000_500
+                ),
             ]
         );
     }
