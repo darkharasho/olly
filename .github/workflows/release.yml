@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check tag against Cargo.toml and widget version
+        run: scripts/release-check.sh "$GITHUB_REF_NAME"
+
+      - run: cargo test --locked
+      - run: node --test tests/tray/*.test.mjs
+
+      - name: Build static binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Bundle
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          scripts/release-bundle.sh "$VERSION" target/x86_64-unknown-linux-musl/release out
+
+      - name: Sign manifest
+        env:
+          OLLY_MINISIGN_KEY: ${{ secrets.OLLY_MINISIGN_KEY }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sudo apt-get install -y minisign
+          key=$(mktemp)
+          printf '%s\n' "$OLLY_MINISIGN_KEY" > "$key"
+          minisign -S -s "$key" -m out/manifest.json -t "olly $VERSION" < /dev/null
+          rm -f "$key"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          scripts/release-notes.sh "$prev" "$GITHUB_REF_NAME" | sed 's/^/- /' > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" out/olly-*.tar.gz out/manifest.json out/manifest.json.minisig \
+            --title "olly $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
