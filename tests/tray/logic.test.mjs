@@ -6,7 +6,7 @@ const path = new URL("../../plasmoid/package/contents/ui/logic.js", import.meta.
 const src = fs.readFileSync(path, "utf8").replace(/^\.pragma library.*$/m, "");
 const L = new Function(
   src +
-    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, actionLine, hasUpdate, updateCard, updateSeenAt, shouldCheck, checkLine};",
+    "; return {mood, moodInfo, barColor, gb, relTime, countdown, incidentDot, incidentSummary, incidentSub, needsCards, stripBot, pausedNow, command, parseStatus, parseIncidents, esc, needsText, statRows, swapWarning, actionLine, hasUpdate, updateCard, updateSeenAt, shouldCheck, checkLine};",
 )();
 
 const C = {
@@ -396,4 +396,12 @@ test("updateSeenAt covers results and errors", () => {
   assert.equal(L.updateSeenAt({ last_update: lastOk() }), NOW - 1000);
   assert.equal(L.updateSeenAt({ update_error: uerr({ at_wall_ms: NOW - 5 }) }), NOW - 5);
   assert.equal(L.updateSeenAt({ last_update: lastOk(), update_error: uerr({ at_wall_ms: NOW - 5000 }) }), NOW - 1000);
+});
+
+test("swapWarning", () => {
+  assert.equal(L.swapWarning({ swap_warning: true, swap_used: 9.2e9, swap_total: 16e9 }),
+    "Swap is filling up: 9.2 GB of 16 GB and climbing. Things may get sluggish. Closing an app you don't need would help.");
+  assert.equal(L.swapWarning({ swap_warning: false, swap_used: 9e9, swap_total: 16e9 }), "");
+  assert.equal(L.swapWarning({ swap_used: 9e9, swap_total: 16e9 }), "");
+  assert.equal(L.swapWarning(null), "");
 });

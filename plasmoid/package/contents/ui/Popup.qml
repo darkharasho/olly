@@ -22,6 +22,7 @@ ColumnLayout {
     readonly property var update: offline ? null
         : Logic.updateCard(status, app.updateDismissedAt, app.now, Plasmoid.metaData.version)
     readonly property var stats: Logic.statRows(status)
+    readonly property string swapText: offline ? "" : Logic.swapWarning(status)
     readonly property var shown: app.incidents.slice(0, showAll ? 20 : 3)
 
     // A card action's error shows on its card while the card is up, else in the footer.
@@ -203,6 +204,26 @@ ColumnLayout {
                 Layout.preferredWidth: Kirigami.Units.gridUnit * 4
                 horizontalAlignment: Text.AlignRight
                 text: popup.status && popup.status.top ? Logic.gb(popup.status.top.bytes) : ""
+            }
+        }
+
+        // Swap warning: information only, so a quiet card under the bars
+        Rectangle {
+            Layout.fillWidth: true
+            visible: popup.swapText !== ""
+            implicitHeight: swapLabel.implicitHeight + 2 * Kirigami.Units.smallSpacing
+            radius: Kirigami.Units.cornerRadius
+            color: Qt.rgba(Kirigami.Theme.neutralBackgroundColor.r, Kirigami.Theme.neutralBackgroundColor.g,
+                           Kirigami.Theme.neutralBackgroundColor.b, 0.5)
+
+            PlasmaComponents3.Label {
+                id: swapLabel
+                anchors.fill: parent
+                anchors.margins: Kirigami.Units.smallSpacing
+                text: popup.swapText
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                opacity: 0.85
             }
         }
     }

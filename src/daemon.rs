@@ -5,7 +5,7 @@ use crate::allowlist::Allowlist;
 use crate::claude::{ClaudeRunner, Job};
 use crate::config::Config;
 use crate::engine::{Action, Command, Engine, Event, FrozenView, Level, StepOutput};
-use crate::history::{History, LeakWatch};
+use crate::history::{History, LeakWatch, SwapWatch};
 use crate::incident::{IncidentRecorder, IncidentStore, TopApp};
 use crate::ipc::{self, err_line, ok_line, FrozenInfo, Request, StatusData, Subscribers, ToDaemon};
 use crate::procfs::parse_status;
@@ -183,6 +183,7 @@ struct Daemon {
     start: Instant,
     sampler: Sampler,
     hist: History,
+    swap_watch: SwapWatch,
     leak: LeakWatch,
     allow: Allowlist,
     engine: Engine,
@@ -325,6 +326,11 @@ impl Daemon {
         };
         let apps = self.sampler.apps();
         self.hist.record(now, &apps);
+        self.swap_watch.record(
+            now,
+            sys.mem.swap_total.saturating_sub(sys.mem.swap_free),
+            sys.mem.swap_total,
+        );
         self.last_top = top_app(&apps, &self.hist, now);
         let out = self.engine.step(&sys, &apps, &self.hist, &self.allow);
         self.process(out);
@@ -805,6 +811,7 @@ impl Daemon {
             message: voice::status_line(level, avail, remaining),
             swap_total,
             swap_used: swap_total.saturating_sub(swap_free),
+            swap_warning: self.swap_watch.is_on(),
             some_avg10: self.last_sys.map_or(0.0, |s| s.psi.some_avg10),
             top: self.last_top.clone(),
             incident_active: self.engine.incident().is_some(),
@@ -1026,6 +1033,7 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
     let mut d = Daemon {
         sampler: Sampler::new(root.clone(), cfg.desktop_uid),
         hist: History::new(&cfg.growth),
+        swap_watch: SwapWatch::default(),
         leak: LeakWatch::new(&cfg.growth),
         allow: Allowlist::load(cfg.allowlist.clone(), paths.allowlist.clone()),
         engine,
@@ -1306,6 +1314,7 @@ mod tests {
         Daemon {
             sampler: Sampler::new(root.clone(), cfg.desktop_uid),
             hist: History::new(&cfg.growth),
+            swap_watch: SwapWatch::default(),
             leak: LeakWatch::new(&cfg.growth),
             allow: Allowlist::load(cfg.allowlist.clone(), root.join("allow.toml")),
             engine: Engine::new(cfg.clone()),

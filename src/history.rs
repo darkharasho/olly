@@ -130,6 +130,43 @@ impl LeakWatch {
     }
 }
 
+/// Decides the popup's "swap is filling up" card from swap-used samples.
+/// On at >= 50% used with >= 1 GiB of growth over the last 15 minutes; off
+/// below 40% used, or once that growth is gone. No swap means never on.
+#[derive(Default)]
+pub struct SwapWatch {
+    points: VecDeque<(u64, u64)>,
+    on: bool,
+}
+
+impl SwapWatch {
+    const WINDOW_MS: u64 = 15 * 60 * 1000;
+    const GROWTH: u64 = 1 << 30;
+
+    /// Feed one sample; returns whether the warning is on now.
+    pub fn record(&mut self, t_ms: u64, used: u64, total: u64) -> bool {
+        let cutoff = t_ms.saturating_sub(Self::WINDOW_MS);
+        while self.points.front().is_some_and(|&(t, _)| t < cutoff) {
+            self.points.pop_front();
+        }
+        let oldest = self.points.front().map_or(used, |&(_, u)| u);
+        self.points.push_back((t_ms, used));
+        let grew = used.saturating_sub(oldest) >= Self::GROWTH;
+        self.on = if total == 0 {
+            false
+        } else if self.on {
+            used.saturating_mul(100) >= total.saturating_mul(40) && grew
+        } else {
+            used.saturating_mul(2) >= total && grew
+        };
+        self.on
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.on
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +251,42 @@ mod tests {
             w.record(m * 60_000, &[(name.clone(), 10 * GIB + m * total / 60)]);
         }
         assert!(w.suspects(3_600_000).is_empty());
+    }
+
+    #[test]
+    fn swap_warning_needs_half_full_and_a_gib_of_growth() {
+        let mut w = SwapWatch::default();
+        let min = 60_000;
+        assert!(!w.record(0, 4 * GIB, 16 * GIB)); // half used but no growth yet
+        assert!(!w.record(min, 4 * GIB + GIB / 2, 16 * GIB));
+        assert!(!w.record(2 * min, 7 * GIB, 16 * GIB)); // grew 3 GiB, under 50%
+        assert!(w.record(3 * min, 8 * GIB, 16 * GIB));
+        assert!(w.is_on());
+    }
+
+    #[test]
+    fn swap_warning_has_hysteresis_and_clears_without_growth() {
+        let mut w = SwapWatch::default();
+        let min = 60_000;
+        w.record(0, 6 * GIB, 16 * GIB);
+        assert!(w.record(min, 8 * GIB, 16 * GIB));
+        // Dips under 50% but stays over 40%, still growing: stays on.
+        assert!(w.record(2 * min, 7 * GIB, 16 * GIB));
+        // Below 40%: off.
+        assert!(!w.record(3 * min, 6 * GIB, 16 * GIB));
+        // Back over 50% with growth from the 6 GiB point: on again.
+        assert!(w.record(4 * min, 8 * GIB, 16 * GIB));
+        // Plateau: after 15 minutes with no further growth it clears.
+        for i in 5..=20 {
+            w.record(i * min, 8 * GIB, 16 * GIB);
+        }
+        assert!(!w.is_on());
+    }
+
+    #[test]
+    fn swap_warning_never_on_without_swap() {
+        let mut w = SwapWatch::default();
+        assert!(!w.record(0, 0, 0));
+        assert!(!w.record(60_000, 5 * GIB, 0));
     }
 }

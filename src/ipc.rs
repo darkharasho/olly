@@ -116,6 +116,9 @@ pub struct StatusData {
     /// Why the latest update stopped before the hand-off, cleared when a new one starts.
     #[serde(default)]
     pub update_error: Option<UpdateError>,
+    /// Swap is over half full and has grown by 1 GiB or more in the last 15 minutes.
+    #[serde(default)]
+    pub swap_warning: bool,
 }
 
 /// What the tray shows for one frozen app.

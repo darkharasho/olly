@@ -252,6 +252,15 @@ function statRows(status) {
     return rows;
 }
 
+// The soft swap card's text, or "" when the daemon isn't warning about swap.
+function swapWarning(status) {
+    var s = status || {};
+    if (s.swap_warning !== true)
+        return "";
+    return "Swap is filling up: " + gb(s.swap_used || 0) + " of " + gb(s.swap_total || 0)
+        + " and climbing. Things may get sluggish. Closing an app you don't need would help.";
+}
+
 // One incident action `[wall_ms, {Name: {target, ...}}, dry_run]` as "HH:MM  Name target",
 // with " (would have)" when it was a dry run.
 function actionLine(action) {
