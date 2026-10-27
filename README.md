@@ -15,12 +15,20 @@ The emergency path is plain local rules: no network, no LLM, no spawning process
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/darkharasho/olly/main/scripts/get-olly.sh | bash
+```
+
+Run it as your normal user, not root. It downloads the latest prebuilt release, checks the tarball against the release's checksum, and installs it, so you need no Rust toolchain or checkout. After that, olly updates itself (see [Releases and updates](#releases-and-updates)). This first download trusts GitHub over HTTPS; every later update is also checked against olly's signing key.
+
+To install from a source checkout instead:
+
+```sh
 scripts/install.sh
 ```
 
-Run it as your normal user, not root. It builds with `cargo build --release`, then uses sudo to install `olly` and `olly-notify` into `/usr/local/bin`, the system unit into `/etc/systemd/system`, and the config into `/etc/olly/config.toml` (an existing config is left alone). The notification agent installs as a user unit under `~/.config/systemd/user`. On Bazzite, `/usr/local` is writable, so this works on the immutable base.
+It builds with `cargo build --release`, then uses sudo to install `olly` and `olly-notify` into `/usr/local/bin`, the system unit into `/etc/systemd/system`, and the config into `/etc/olly/config.toml` (an existing config is left alone). The notification agent installs as a user unit under `~/.config/systemd/user`. On Bazzite, `/usr/local` is writable, so this works on the immutable base.
 
-To remove it: `scripts/uninstall.sh`. That stops and disables both units and deletes the binaries and units, but keeps `/etc/olly/config.toml` and `/var/lib/olly` (your incident history). Add `--purge` to remove those too.
+To remove it: `scripts/uninstall.sh` from a checkout, or `curl -fsSL https://raw.githubusercontent.com/darkharasho/olly/main/scripts/uninstall.sh | bash`. That stops and disables both units and deletes the binaries and units, but keeps `/etc/olly/config.toml` and `/var/lib/olly` (your incident history). Add `--purge` to remove those too.
 
 ## Dry-run first
 
