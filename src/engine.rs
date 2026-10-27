@@ -125,9 +125,14 @@ pub fn classify(s: &SystemSample, t: &Thresholds) -> Level {
 struct KillWait {
     id: u64,
     key: AppKey,
+    killed_at: u64,
     /// When the target was first seen gone from the samples.
     gone_at: Option<u64>,
 }
+
+/// A killed target still in the samples after this long counts as stuck
+/// (a restarted service, an unreaped zombie), so it can't hold kills forever.
+const KILL_GONE_CEILING_MS: u64 = 15_000;
 
 struct FrozenState {
     target: Target,
@@ -274,6 +279,12 @@ impl Engine {
         if let Some(w) = self.kill_wait.as_mut() {
             if w.gone_at.is_none() && find(&w.key).is_none() {
                 w.gone_at = Some(now);
+            } else if w.gone_at.is_none() && now.saturating_sub(w.killed_at) >= KILL_GONE_CEILING_MS
+            {
+                w.gone_at = Some(now);
+                if !self.stuck.contains(&w.key) {
+                    self.stuck.push(w.key.clone());
+                }
             }
         }
         if self.may_kill(now) {
@@ -535,6 +546,7 @@ impl Engine {
         self.kill_wait = Some(KillWait {
             id: target.id,
             key: target.key.clone(),
+            killed_at: now,
             gone_at: self.cfg.dry_run.then_some(now),
         });
         if self.cfg.dry_run {
@@ -1346,6 +1358,27 @@ mod tests {
         assert_eq!(
             kill_times,
             vec![(21_000, ("other".to_string(), KillReason::Emergency))]
+        );
+    }
+
+    #[test]
+    fn killed_target_that_never_leaves_does_not_block_forever() {
+        let mut sim = Sim::new();
+        sim.warm(10, |t| vec![leak(t), other(t)]);
+        let out = sim.step(emergency(11_000), &[leak(11_000), other(11_000)]);
+        assert_eq!(kills(&out).len(), 1);
+        // The kill "worked" but the key stays (a restarted service, an unreaped zombie).
+        let mut kill_times = Vec::new();
+        for s in 12..=60 {
+            let t = s * 1000;
+            for k in kills(&sim.step(emergency(t), &[leak(t), other(t)])) {
+                kill_times.push((t, k));
+            }
+        }
+        // Counted as stuck at 11s + 15s, then the 10s settle.
+        assert_eq!(
+            kill_times,
+            vec![(36_000, ("other".to_string(), KillReason::Emergency))]
         );
     }
 
