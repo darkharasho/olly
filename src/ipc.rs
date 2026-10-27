@@ -15,6 +15,14 @@ pub const MAX_CONNS: usize = 8;
 const SUB_QUEUE: usize = 64;
 const SUB_FULL_LIMIT: u8 = 3;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const PROBE_INTERVAL: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const PROBE_INTERVAL: Duration = Duration::from_millis(200);
+#[cfg(not(test))]
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const CONN_STACK: usize = 256 * 1024;
 
@@ -270,9 +278,6 @@ fn read_request_line<R: BufRead>(r: &mut R) -> io::Result<ReadLine> {
     } else if buf.len() > MAX_LINE {
         return Ok(ReadLine::TooLong);
     }
-    if buf.len() > MAX_LINE {
-        return Ok(ReadLine::TooLong);
-    }
     Ok(ReadLine::Line(String::from_utf8_lossy(&buf).into_owned()))
 }
 
@@ -292,6 +297,8 @@ fn drain(stream: &UnixStream) {
 }
 
 fn connection(stream: UnixStream, shared: &Shared) {
+    // An idle client must not hold a slot forever; a timeout ends the read with an error.
+    let _ = stream.set_read_timeout(Some(IDLE_READ_TIMEOUT));
     let Ok(read_half) = stream.try_clone() else { return };
     let mut reader = BufReader::new(read_half);
     loop {
@@ -344,11 +351,32 @@ fn stream_events(stream: &UnixStream, shared: &Shared) {
     }
     // Ends when the daemon drops the sender or a write fails (client gone or stuck);
     // dropping `srx` then makes the daemon's next try_send see Disconnected.
-    while let Ok(line) = srx.recv() {
-        if write_line(stream, &line).is_err() {
-            return;
+    loop {
+        match srx.recv_timeout(PROBE_INTERVAL) {
+            Ok(line) => {
+                if write_line(stream, &line).is_err() {
+                    return;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if peer_closed(stream) {
+                    return;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// True if the peer hung up or the socket errored (non-blocking probe).
+fn peer_closed(s: &UnixStream) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: s.as_raw_fd(),
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    rc < 0 || pfd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
 }
 
 #[cfg(test)]
@@ -570,7 +598,45 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&read_line(&extra)).unwrap();
         assert_eq!(v["ok"], false);
         assert!(v["error"].as_str().unwrap().contains("busy"));
+        drop(extra);
+        // Dropping one held connection frees its slot.
+        let mut held = held;
+        drop(held.pop());
+        let mut accepted = false;
+        for _ in 0..100 {
+            let c = h.connect();
+            (&c).write_all(b"garbage\n").unwrap();
+            if read_line(&c).contains("bad request") {
+                accepted = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(accepted, "slot was not released");
         drop(held);
+    }
+
+    #[test]
+    fn dead_subscriber_frees_slot() {
+        let h = Harness::me();
+        let mut subs = Vec::new();
+        for _ in 0..MAX_CONNS {
+            let c = h.connect();
+            (&c).write_all(b"{\"cmd\":\"subscribe\"}\n").unwrap();
+            assert!(read_line(&c).starts_with("{\"ok\":true"));
+            subs.push(c);
+        }
+        // Keep the daemon-side senders alive and silent.
+        let _senders: Vec<_> = (0..MAX_CONNS).map(|_| h.rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
+        drop(subs);
+        std::thread::sleep(PROBE_INTERVAL * 4);
+        let c = h.connect();
+        (&c).write_all(b"{\"cmd\":\"status\"}\n").unwrap();
+        let ToDaemon::Req(_, reply) = h.rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
+            panic!("expected Req")
+        };
+        reply.send(ok_line(&())).unwrap();
+        assert_eq!(read_line(&c), "{\"ok\":true,\"data\":null}\n");
     }
 
     #[test]

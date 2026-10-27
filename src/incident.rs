@@ -91,7 +91,10 @@ impl IncidentRecorder {
                 None
             }
             Event::IncidentEnd { id, .. } => {
-                let mut inc = self.current.take().filter(|i| i.id == *id)?;
+                if self.current.as_ref().is_none_or(|i| i.id != *id) {
+                    return None;
+                }
+                let mut inc = self.current.take()?;
                 inc.end_ms_wall = wall_ms;
                 inc.peak_full = inc.peak_full.max(0.0);
                 if inc.min_avail == u64::MAX {
@@ -405,6 +408,15 @@ mod tests {
         assert!(done.summary.ends_with("Recovered in 14s."), "{}", done.summary);
         assert!(done.summary.contains("growing 600 MB/min"), "{}", done.summary);
         assert!(!done.summary.contains("olly"), "{}", done.summary);
+    }
+
+    #[test]
+    fn mismatched_incident_end_keeps_current() {
+        let mut rec = IncidentRecorder::new();
+        rec.on_event(&Event::IncidentStart { id: 5, t_ms: 0 }, 0);
+        assert_eq!(rec.on_event(&Event::IncidentEnd { id: 4, t_ms: 1 }, 1000), None);
+        let done = rec.on_event(&Event::IncidentEnd { id: 5, t_ms: 2 }, 2000).unwrap();
+        assert_eq!(done.id, 5);
     }
 
     #[test]
