@@ -220,6 +220,8 @@ struct Daemon {
     leak_seen: HashMap<String, u64>,
     /// cgroup -> display name of the largest app sampled in it, for naming leak suspects.
     app_names: HashMap<String, String>,
+    /// cgroups with a running game in them (empty when game mode is off).
+    game_cgroups: HashSet<String>,
     /// Current slow-leak suspects for status, largest first.
     leaks: Vec<LeakInfo>,
     upd: Updater,
@@ -301,6 +303,22 @@ fn cgroup_names(apps: &[AppSample]) -> HashMap<String, String> {
     best.into_iter().map(|(k, (_, n))| (k, n)).collect()
 }
 
+/// The cgroups holding a game. A game loading levels and assets isn't a leak worth a
+/// heads-up while it's being played.
+fn game_cgroups(apps: &[AppSample]) -> HashSet<String> {
+    apps.iter()
+        .filter(|a| a.is_game)
+        .map(|a| a.key.cgroup.clone())
+        .collect()
+}
+
+fn not_games(suspects: Vec<(String, u64)>, games: &HashSet<String>) -> Vec<(String, u64)> {
+    suspects
+        .into_iter()
+        .filter(|(cg, _)| !games.contains(cg))
+        .collect()
+}
+
 /// Status entries for the suspects that are still sampled as an app: largest first, at most 3.
 fn leak_infos(
     suspects: &[(String, u64)],
@@ -377,6 +395,11 @@ impl Daemon {
         let apps = self.sampler.apps();
         self.hist.record(now, &apps);
         self.app_names = cgroup_names(&apps);
+        self.game_cgroups = if self.cfg.game_mode {
+            game_cgroups(&apps)
+        } else {
+            HashSet::new()
+        };
         self.swap_watch.record(
             now,
             sys.mem.swap_total.saturating_sub(sys.mem.swap_free),
@@ -393,7 +416,7 @@ impl Daemon {
     fn slow(&mut self, now: u64) {
         let totals = self.sampler.cgroup_totals();
         self.leak.record(now, &totals);
-        let suspects = self.leak.suspects(now);
+        let suspects = not_games(self.leak.suspects(now), &self.game_cgroups);
         self.leaks = leak_infos(
             &suspects,
             &self.app_names,
@@ -1215,6 +1238,7 @@ pub fn run(mut cfg: Config, cfg_err: Option<String>, root: PathBuf) -> ! {
         claude_rx,
         leak_seen: HashMap::new(),
         app_names: HashMap::new(),
+        game_cgroups: HashSet::new(),
         leaks: Vec::new(),
         upd: updater,
         start: Instant::now(),
@@ -1502,6 +1526,7 @@ mod tests {
             claude_rx,
             leak_seen: HashMap::new(),
             app_names: HashMap::new(),
+        game_cgroups: HashSet::new(),
             leaks: Vec::new(),
             upd: test_updater(&root, cfg.update_check),
             start: Instant::now(),
@@ -1666,6 +1691,28 @@ mod tests {
         let got: Vec<_> = v.iter().map(|l| (l.name.as_str(), l.growth_bytes)).collect();
         assert_eq!(got, vec![("b", 9), ("d", 7), ("c", 5)]);
         assert_eq!(v[0].window_secs, 7200);
+    }
+
+    #[test]
+    fn a_cgroup_running_a_game_is_never_a_leak_suspect() {
+        let steam = AppSample {
+            key: AppKey {
+                cgroup: "/app-steam".into(),
+                root_pid: None,
+            },
+            name: "eldenring.exe".into(),
+            is_game: true,
+            ..leaky(0)
+        };
+        let games = game_cgroups(&[leaky(0), steam]);
+        let sus = vec![
+            ("/app-steam".to_string(), 4 * GIB),
+            ("/leaky".to_string(), 3 * GIB),
+        ];
+        assert_eq!(
+            not_games(sus, &games),
+            vec![("/leaky".to_string(), 3 * GIB)]
+        );
     }
 
     #[test]

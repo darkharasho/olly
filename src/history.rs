@@ -103,6 +103,13 @@ impl LeakWatch {
 
     pub fn suspects(&self, now_ms: u64) -> Vec<(String, u64)> {
         let quarter_start = now_ms.saturating_sub(self.window_ms / 4);
+        let half_start = now_ms.saturating_sub(self.window_ms / 2);
+        let at = |ring: &VecDeque<(u64, u64)>, t0: u64, b0: u64| {
+            ring.iter()
+                .take_while(|&&(t, _)| t <= t0)
+                .last()
+                .map_or(b0, |&(_, b)| b)
+        };
         let mut out = Vec::new();
         for (name, ring) in &self.points {
             let (Some(&(t0, b0)), Some(&(_, b1))) = (ring.front(), ring.back()) else {
@@ -115,13 +122,11 @@ impl LeakWatch {
             if growth < self.min_bytes {
                 continue;
             }
-            let bq = ring
-                .iter()
-                .take_while(|&&(t, _)| t <= quarter_start)
-                .last()
-                .map_or(b0, |&(_, b)| b);
-            let recent = b1.saturating_sub(bq);
-            if recent as f64 >= 0.10 * growth as f64 {
+            // A leak grows across the window: still growing lately (no plateau), and
+            // already growing in the first half (not one recent jump, like a game loading).
+            let recent = b1.saturating_sub(at(ring, quarter_start, b0));
+            let early = at(ring, half_start, b0).saturating_sub(b0);
+            if recent as f64 >= 0.10 * growth as f64 && early as f64 >= 0.25 * growth as f64 {
                 out.push((name.clone(), growth));
             }
         }
@@ -252,6 +257,31 @@ mod tests {
             w.record(m * 60_000, &[(name.clone(), 10 * GIB + m * total / 60)]);
         }
         assert!(w.suspects(3_600_000).is_empty());
+    }
+
+    #[test]
+    fn a_recent_jump_is_not_a_leak() {
+        // A game launched inside Steam's cgroup: flat for hours, then +4 GiB at once.
+        let g = Growth::default();
+        let name = "/app.slice/app-steam@autostart.service".to_string();
+        let mut w = LeakWatch::new(&g);
+        for m in 0..=120u64 {
+            let bytes = if m >= 110 { 5 * GIB } else { GIB };
+            w.record(m * 60_000, &[(name.clone(), bytes)]);
+        }
+        assert!(w.suspects(7_200_000).is_empty());
+
+        // The same jump still loading a little: growth only in the last quarter.
+        let mut w = LeakWatch::new(&g);
+        for m in 0..=120u64 {
+            let bytes = if m >= 100 {
+                5 * GIB + (m - 100) * (GIB / 20)
+            } else {
+                GIB
+            };
+            w.record(m * 60_000, &[(name.clone(), bytes)]);
+        }
+        assert!(w.suspects(7_200_000).is_empty());
     }
 
     #[test]
